@@ -88,7 +88,18 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
-func (s *Store) PutReady(rec FileRecord) error {
+func putPendingEventTx(tx *bolt.Tx, ev *protocol.SummaryEvent) error {
+	if ev == nil || ev.EventID == "" {
+		return nil
+	}
+	raw, err := json.Marshal(ev)
+	if err != nil {
+		return err
+	}
+	return tx.Bucket(bucketPendingEvents).Put([]byte(ev.EventID), raw)
+}
+
+func (s *Store) PutReady(rec FileRecord, ev *protocol.SummaryEvent) error {
 	rec.Status = protocol.FileStatusReady
 	rec.ClaimedBy = ""
 	rec.LeaseID = ""
@@ -103,7 +114,10 @@ func (s *Store) PutReady(rec FileRecord) error {
 		if err != nil {
 			return err
 		}
-		return b.Put([]byte(rec.FileID), raw)
+		if err := b.Put([]byte(rec.FileID), raw); err != nil {
+			return err
+		}
+		return putPendingEventTx(tx, ev)
 	})
 }
 
@@ -265,8 +279,9 @@ func (s *Store) markDeleted(fileID, leaseID, leaseToken, bNodeID string) {
 }
 
 // AckAndRemove validates the lease & SHA256, invokes removeFile to unlink the backing file,
-// then deletes the active record from BoltDB atomically (or returns nil, true if already deleted).
-func (s *Store) AckAndRemove(fileID, leaseID, leaseToken, bNodeID, sha256Hex string, removeFile func(fileID string) error) (*FileRecord, bool, error) {
+// then deletes the active record and enqueues the summary event in BoltDB atomically
+// (or returns nil, true if already deleted).
+func (s *Store) AckAndRemove(fileID, leaseID, leaseToken, bNodeID, sha256Hex string, removeFile func(fileID string) error, buildEvent func(rec FileRecord) *protocol.SummaryEvent) (*FileRecord, bool, error) {
 	if s.IsRecentlyDeletedFor(fileID, leaseID, leaseToken, bNodeID) {
 		return nil, true, nil
 	}
@@ -294,7 +309,13 @@ func (s *Store) AckAndRemove(fileID, leaseID, leaseToken, bNodeID, sha256Hex str
 				return err
 			}
 		}
-		return b.Delete([]byte(fileID))
+		if err := b.Delete([]byte(fileID)); err != nil {
+			return err
+		}
+		if buildEvent != nil {
+			return putPendingEventTx(tx, buildEvent(deletedRec))
+		}
+		return nil
 	})
 	if err != nil {
 		if errors.Is(err, ErrFileNotFound) && s.IsRecentlyDeletedFor(fileID, leaseID, leaseToken, bNodeID) {
@@ -306,7 +327,7 @@ func (s *Store) AckAndRemove(fileID, leaseID, leaseToken, bNodeID, sha256Hex str
 	return &deletedRec, false, nil
 }
 
-func (s *Store) Nack(fileID, leaseID, leaseToken, bNodeID string) (*FileRecord, error) {
+func (s *Store) Nack(fileID, leaseID, leaseToken, bNodeID string, buildEvent func(rec FileRecord) *protocol.SummaryEvent) (*FileRecord, error) {
 	var rec FileRecord
 	now := time.Now().UTC()
 	err := s.db.Update(func(tx *bolt.Tx) error {
@@ -345,7 +366,13 @@ func (s *Store) Nack(fileID, leaseID, leaseToken, bNodeID string) (*FileRecord, 
 		if err != nil {
 			return err
 		}
-		return b.Put([]byte(fileID), out)
+		if err := b.Put([]byte(fileID), out); err != nil {
+			return err
+		}
+		if buildEvent != nil {
+			return putPendingEventTx(tx, buildEvent(rec))
+		}
+		return nil
 	})
 	if err != nil {
 		return nil, err

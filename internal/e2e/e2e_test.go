@@ -986,35 +986,110 @@ func TestQARegressions(t *testing.T) {
 		return len(live.Files) == 1
 	}, "a2 online with 1 file")
 
-	// Register a dedicated B node to test SSE disconnect on delete.
+	// Register a dedicated B node to test SSE disconnect on BOTH token rotation AND node deletion.
 	sseBTok := auth.GenerateRandomToken(16)
 	if err := env.centerSrv.Store().UpsertNode(context.Background(), protocol.NodeRecord{
 		ID: "b-sse-del", Name: "b-sse-del", Role: protocol.RoleAgentB, Projects: []string{"proj-a2-only"},
 	}, sseBTok); err != nil {
 		t.Fatalf("UpsertNode b-sse-del: %v", err)
 	}
-	sseReq, _ := http.NewRequestWithContext(ctx, http.MethodGet, env.centerURL+"/api/v1/b/events?projects=proj-a2-only", nil)
-	sseReq.Header.Set(protocol.HeaderNodeID, "b-sse-del")
-	sseReq.Header.Set(protocol.HeaderNodeToken, sseBTok)
-	sseClient := &http.Client{Transport: env.httpClient.Transport}
-	sseResp, err := sseClient.Do(sseReq)
-	if err != nil || sseResp.StatusCode != http.StatusOK {
-		t.Fatalf("open SSE for b-sse-del failed: err=%v resp=%v", err, sseResp)
+	openSSE := func(tok string) (<-chan struct{}, *http.Response) {
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, env.centerURL+"/api/v1/b/events?projects=proj-a2-only", nil)
+		req.Header.Set(protocol.HeaderNodeID, "b-sse-del")
+		req.Header.Set(protocol.HeaderNodeToken, tok)
+		cli := &http.Client{Transport: env.httpClient.Transport}
+		resp, err := cli.Do(req)
+		if err != nil || resp.StatusCode != http.StatusOK {
+			t.Fatalf("open SSE for b-sse-del failed: err=%v resp=%v", err, resp)
+		}
+		closed := make(chan struct{})
+		go func() {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+			close(closed)
+		}()
+		return closed, resp
 	}
-	sseClosed := make(chan struct{})
-	go func() {
-		_, _ = io.Copy(io.Discard, sseResp.Body)
-		_ = sseResp.Body.Close()
-		close(sseClosed)
-	}()
+	rotClosed, _ := openSSE(sseBTok)
+	// Rotate token via admin API -> old SSE stream must be disconnected immediately!
+	rRot, bRot := adminReq(http.MethodPost, "/api/v1/admin/nodes", map[string]any{
+		"id": "b-sse-del", "name": "b-sse-del", "role": "agent_b", "projects": []string{"proj-a2-only"},
+	})
+	if rRot.StatusCode != http.StatusOK {
+		t.Fatalf("rotate b-sse-del token failed: %d", rRot.StatusCode)
+	}
+	var rotRes struct {
+		Token string `json:"token"`
+	}
+	_ = json.Unmarshal(bRot, &rotRes)
+	select {
+	case <-rotClosed:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("expected active SSE stream to close immediately after rotating token for b-sse-del")
+	}
+
+	// Open SSE with new token, then delete node -> SSE must also close immediately!
+	delClosed, _ := openSSE(rotRes.Token)
 	if r, _ := adminReq(http.MethodDelete, "/api/v1/admin/nodes/b-sse-del", nil); r.StatusCode != http.StatusNoContent {
 		t.Fatalf("delete b-sse-del failed: %d", r.StatusCode)
 	}
 	select {
-	case <-sseClosed:
+	case <-delClosed:
 	case <-time.After(3 * time.Second):
 		t.Fatalf("expected active SSE stream to close immediately after deleting b-sse-del")
 	}
+
+	// 8. Agent A stream auto-renew scales to short lease_ttl (3s) without client calling /renew.
+	env.createProject("proj-arenew", protocol.ConflictOverwrite, 3)
+	arData, arSHA := randBytes(t, 2*1024*1024)
+	if r, _ := uploadToA(t, a1Local, a1Tok, "proj-arenew", "slow.bin", arData, arSHA); r.StatusCode != http.StatusOK {
+		t.Fatalf("upload slow.bin failed: %d", r.StatusCode)
+	}
+	arJWT, _ := auth.SignAccessJWT(env.jwtSecret, auth.AccessClaims{
+		BNodeID: "b-ar", ProjectID: "proj-arenew", ANodeID: "a1",
+		IssuedAt: time.Now().Unix(), ExpiresAt: time.Now().Add(time.Minute).Unix(),
+	})
+	arClaimBody, _ := json.Marshal(protocol.ClaimReq{ProjectID: "proj-arenew", BNodeID: "b-ar", LeaseTTLSec: 3})
+	arClaimReq, _ := http.NewRequest(http.MethodPost, "https://"+agA1.PublicListenAddr()+"/api/v1/claim", bytes.NewReader(arClaimBody))
+	arClaimReq.Header.Set("Authorization", "Bearer "+arJWT)
+	arClaimReq.Header.Set("Content-Type", "application/json")
+	arClaimResp, err := env.httpClient.Do(arClaimReq)
+	if err != nil || arClaimResp.StatusCode != http.StatusOK {
+		t.Fatalf("claim slow.bin failed: err=%v resp=%v", err, arClaimResp)
+	}
+	var arClaim protocol.ClaimResp
+	_ = json.NewDecoder(arClaimResp.Body).Decode(&arClaim)
+	_ = arClaimResp.Body.Close()
+
+	// Pace server-side streaming over ~4.4s (8 x 256KiB chunks @ 550ms) > 3s lease TTL with zero client /renew calls!
+	agA1.StreamChunkHook = func(fileID string, sentTotal int64) error {
+		if fileID == arClaim.FileID {
+			time.Sleep(550 * time.Millisecond)
+		}
+		return nil
+	}
+	defer func() { agA1.StreamChunkHook = nil }()
+
+	streamReq, _ := http.NewRequest(http.MethodGet, "https://"+agA1.PublicListenAddr()+"/api/v1/files/"+arClaim.FileID+"/stream", nil)
+	streamReq.Header.Set(protocol.HeaderLeaseToken, arClaim.LeaseToken)
+	streamResp, err := env.httpClient.Do(streamReq)
+	if err != nil || streamResp.StatusCode != http.StatusOK {
+		t.Fatalf("stream slow.bin failed: err=%v resp=%v", err, streamResp)
+	}
+	gotAR, rErr := io.ReadAll(streamResp.Body)
+	_ = streamResp.Body.Close()
+	if rErr != nil || !bytes.Equal(gotAR, arData) {
+		t.Fatalf("slow stream mismatch: len=%d err=%v", len(gotAR), rErr)
+	}
+	arAckBody, _ := json.Marshal(protocol.AckReq{LeaseID: arClaim.LeaseID, BNodeID: "b-ar", SHA256: arSHA})
+	arAckReq, _ := http.NewRequest(http.MethodPost, "https://"+agA1.PublicListenAddr()+"/api/v1/files/"+arClaim.FileID+"/ack", bytes.NewReader(arAckBody))
+	arAckReq.Header.Set("Content-Type", "application/json")
+	arAckReq.Header.Set(protocol.HeaderLeaseToken, arClaim.LeaseToken)
+	arAckResp, err := env.httpClient.Do(arAckReq)
+	if err != nil || arAckResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected ACK 200 after slow stream auto-renew (lease_ttl=3s), got err=%v resp=%v", err, arAckResp)
+	}
+	_ = arAckResp.Body.Close()
 
 	_ = agA2.Shutdown(context.Background())
 

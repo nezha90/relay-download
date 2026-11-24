@@ -119,20 +119,33 @@ function renderTrendChart(days) {
     el.innerHTML = '<div class="empty">暂无历史汇总统计</div>';
     return;
   }
-  const maxBytes = Math.max(...days.map(d => d.bytes_transferred || 0), 1);
-  const w = 520, h = 180, pad = 26;
-  const barW = Math.max(12, Math.floor((w - pad * 2) / days.length) - 8);
-  const bars = days.map((d, idx) => {
-    const ratio = (d.bytes_transferred || 0) / maxBytes;
-    const bh = Math.max(4, Math.round(ratio * (h - 52)));
-    const x = pad + idx * ((w - pad * 2) / days.length) + 4;
+  // Pad to a full 14-day UTC series so sparse data never stretches a single bar across the chart.
+  const byDate = new Map(days.map(d => [d.date, d]));
+  const series = [];
+  const now = new Date();
+  for (let i = 13; i >= 0; i--) {
+    const dt = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - i));
+    const key = dt.toISOString().slice(0, 10);
+    series.push(byDate.get(key) || { date: key, files_completed: 0, bytes_transferred: 0 });
+  }
+  const maxBytes = Math.max(...series.map(d => d.bytes_transferred || 0), 1);
+  const w = 520, h = 180, pad = 22;
+  const slotW = (w - pad * 2) / series.length;
+  const barW = Math.min(24, Math.max(10, Math.floor(slotW) - 8));
+  const bars = series.map((d, idx) => {
+    const bytes = d.bytes_transferred || 0;
+    const ratio = bytes / maxBytes;
+    const bh = bytes > 0 ? Math.max(4, Math.round(ratio * (h - 52))) : 2;
+    const cx = pad + idx * slotW + slotW / 2;
+    const x = cx - barW / 2;
     const y = h - 26 - bh;
     const label = d.date.slice(5);
+    const fill = bytes > 0 ? '#3b82f6' : '#2d3645';
     return `
       <g>
-        <title>${esc(d.date)}: 完成 ${d.files_completed} 文件 (${fmtBytes(d.bytes_transferred)})</title>
-        <rect x="${x}" y="${y}" width="${barW}" height="${bh}" rx="3" fill="#3b82f6" />
-        <text x="${x + barW / 2}" y="${h - 8}" text-anchor="middle" fill="#8b949e" font-size="10">${esc(label)}</text>
+        <title>${esc(d.date)}: 完成 ${d.files_completed} 文件 (${fmtBytes(bytes)})</title>
+        <rect x="${x.toFixed(1)}" y="${y}" width="${barW}" height="${bh}" rx="3" fill="${fill}" />
+        ${idx % 2 === 1 || idx === series.length - 1 ? `<text x="${cx.toFixed(1)}" y="${h - 8}" text-anchor="middle" fill="#8b949e" font-size="9">${esc(label)}</text>` : ''}
       </g>
     `;
   }).join('');
@@ -141,7 +154,7 @@ function renderTrendChart(days) {
       ${bars}
     </svg>
     <div class="muted" style="margin-top:6px">
-      近期累计: ${days.reduce((a, d) => a + d.files_completed, 0)} 文件 · ${fmtBytes(days.reduce((a, d) => a + d.bytes_transferred, 0))}
+      近 14 日累计: ${days.reduce((a, d) => a + d.files_completed, 0)} 文件 · ${fmtBytes(days.reduce((a, d) => a + d.bytes_transferred, 0))}
     </div>
   `;
 }
@@ -341,7 +354,8 @@ function setupEvents() {
     });
   });
 
-  const doLogin = async () => {
+  const doLogin = async (e) => {
+    if (e) e.preventDefault();
     const v = document.getElementById('login-token').value.trim();
     if (!v) return;
     adminToken = v;
@@ -354,14 +368,12 @@ function setupEvents() {
       adminToken = '';
     }
   };
-  document.getElementById('login-btn').addEventListener('click', doLogin);
-  document.getElementById('login-token').addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') doLogin();
-  });
+  document.getElementById('login-form').addEventListener('submit', doLogin);
 
   document.getElementById('logout-btn').addEventListener('click', () => {
     adminToken = '';
     sessionStorage.removeItem(STORAGE_KEY);
+    document.getElementById('login-token').value = '';
     showLogin();
   });
 

@@ -723,6 +723,8 @@ func (s *Server) handleAdminCreateNode(w http.ResponseWriter, r *http.Request) {
 		protocol.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// Disconnect any active SSE stream authenticated under a prior token or project set.
+	s.hub.DisconnectSSE(rec.ID)
 	protocol.WriteJSON(w, http.StatusOK, map[string]any{
 		"node":  rec,
 		"token": rawToken,

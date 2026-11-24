@@ -521,20 +521,20 @@ func (a *Agent) handleLocalUpload(w http.ResponseWriter, r *http.Request) {
 		Status:     protocol.FileStatusReady,
 		UploadedAt: time.Now().UTC(),
 	}
-	if err := a.store.PutReady(rec); err != nil {
-		_ = os.Remove(readyPath)
-		protocol.WriteError(w, http.StatusInternalServerError, "persist file metadata: "+err.Error())
-		return
-	}
-
-	_ = a.store.EnqueueEvent(protocol.SummaryEvent{
+	uplEv := &protocol.SummaryEvent{
 		EventID:   "upl-" + fileID,
 		ProjectID: projectID,
 		ANodeID:   a.cfg.NodeID,
 		EventType: protocol.EventUploaded,
 		Bytes:     written,
-		Timestamp: time.Now().UTC(),
-	})
+		Timestamp: rec.UploadedAt,
+	}
+	if err := a.store.PutReady(rec, uplEv); err != nil {
+		_ = os.Remove(readyPath)
+		protocol.WriteError(w, http.StatusInternalServerError, "persist file metadata: "+err.Error())
+		return
+	}
+
 	a.triggerEventFlush()
 	a.triggerHeartbeat()
 
@@ -638,20 +638,20 @@ func (a *Agent) handleLocalRegister(w http.ResponseWriter, r *http.Request) {
 		Status:     protocol.FileStatusReady,
 		UploadedAt: time.Now().UTC(),
 	}
-	if err := a.store.PutReady(rec); err != nil {
-		_ = os.Remove(readyPath)
-		protocol.WriteError(w, http.StatusInternalServerError, "persist file metadata: "+err.Error())
-		return
-	}
-
-	_ = a.store.EnqueueEvent(protocol.SummaryEvent{
+	uplEv := &protocol.SummaryEvent{
 		EventID:   "upl-" + fileID,
 		ProjectID: req.ProjectID,
 		ANodeID:   a.cfg.NodeID,
 		EventType: protocol.EventUploaded,
 		Bytes:     size,
-		Timestamp: time.Now().UTC(),
-	})
+		Timestamp: rec.UploadedAt,
+	}
+	if err := a.store.PutReady(rec, uplEv); err != nil {
+		_ = os.Remove(readyPath)
+		protocol.WriteError(w, http.StatusInternalServerError, "persist file metadata: "+err.Error())
+		return
+	}
+
 	a.triggerEventFlush()
 	a.triggerHeartbeat()
 
@@ -861,6 +861,13 @@ func (a *Agent) handleStream(w http.ResponseWriter, r *http.Request) {
 	if rec.LeaseTTLSec > 0 {
 		leaseTTL = time.Duration(rec.LeaseTTLSec) * time.Second
 	}
+	renewEvery := leaseTTL / 3
+	if renewEvery < time.Second {
+		renewEvery = time.Second
+	}
+	if renewEvery > 15*time.Second {
+		renewEvery = 15 * time.Second
+	}
 
 	for remaining > 0 {
 		if r.Context().Err() != nil {
@@ -901,7 +908,7 @@ func (a *Agent) handleStream(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			// Auto-renew lease periodically while streaming so large files never expire mid-transfer.
-			if time.Since(lastRenew) >= 15*time.Second {
+			if time.Since(lastRenew) >= renewEvery {
 				if _, err := a.store.RenewLease(fileID, rec.LeaseID, leaseToken, rec.ClaimedBy, leaseTTL); err != nil {
 					return
 				}
@@ -968,6 +975,17 @@ func (a *Agent) handleAck(w http.ResponseWriter, r *http.Request) {
 			return rmErr
 		}
 		return nil
+	}, func(r FileRecord) *protocol.SummaryEvent {
+		return &protocol.SummaryEvent{
+			EventID:    "cmp-" + fileID,
+			ProjectID:  r.ProjectID,
+			ANodeID:    a.cfg.NodeID,
+			BNodeID:    req.BNodeID,
+			EventType:  protocol.EventCompleted,
+			Bytes:      r.Size,
+			DurationMs: req.DurationMs,
+			Timestamp:  time.Now().UTC(),
+		}
 	})
 	if err != nil {
 		switch {
@@ -987,16 +1005,6 @@ func (a *Agent) handleAck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = a.store.EnqueueEvent(protocol.SummaryEvent{
-		EventID:    "cmp-" + fileID,
-		ProjectID:  rec.ProjectID,
-		ANodeID:    a.cfg.NodeID,
-		BNodeID:    req.BNodeID,
-		EventType:  protocol.EventCompleted,
-		Bytes:      rec.Size,
-		DurationMs: req.DurationMs,
-		Timestamp:  time.Now().UTC(),
-	})
 	a.triggerEventFlush()
 	a.triggerHeartbeat()
 
@@ -1016,7 +1024,17 @@ func (a *Agent) handleNack(w http.ResponseWriter, r *http.Request) {
 		protocol.WriteError(w, http.StatusBadRequest, "invalid nack request")
 		return
 	}
-	rec, err := a.store.Nack(fileID, req.LeaseID, leaseToken, req.BNodeID)
+	_, err := a.store.Nack(fileID, req.LeaseID, leaseToken, req.BNodeID, func(r FileRecord) *protocol.SummaryEvent {
+		return &protocol.SummaryEvent{
+			EventID:   fmt.Sprintf("fail-%s-%d", fileID, r.RetryCount),
+			ProjectID: r.ProjectID,
+			ANodeID:   a.cfg.NodeID,
+			BNodeID:   req.BNodeID,
+			EventType: protocol.EventFailed,
+			Bytes:     r.Size,
+			Timestamp: time.Now().UTC(),
+		}
+	})
 	if err != nil {
 		if errors.Is(err, ErrFileNotFound) {
 			protocol.WriteError(w, http.StatusNotFound, "file not found")
@@ -1025,15 +1043,6 @@ func (a *Agent) handleNack(w http.ResponseWriter, r *http.Request) {
 		protocol.WriteError(w, http.StatusConflict, err.Error())
 		return
 	}
-	_ = a.store.EnqueueEvent(protocol.SummaryEvent{
-		EventID:   fmt.Sprintf("fail-%s-%d", fileID, rec.RetryCount),
-		ProjectID: rec.ProjectID,
-		ANodeID:   a.cfg.NodeID,
-		BNodeID:   req.BNodeID,
-		EventType: protocol.EventFailed,
-		Bytes:     rec.Size,
-		Timestamp: time.Now().UTC(),
-	})
 	a.triggerEventFlush()
 	a.triggerHeartbeat()
 	a.logger.Warn("file NACKed and returned to READY", "file_id", fileID, "b_node", req.BNodeID, "reason", req.Reason)

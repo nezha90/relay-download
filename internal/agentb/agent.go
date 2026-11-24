@@ -652,8 +652,6 @@ func (a *Agent) runDownload(ctx context.Context, dl ActiveDownload) {
 		a.commitMu.Unlock()
 	}
 
-	_ = a.store.DeleteActive(dl.FileID)
-
 	ack := PendingAck{
 		FileID:     dl.FileID,
 		ANodeID:    dl.ANodeID,
@@ -664,7 +662,7 @@ func (a *Agent) runDownload(ctx context.Context, dl ActiveDownload) {
 		DurationMs: time.Since(startTime).Milliseconds(),
 		CreatedAt:  time.Now().UTC(),
 	}
-	_ = a.store.PutPendingAck(ack)
+	_ = a.store.CompleteActiveAndQueueAck(dl.FileID, ack)
 	if err := a.sendAck(ctx, ack); err == nil {
 		_ = a.store.DeletePendingAck(ack.FileID)
 	} else {

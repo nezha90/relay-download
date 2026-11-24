@@ -84,8 +84,13 @@ func TestStoreNackBackoffAndAuthenticatedAckIdempotency(t *testing.T) {
 		Size:      128,
 		SHA256:    "abcd",
 	}
-	if err := st.PutReady(rec); err != nil {
+	if err := st.PutReady(rec, &protocol.SummaryEvent{
+		EventID: "upl-f-1", ProjectID: "p1", ANodeID: "a1", EventType: protocol.EventUploaded, Bytes: 128,
+	}); err != nil {
 		t.Fatalf("PutReady: %v", err)
+	}
+	if evs, err := st.ListPendingEvents(10); err != nil || len(evs) != 1 || evs[0].EventID != "upl-f-1" {
+		t.Fatalf("expected atomic uploaded event in pending_events, got %+v err=%v", evs, err)
 	}
 
 	claimed, err := st.ClaimNext("p1", "b1", 0, 30*time.Second)
@@ -97,7 +102,7 @@ func TestStoreNackBackoffAndAuthenticatedAckIdempotency(t *testing.T) {
 	}
 
 	// NACK must put the file into backoff cooldown.
-	nacked, err := st.Nack(claimed.FileID, claimed.LeaseID, claimed.LeaseToken, "b1")
+	nacked, err := st.Nack(claimed.FileID, claimed.LeaseID, claimed.LeaseToken, "b1", nil)
 	if err != nil {
 		t.Fatalf("Nack: %v", err)
 	}
@@ -124,20 +129,25 @@ func TestStoreNackBackoffAndAuthenticatedAckIdempotency(t *testing.T) {
 		t.Fatalf("ClaimNext after backoff: %v", err)
 	}
 
-	// Ack and delete.
-	deletedRec, already, err := st.AckAndRemove(reclaimed.FileID, reclaimed.LeaseID, reclaimed.LeaseToken, "b1", "abcd", nil)
+	// Ack and delete atomically with completed event.
+	deletedRec, already, err := st.AckAndRemove(reclaimed.FileID, reclaimed.LeaseID, reclaimed.LeaseToken, "b1", "abcd", nil, func(r FileRecord) *protocol.SummaryEvent {
+		return &protocol.SummaryEvent{EventID: "cmp-" + r.FileID, ProjectID: r.ProjectID, ANodeID: "a1", EventType: protocol.EventCompleted, Bytes: r.Size}
+	})
 	if err != nil || already || deletedRec == nil || deletedRec.Status != protocol.FileStatusClaimed {
 		t.Fatalf("initial AckAndRemove failed: rec=%v already=%v err=%v", deletedRec, already, err)
 	}
+	if evs, err := st.ListPendingEvents(10); err != nil || len(evs) != 2 {
+		t.Fatalf("expected atomic completed event in pending_events, got %+v err=%v", evs, err)
+	}
 
 	// Genuine duplicate ACK with matching credentials returns alreadyDeleted=true.
-	_, already, err = st.AckAndRemove(reclaimed.FileID, reclaimed.LeaseID, reclaimed.LeaseToken, "b1", "abcd", nil)
+	_, already, err = st.AckAndRemove(reclaimed.FileID, reclaimed.LeaseID, reclaimed.LeaseToken, "b1", "abcd", nil, nil)
 	if err != nil || !already {
 		t.Fatalf("expected idempotent already_deleted for matching credentials, got already=%v err=%v", already, err)
 	}
 
 	// Forged credentials must NOT get already_deleted (must return ErrFileNotFound).
-	_, already, err = st.AckAndRemove(reclaimed.FileID, reclaimed.LeaseID, "wrong-token", "b1", "abcd", nil)
+	_, already, err = st.AckAndRemove(reclaimed.FileID, reclaimed.LeaseID, "wrong-token", "b1", "abcd", nil, nil)
 	if err != ErrFileNotFound || already {
 		t.Fatalf("expected ErrFileNotFound for forged token, got already=%v err=%v", already, err)
 	}

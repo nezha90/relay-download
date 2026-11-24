@@ -115,6 +115,20 @@ func (s *Store) PutPendingAck(ack PendingAck) error {
 	})
 }
 
+// CompleteActiveAndQueueAck atomically removes an active download record and persists its pending ACK.
+func (s *Store) CompleteActiveAndQueueAck(fileID string, ack PendingAck) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		if err := tx.Bucket(bucketActiveDownloads).Delete([]byte(fileID)); err != nil {
+			return err
+		}
+		raw, err := json.Marshal(ack)
+		if err != nil {
+			return err
+		}
+		return tx.Bucket(bucketPendingAcks).Put([]byte(ack.FileID), raw)
+	})
+}
+
 func (s *Store) DeletePendingAck(fileID string) error {
 	return s.db.Update(func(tx *bolt.Tx) error {
 		return tx.Bucket(bucketPendingAcks).Delete([]byte(fileID))

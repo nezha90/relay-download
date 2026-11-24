@@ -140,14 +140,12 @@ func (h *Hub) SubscribeB(bNodeID string, projects []string, cancel context.Cance
 	return sub.ch, unsub
 }
 
-// RemoveNode evicts a deleted node from in-memory state and disconnects any active SSE streams.
-func (h *Hub) RemoveNode(nodeID string) {
+// DisconnectSSE cancels any active SSE subscriptions for nodeID (e.g. on token rotation).
+func (h *Hub) DisconnectSSE(nodeID string) {
 	var cancels []context.CancelFunc
 	seen := make(map[*bSub]struct{})
 
 	h.mu.Lock()
-	delete(h.aNodes, nodeID)
-	delete(h.bNodes, nodeID)
 	for p, m := range h.bSubs {
 		if sub, ok := m[nodeID]; ok {
 			delete(m, nodeID)
@@ -167,6 +165,15 @@ func (h *Hub) RemoveNode(nodeID string) {
 	for _, c := range cancels {
 		c()
 	}
+}
+
+// RemoveNode evicts a deleted node from in-memory state and disconnects any active SSE streams.
+func (h *Hub) RemoveNode(nodeID string) {
+	h.mu.Lock()
+	delete(h.aNodes, nodeID)
+	delete(h.bNodes, nodeID)
+	h.mu.Unlock()
+	h.DisconnectSSE(nodeID)
 }
 
 // WakeupB wakes up at most readyCount+1 subscribed B nodes for projectID,

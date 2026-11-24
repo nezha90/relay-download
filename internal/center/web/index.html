@@ -4,6 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Relay Center · 流式文件传输控制台</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%233b82f6'/%3E%3Cpath d='M8 16h16M18 10l6 6-6 6' stroke='white' stroke-width='3' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E" />
   <link rel="stylesheet" href="/style.css" />
 </head>
 <body>
@@ -11,9 +12,11 @@
     <div class="modal-card">
       <h2>Relay Center 登录</h2>
       <p class="muted">请输入中心服务器配置的 Admin Token</p>
-      <input id="login-token" type="password" placeholder="Admin Token" autocomplete="off" />
-      <div id="login-err" class="err-msg"></div>
-      <button id="login-btn" class="btn primary full">连接控制台</button>
+      <form id="login-form" class="form-stack">
+        <input id="login-token" type="password" placeholder="Admin Token" autocomplete="current-password" />
+        <div id="login-err" class="err-msg"></div>
+        <button id="login-btn" type="submit" class="btn primary full">连接控制台</button>
+      </form>
     </div>
   </div>
 
