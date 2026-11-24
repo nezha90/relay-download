@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Relay Center · 流式文件传输控制台</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <div id="login-overlay" class="overlay hidden">
+    <div class="modal-card">
+      <h2>Relay Center 登录</h2>
+      <p class="muted">请输入中心服务器配置的 Admin Token</p>
+      <input id="login-token" type="password" placeholder="Admin Token" autocomplete="off" />
+      <div id="login-err" class="err-msg"></div>
+      <button id="login-btn" class="btn primary full">连接控制台</button>
+    </div>
+  </div>
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="dot-live"></span>
+      <span>Relay Center</span>
+      <span class="badge">去中心化直传 · 汇总模式</span>
+    </div>
+    <nav class="tabs">
+      <button class="tab active" data-tab="dashboard">总览看板</button>
+      <button class="tab" data-tab="projects">项目视图</button>
+      <button class="tab" data-tab="nodes-a">A 节点 (公网)</button>
+      <button class="tab" data-tab="nodes-b">B 节点 (内网)</button>
+    </nav>
+    <div class="actions">
+      <label class="toggle">
+        <input id="auto-refresh" type="checkbox" checked />
+        <span>自动刷新 (3s)</span>
+      </label>
+      <button id="refresh-now" class="btn">刷新</button>
+      <button id="logout-btn" class="btn ghost">退出</button>
+    </div>
+  </header>
+
+  <main class="container">
+    <!-- Dashboard Tab -->
+    <section id="tab-dashboard" class="tab-panel active">
+      <div class="kpi-grid" id="kpi-grid"></div>
+      <div class="two-col">
+        <div class="card">
+          <div class="card-head">
+            <h3>实时传输中 (B ◄── A 直连)</h3>
+            <span id="active-count-badge" class="badge">0</span>
+          </div>
+          <div id="active-transfers-list"></div>
+        </div>
+        <div class="card">
+          <div class="card-head">
+            <h3>近 14 日传输汇总趋势</h3>
+            <span class="muted">按日完成文件数与流量</span>
+          </div>
+          <div id="trend-chart"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Projects Tab -->
+    <section id="tab-projects" class="tab-panel">
+      <div class="section-bar">
+        <h2>项目隔离管理</h2>
+        <button id="open-create-project" class="btn primary">+ 新建项目</button>
+      </div>
+      <div id="projects-grid" class="card-grid"></div>
+    </section>
+
+    <!-- Agent A Tab -->
+    <section id="tab-nodes-a" class="tab-panel">
+      <div class="section-bar">
+        <h2>公网 A 节点列表 (A1 / A2 / A3...)</h2>
+        <button id="open-create-node-a" class="btn primary">+ 注册 A 节点</button>
+      </div>
+      <div class="card">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>节点 ID / 名称</th>
+              <th>状态</th>
+              <th>公网地址</th>
+              <th>磁盘水位</th>
+              <th>待下载 / 传输中</th>
+              <th>出站速率</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="nodes-a-tbody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Agent B Tab -->
+    <section id="tab-nodes-b" class="tab-panel">
+      <div class="section-bar">
+        <h2>内网 B 节点列表 (多机抢占消费)</h2>
+        <button id="open-create-node-b" class="btn primary">+ 注册 B 节点</button>
+      </div>
+      <div class="card">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>节点 ID / 名称</th>
+              <th>状态</th>
+              <th>订阅项目</th>
+              <th>本地磁盘可用</th>
+              <th>当前并发拉取</th>
+              <th>入站速率</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="nodes-b-tbody"></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <!-- Live Proxy Files Drawer Modal -->
+  <div id="live-modal" class="overlay hidden">
+    <div class="modal-card wide">
+      <div class="modal-head">
+        <div>
+          <h3 id="live-modal-title">实时穿透队列</h3>
+          <p class="muted">直接实时向 A 节点查询，中心服务器不存储文件清单</p>
+        </div>
+        <button class="btn ghost" onclick="closeModal('live-modal')">关闭</button>
+      </div>
+      <div id="live-modal-body"></div>
+    </div>
+  </div>
+
+  <!-- Create Project Modal -->
+  <div id="project-modal" class="overlay hidden">
+    <div class="modal-card">
+      <div class="modal-head">
+        <h3>新建项目</h3>
+        <button class="btn ghost" onclick="closeModal('project-modal')">关闭</button>
+      </div>
+      <form id="create-project-form" class="form-stack">
+        <label>项目 ID (英文/数字)
+          <input name="id" required placeholder="e.g. proj-video" />
+        </label>
+        <label>项目名称
+          <input name="name" required placeholder="视频分发项目" />
+        </label>
+        <label>描述
+          <input name="description" placeholder="可选描述" />
+        </label>
+        <label>同名冲突策略
+          <select name="conflict_policy">
+            <option value="overwrite" selected>项目内部覆盖 (overwrite)</option>
+            <option value="auto_rename">自动重命名 (auto_rename)</option>
+            <option value="skip">跳过 (skip)</option>
+          </select>
+        </label>
+        <label>抢占租约超时 (秒)
+          <input name="lease_ttl_sec" type="number" value="300" min="10" />
+        </label>
+        <button type="submit" class="btn primary full">保存项目</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- Create Node Modal -->
+  <div id="node-modal" class="overlay hidden">
+    <div class="modal-card">
+      <div class="modal-head">
+        <h3 id="node-modal-title">注册节点</h3>
+        <button class="btn ghost" onclick="closeModal('node-modal')">关闭</button>
+      </div>
+      <form id="create-node-form" class="form-stack">
+        <input type="hidden" name="role" />
+        <label>节点 ID
+          <input name="id" required placeholder="e.g. a1 / b1" />
+        </label>
+        <label>显示名称
+          <input name="name" placeholder="公网节点 A1" />
+        </label>
+        <label id="node-public-addr-wrap">公网地址 (仅 A 节点)
+          <input name="public_addr" placeholder="https://1.2.3.4:8443" />
+        </label>
+        <label>绑定项目 (逗号分隔，留空表示所有项目)
+          <input name="projects" placeholder="proj-alpha,proj-beta" />
+        </label>
+        <button type="submit" class="btn primary full">创建并生成密钥</button>
+      </form>
+      <div id="node-token-result" class="token-box hidden"></div>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,19 @@
+node_id: "b1"
+node_name: "内网接收节点 B1"
+
+center_url: "https://5.6.7.8:8440"
+# 在 Center Web 控制台注册节点 B1 后生成的 Token
+center_token: "replace-with-node-b1-token"
+ca_cert: "./certs/ca.crt"
+
+# 按项目映射本地落盘目录（项目内部同名默认采用原子覆盖原则）
+projects:
+  proj-alpha: "/data/relay/proj-alpha"
+  proj-beta: "/data/relay/proj-beta"
+
+state_dir: "./data-b1"
+max_concurrent: 3
+min_free_disk_bytes: 1073741824 # 1 GiB
+rate_limit_mbps: 0 # 0 表示不限速
+poll_interval_sec: 10
+heartbeat_interval_sec: 2

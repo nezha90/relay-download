@@ -1,0 +1,27 @@
+# Build artifacts
+/bin/
+
+# Certificates & private keys
+/certs/
+*.crt
+*.key
+*.pem
+
+# Runtime data & local databases
+/data-*/
+*.db
+*.db-shm
+*.db-wal
+*.part
+
+# Local deployment configs with secrets (keep deploy/*.example.yaml)
+center.yaml
+agent-a.yaml
+agent-b.yaml
+*.local.yaml
+
+# OS & editor files
+.DS_Store
+*.swp
+.idea/
+.vscode/

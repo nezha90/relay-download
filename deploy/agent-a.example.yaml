@@ -1,0 +1,35 @@
+node_id: "a1"
+node_name: "公网下载节点 A1"
+public_addr: "https://1.2.3.4:8443"
+
+center_url: "https://5.6.7.8:8440"
+# 在 Center Web 控制台注册节点 A1 后生成的 Token
+center_token: "replace-with-node-a1-token"
+
+# 与 Center 保持一致，用于离线校验 B 携带的短效下载凭证与中心穿透查询
+jwt_secret: "replace-with-strong-shared-jwt-secret"
+center_secret: "replace-with-strong-center-to-a-secret"
+
+# 留空表示允许接收所有项目；或显式限制允许的项目 ID
+projects: []
+
+# 本地上传/注册监听端口（强制仅绑定 127.0.0.1，不暴露到公网）
+local_listen: "127.0.0.1:18081"
+local_token: "replace-with-local-upload-token"
+
+# 公网加密传输端口（仅面向内网 B 提供抢占与流式下载）
+public_listen: "0.0.0.0:8443"
+tls_cert: "./certs/a1.crt"
+tls_key: "./certs/a1.key"
+ca_cert: "./certs/ca.crt"
+
+data_dir: "./data-a1"
+
+# 本地磁盘水位保护（超过水位拒绝新上传返回 507 并向中心告警，绝不静默删未下载文件）
+max_disk_usage_pct: 85.0
+min_free_disk_bytes: 2147483648 # 2 GiB
+
+lease_ttl_sec: 300
+max_concurrent_streams: 16
+rate_limit_mbps: 0 # 0 表示不限速
+heartbeat_interval_sec: 5

@@ -1,0 +1,13 @@
+listen: "0.0.0.0:8440"
+tls_cert: "./certs/center.crt"
+tls_key: "./certs/center.key"
+ca_cert: "./certs/ca.crt"
+db_path: "./data-center/center.db"
+
+# 务必替换为高强度随机密钥（可用 openssl rand -hex 32 生成）
+jwt_secret: "replace-with-strong-shared-jwt-secret"
+center_secret: "replace-with-strong-center-to-a-secret"
+admin_token: "replace-with-strong-admin-token"
+
+node_offline_sec: 20
+jwt_ttl_sec: 900
