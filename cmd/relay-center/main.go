@@ -13,6 +13,7 @@ import (
 
 	"relay-download/internal/center"
 	"relay-download/internal/pki"
+	"relay-download/internal/version"
 )
 
 func main() {
@@ -22,6 +23,9 @@ func main() {
 	}
 
 	switch os.Args[1] {
+	case "version", "-version", "--version":
+		fmt.Println(version.String("relay-center"))
+		return
 	case "serve":
 		runServe(os.Args[2:])
 	case "pki":

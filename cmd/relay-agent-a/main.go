@@ -3,17 +3,25 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
 
 	"relay-download/internal/agenta"
+	"relay-download/internal/version"
 )
 
 func main() {
 	cfgPath := flag.String("config", "agent-a.yaml", "path to agent-a yaml config")
+	showVer := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
+
+	if *showVer {
+		fmt.Println(version.String("relay-agent-a"))
+		return
+	}
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	cfg, err := agenta.LoadConfig(*cfgPath)

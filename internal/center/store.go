@@ -108,6 +108,29 @@ CREATE TABLE IF NOT EXISTS event_dedup (
 	created_at TIMESTAMP NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_event_dedup_created ON event_dedup(created_at);
+
+CREATE TABLE IF NOT EXISTS releases (
+	id TEXT PRIMARY KEY,
+	role TEXT NOT NULL,
+	version TEXT NOT NULL,
+	os TEXT NOT NULL,
+	arch TEXT NOT NULL,
+	sha256 TEXT NOT NULL,
+	size INTEGER NOT NULL,
+	filename TEXT NOT NULL,
+	notes TEXT NOT NULL DEFAULT '',
+	created_at TIMESTAMP NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS node_upgrades (
+	node_id TEXT PRIMARY KEY,
+	release_id TEXT NOT NULL,
+	attempt_id TEXT NOT NULL DEFAULT '',
+	target_version TEXT NOT NULL,
+	status TEXT NOT NULL,
+	message TEXT NOT NULL DEFAULT '',
+	updated_at TIMESTAMP NOT NULL
+);
 `
 	_, err := db.Exec(schema)
 	return err
@@ -439,4 +462,146 @@ func (s *Store) TableNames(ctx context.Context) ([]string, error) {
 		names = append(names, name)
 	}
 	return names, rows.Err()
+}
+
+func (s *Store) InsertRelease(ctx context.Context, r protocol.ReleaseRecord) error {
+	if r.CreatedAt.IsZero() {
+		r.CreatedAt = time.Now().UTC()
+	}
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO releases (id, role, version, os, arch, sha256, size, filename, notes, created_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+`, r.ID, r.Role, r.Version, r.OS, r.Arch, r.SHA256, r.Size, r.Filename, r.Notes, r.CreatedAt)
+	return err
+}
+
+func (s *Store) ListReleases(ctx context.Context, role string) ([]protocol.ReleaseRecord, error) {
+	var (
+		rows *sql.Rows
+		err  error
+	)
+	if role != "" {
+		rows, err = s.db.QueryContext(ctx, `
+SELECT id, role, version, os, arch, sha256, size, filename, notes, created_at
+FROM releases WHERE role = ? ORDER BY created_at DESC
+`, role)
+	} else {
+		rows, err = s.db.QueryContext(ctx, `
+SELECT id, role, version, os, arch, sha256, size, filename, notes, created_at
+FROM releases ORDER BY created_at DESC
+`)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	list := make([]protocol.ReleaseRecord, 0)
+	for rows.Next() {
+		var r protocol.ReleaseRecord
+		if err := rows.Scan(&r.ID, &r.Role, &r.Version, &r.OS, &r.Arch, &r.SHA256, &r.Size, &r.Filename, &r.Notes, &r.CreatedAt); err != nil {
+			return nil, err
+		}
+		list = append(list, r)
+	}
+	return list, rows.Err()
+}
+
+func (s *Store) GetRelease(ctx context.Context, id string) (*protocol.ReleaseRecord, error) {
+	var r protocol.ReleaseRecord
+	err := s.db.QueryRowContext(ctx, `
+SELECT id, role, version, os, arch, sha256, size, filename, notes, created_at
+FROM releases WHERE id = ?
+`, id).Scan(&r.ID, &r.Role, &r.Version, &r.OS, &r.Arch, &r.SHA256, &r.Size, &r.Filename, &r.Notes, &r.CreatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &r, nil
+}
+
+func (s *Store) LatestReleaseFor(ctx context.Context, role, osName, arch string) (*protocol.ReleaseRecord, error) {
+	var r protocol.ReleaseRecord
+	err := s.db.QueryRowContext(ctx, `
+SELECT id, role, version, os, arch, sha256, size, filename, notes, created_at
+FROM releases WHERE role = ? AND os = ? AND arch = ?
+ORDER BY created_at DESC LIMIT 1
+`, role, osName, arch).Scan(&r.ID, &r.Role, &r.Version, &r.OS, &r.Arch, &r.SHA256, &r.Size, &r.Filename, &r.Notes, &r.CreatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &r, nil
+}
+
+func (s *Store) DeleteRelease(ctx context.Context, id string) (*protocol.ReleaseRecord, error) {
+	r, err := s.GetRelease(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM releases WHERE id = ?`, id); err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
+func (s *Store) UpsertNodeUpgrade(ctx context.Context, u protocol.NodeUpgradeRecord) error {
+	if u.UpdatedAt.IsZero() {
+		u.UpdatedAt = time.Now().UTC()
+	}
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO node_upgrades (node_id, release_id, attempt_id, target_version, status, message, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(node_id) DO UPDATE SET
+	release_id=excluded.release_id,
+	attempt_id=excluded.attempt_id,
+	target_version=excluded.target_version,
+	status=excluded.status,
+	message=excluded.message,
+	updated_at=excluded.updated_at
+`, u.NodeID, u.ReleaseID, u.AttemptID, u.TargetVersion, u.Status, u.Message, u.UpdatedAt)
+	return err
+}
+
+func (s *Store) GetNodeUpgrade(ctx context.Context, nodeID string) (*protocol.NodeUpgradeRecord, error) {
+	var u protocol.NodeUpgradeRecord
+	err := s.db.QueryRowContext(ctx, `
+SELECT node_id, release_id, attempt_id, target_version, status, message, updated_at
+FROM node_upgrades WHERE node_id = ?
+`, nodeID).Scan(&u.NodeID, &u.ReleaseID, &u.AttemptID, &u.TargetVersion, &u.Status, &u.Message, &u.UpdatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &u, nil
+}
+
+func (s *Store) ListNodeUpgrades(ctx context.Context) (map[string]protocol.NodeUpgradeRecord, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT node_id, release_id, attempt_id, target_version, status, message, updated_at
+FROM node_upgrades
+`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[string]protocol.NodeUpgradeRecord)
+	for rows.Next() {
+		var u protocol.NodeUpgradeRecord
+		if err := rows.Scan(&u.NodeID, &u.ReleaseID, &u.AttemptID, &u.TargetVersion, &u.Status, &u.Message, &u.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out[u.NodeID] = u
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) DeleteNodeUpgrade(ctx context.Context, nodeID string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM node_upgrades WHERE node_id = ?`, nodeID)
+	return err
 }

@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,6 +26,8 @@ import (
 	"relay-download/internal/pki"
 	"relay-download/internal/protocol"
 	"relay-download/internal/transfer"
+	"relay-download/internal/updater"
+	"relay-download/internal/version"
 )
 
 type Agent struct {
@@ -50,9 +53,12 @@ type Agent struct {
 
 	hbWakeCh    chan struct{}
 	eventWakeCh chan struct{}
+	updater     *updater.Updater
 
-	// Optional test hook to inject fault during streaming (unused in production).
-	StreamChunkHook func(fileID string, sentTotal int64) error
+	// Optional test hooks (unused in production).
+	StreamChunkHook    func(fileID string, sentTotal int64) error
+	UpgradeExePath     string
+	UpgradeRestartHook func(targetVersion string)
 
 	runMu     sync.Mutex
 	runCancel context.CancelFunc
@@ -120,6 +126,35 @@ func New(cfg *Config, logger *slog.Logger) (*Agent, error) {
 		_ = store.Close()
 		return nil, fmt.Errorf("startup reconcile: %w", err)
 	}
+
+	dlClient := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig:     clientTLS.Clone(),
+			ForceAttemptHTTP2:   true,
+			TLSHandshakeTimeout: 10 * time.Second,
+		},
+	}
+	a.updater = updater.New(updater.Options{
+		Component:    "relay-agent-a",
+		NodeID:       cfg.NodeID,
+		CenterURL:    cfg.CenterURL,
+		CenterToken:  cfg.CenterToken,
+		HTTPClient:   dlClient,
+		Logger:       a.logger,
+		OnStatusSync: a.triggerHeartbeat,
+		OnRestart: func(targetVer string) {
+			if a.UpgradeRestartHook != nil {
+				a.UpgradeRestartHook(targetVer)
+				return
+			}
+			a.runMu.Lock()
+			cancel := a.runCancel
+			a.runMu.Unlock()
+			if cancel != nil {
+				cancel()
+			}
+		},
+	})
 	return a, nil
 }
 
@@ -167,6 +202,31 @@ func (a *Agent) Start(ctx context.Context) error {
 		}
 	}()
 
+	if a.UpgradeExePath != "" {
+		a.updater = updater.New(updater.Options{
+			Component:    "relay-agent-a",
+			NodeID:       a.cfg.NodeID,
+			CenterURL:    a.cfg.CenterURL,
+			CenterToken:  a.cfg.CenterToken,
+			HTTPClient:   a.httpClient,
+			Logger:       a.logger,
+			ExePath:      a.UpgradeExePath,
+			OnStatusSync: a.triggerHeartbeat,
+			OnRestart: func(targetVer string) {
+				if a.UpgradeRestartHook != nil {
+					a.UpgradeRestartHook(targetVer)
+					return
+				}
+				a.runMu.Lock()
+				cancel := a.runCancel
+				a.runMu.Unlock()
+				if cancel != nil {
+					cancel()
+				}
+			},
+		})
+	}
+
 	runCtx, runCancel := context.WithCancel(ctx)
 	a.runMu.Lock()
 	a.runCancel = runCancel
@@ -185,7 +245,7 @@ func (a *Agent) Start(ctx context.Context) error {
 	launchBG(a.eventFlushLoop)
 
 	select {
-	case <-ctx.Done():
+	case <-runCtx.Done():
 		return a.Shutdown(context.Background())
 	case err := <-errCh:
 		_ = a.Shutdown(context.Background())
@@ -1131,18 +1191,28 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 		a.logger.Warn("compute availability failed", "err", err)
 		return
 	}
+	upgAttempt, upgStatus, upgErr := "", "", ""
+	if a.updater != nil {
+		upgAttempt, upgStatus, upgErr = a.updater.Status()
+	}
 	payload := protocol.AgentAHeartbeatReq{
-		NodeID:         a.cfg.NodeID,
-		Name:           a.cfg.NodeName,
-		PublicAddr:     a.cfg.PublicAddr,
-		Projects:       a.cfg.Projects,
-		DiskTotalBytes: total,
-		DiskFreeBytes:  free,
-		DiskUsedPct:    pct,
-		DiskAlarm:      alarm,
-		ActiveStreams:  int(a.activeStreams.Load()),
-		OutSpeedBps:    a.lastSpeedBps.Load(),
-		Availability:   avail,
+		NodeID:           a.cfg.NodeID,
+		Name:             a.cfg.NodeName,
+		PublicAddr:       a.cfg.PublicAddr,
+		Projects:         a.cfg.Projects,
+		Version:          version.Version,
+		OS:               runtime.GOOS,
+		Arch:             runtime.GOARCH,
+		UpgradeAttemptID: upgAttempt,
+		UpgradeStatus:    upgStatus,
+		UpgradeError:     upgErr,
+		DiskTotalBytes:   total,
+		DiskFreeBytes:    free,
+		DiskUsedPct:      pct,
+		DiskAlarm:        alarm,
+		ActiveStreams:    int(a.activeStreams.Load()),
+		OutSpeedBps:      a.lastSpeedBps.Load(),
+		Availability:     avail,
 	}
 	body, _ := json.Marshal(payload)
 	url := strings.TrimRight(a.cfg.CenterURL, "/") + "/api/v1/a/heartbeat"
@@ -1159,9 +1229,14 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 		a.logger.Warn("center heartbeat failed", "err", err)
 		return
 	}
-	_ = resp.Body.Close()
+	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
 		a.logger.Warn("center heartbeat non-2xx", "status", resp.StatusCode)
+		return
+	}
+	var hbResp protocol.HeartbeatResp
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 64*1024)).Decode(&hbResp); err == nil && hbResp.Upgrade != nil && a.updater != nil {
+		a.updater.HandleDirective(ctx, hbResp.Upgrade)
 	}
 }
 

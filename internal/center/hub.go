@@ -15,6 +15,9 @@ type LiveAState struct {
 	Name           string
 	PublicAddr     string
 	Projects       []string
+	Version        string
+	OS             string
+	Arch           string
 	DiskTotalBytes uint64
 	DiskFreeBytes  uint64
 	DiskUsedPct    float64
@@ -29,6 +32,9 @@ type LiveBState struct {
 	NodeID          string
 	Name            string
 	Projects        []string
+	Version         string
+	OS              string
+	Arch            string
 	DiskTotalBytes  uint64
 	DiskFreeBytes   uint64
 	DiskUsedPct     float64
@@ -79,6 +85,9 @@ func (h *Hub) UpdateA(hb protocol.AgentAHeartbeatReq) {
 		Name:           hb.Name,
 		PublicAddr:     hb.PublicAddr,
 		Projects:       append([]string(nil), hb.Projects...),
+		Version:        hb.Version,
+		OS:             hb.OS,
+		Arch:           hb.Arch,
 		DiskTotalBytes: hb.DiskTotalBytes,
 		DiskFreeBytes:  hb.DiskFreeBytes,
 		DiskUsedPct:    hb.DiskUsedPct,
@@ -102,6 +111,9 @@ func (h *Hub) UpdateB(hb protocol.AgentBHeartbeatReq) {
 		NodeID:          hb.NodeID,
 		Name:            hb.Name,
 		Projects:        append([]string(nil), hb.Projects...),
+		Version:         hb.Version,
+		OS:              hb.OS,
+		Arch:            hb.Arch,
 		DiskTotalBytes:  hb.DiskTotalBytes,
 		DiskFreeBytes:   hb.DiskFreeBytes,
 		DiskUsedPct:     hb.DiskUsedPct,

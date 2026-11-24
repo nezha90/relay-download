@@ -1,6 +1,10 @@
 const STORAGE_KEY = 'relay_admin_token';
 let adminToken = sessionStorage.getItem(STORAGE_KEY) || '';
 let refreshTimer = null;
+let deployPollTimer = null;
+let cachedReleases = [];
+let lastPrecheck = null;
+const selectedNodes = { agent_a: new Set(), agent_b: new Set() };
 
 function fmtBytes(bytes) {
   if (!bytes || bytes <= 0) return '0 B';
@@ -19,14 +23,13 @@ function esc(s) {
 }
 
 async function api(path, opts = {}) {
-  const res = await fetch(path, {
-    ...opts,
-    headers: {
-      'Content-Type': 'application/json',
-      'X-Admin-Token': adminToken,
-      ...(opts.headers || {}),
-    },
-  });
+  const isFormData = opts.body instanceof FormData;
+  const headers = {
+    'X-Admin-Token': adminToken,
+    ...(isFormData ? {} : { 'Content-Type': 'application/json' }),
+    ...(opts.headers || {}),
+  };
+  const res = await fetch(path, { ...opts, headers });
   if (res.status === 401) {
     adminToken = '';
     sessionStorage.removeItem(STORAGE_KEY);
@@ -49,19 +52,30 @@ function hideLogin() {
 }
 
 function openModal(id) { document.getElementById(id).classList.remove('hidden'); }
-function closeModal(id) { document.getElementById(id).classList.add('hidden'); }
+function closeModal(id) {
+  document.getElementById(id).classList.add('hidden');
+  if (id === 'deploy-a-modal' && deployPollTimer) {
+    clearInterval(deployPollTimer);
+    deployPollTimer = null;
+  }
+}
 window.closeModal = closeModal;
 
 async function refreshAll() {
   if (!adminToken) return;
   try {
-    const [overview, nodes] = await Promise.all([
+    const [overview, nodes, releases, tasks] = await Promise.all([
       api('/api/v1/admin/overview'),
       api('/api/v1/admin/nodes'),
+      api('/api/v1/admin/releases'),
+      api('/api/v1/admin/deploy/tasks'),
     ]);
+    cachedReleases = releases || [];
     renderDashboard(overview);
     renderProjects(overview.projects || []);
     renderNodes(nodes || []);
+    renderReleases(cachedReleases);
+    renderDeployTasks(tasks || []);
   } catch (e) {
     if (e.message !== 'unauthorized') console.error(e);
   }
@@ -119,7 +133,6 @@ function renderTrendChart(days) {
     el.innerHTML = '<div class="empty">暂无历史汇总统计</div>';
     return;
   }
-  // Pad to a full 14-day UTC series so sparse data never stretches a single bar across the chart.
   const byDate = new Map(days.map(d => [d.date, d]));
   const series = [];
   const now = new Date();
@@ -202,20 +215,47 @@ function renderProjects(projects) {
   }).join('');
 }
 
+function renderUpgradeBadge(n) {
+  if (!n.upgrade_status) return '';
+  const map = {
+    pending: { cls: 'alarm', txt: `待升 → ${n.target_version}` },
+    downloading: { cls: 'alarm', txt: `下载中 → ${n.target_version}` },
+    restarting: { cls: 'alarm', txt: `重启中 → ${n.target_version}` },
+    completed: { cls: 'online', txt: `已升级 ${n.target_version}` },
+    failed: { cls: 'offline', txt: `升级失败` },
+  };
+  const info = map[n.upgrade_status] || { cls: '', txt: n.upgrade_status };
+  const title = n.upgrade_message ? ` title="${esc(n.upgrade_message)}"` : '';
+  return `<span class="badge ${info.cls}"${title}>${esc(info.txt)}</span>`;
+}
+
 function renderNodes(nodes) {
   const as = nodes.filter(n => n.role === 'agent_a');
   const bs = nodes.filter(n => n.role === 'agent_b');
+
+  // Drop deleted IDs from selection sets.
+  const aIDs = new Set(as.map(n => n.id));
+  for (const id of selectedNodes.agent_a) if (!aIDs.has(id)) selectedNodes.agent_a.delete(id);
+  const bIDs = new Set(bs.map(n => n.id));
+  for (const id of selectedNodes.agent_b) if (!bIDs.has(id)) selectedNodes.agent_b.delete(id);
 
   document.getElementById('nodes-a-tbody').innerHTML = as.length ? as.map(n => {
     const ready = (n.availability || []).reduce((a, x) => a + x.ready_count, 0);
     const claimed = (n.availability || []).reduce((a, x) => a + x.claimed_count, 0);
     const pct = (n.disk_used_pct || 0).toFixed(1);
+    const verStr = n.version ? `${n.version}${n.arch ? ' · ' + n.arch : ''}` : '-';
+    const checked = selectedNodes.agent_a.has(n.id) ? 'checked' : '';
     return `
       <tr>
+        <td><input type="checkbox" class="node-chk" data-role="agent_a" data-id="${esc(n.id)}" ${checked} /></td>
         <td><strong>${esc(n.name)}</strong><div class="mono muted">${esc(n.id)}</div></td>
         <td>
-          <span class="badge ${n.online ? 'online' : 'offline'}">${n.online ? '在线' : '离线'}</span>
-          ${n.disk_alarm ? '<span class="badge alarm">水位告警</span>' : ''}
+          <div style="display:flex;gap:4px;flex-wrap:wrap;align-items:center">
+            <span class="badge ${n.online ? 'online' : 'offline'}">${n.online ? '在线' : '离线'}</span>
+            ${n.disk_alarm ? '<span class="badge alarm">水位告警</span>' : ''}
+            ${renderUpgradeBadge(n)}
+          </div>
+          <div class="mono muted" style="margin-top:3px">${esc(verStr)}</div>
         </td>
         <td class="mono">${esc(n.public_addr || '-')}</td>
         <td>
@@ -225,24 +265,108 @@ function renderNodes(nodes) {
         <td>${ready} 待下 / ${claimed} 传中</td>
         <td class="mono">${fmtSpeed(n.speed_bps)}</td>
         <td>
-          <button class="btn sm" data-action="view-node-live" data-id="${esc(n.id)}">实时队列</button>
-          <button class="btn sm danger" data-action="delete-node" data-id="${esc(n.id)}">删除</button>
+          <div class="btn-row">
+            <button class="btn sm" data-action="view-node-live" data-id="${esc(n.id)}">实时队列</button>
+            <button class="btn sm danger" data-action="delete-node" data-id="${esc(n.id)}">删除</button>
+          </div>
         </td>
       </tr>
     `;
-  }).join('') : '<tr><td colspan="7" class="empty">暂无注册的 A 节点</td></tr>';
+  }).join('') : '<tr><td colspan="8" class="empty">暂无注册的 A 节点</td></tr>';
 
-  document.getElementById('nodes-b-tbody').innerHTML = bs.length ? bs.map(n => `
+  document.getElementById('nodes-b-tbody').innerHTML = bs.length ? bs.map(n => {
+    const verStr = n.version ? `${n.version}${n.arch ? ' · ' + n.arch : ''}` : '-';
+    const checked = selectedNodes.agent_b.has(n.id) ? 'checked' : '';
+    return `
+      <tr>
+        <td><input type="checkbox" class="node-chk" data-role="agent_b" data-id="${esc(n.id)}" ${checked} /></td>
+        <td><strong>${esc(n.name)}</strong><div class="mono muted">${esc(n.id)}</div></td>
+        <td>
+          <div style="display:flex;gap:4px;flex-wrap:wrap;align-items:center">
+            <span class="badge ${n.online ? 'online' : 'offline'}">${n.online ? '在线' : '离线'}</span>
+            ${renderUpgradeBadge(n)}
+          </div>
+          <div class="mono muted" style="margin-top:3px">${esc(verStr)}</div>
+        </td>
+        <td class="mono">${(n.projects && n.projects.length) ? esc(n.projects.join(', ')) : '全部'}</td>
+        <td>${fmtBytes(n.disk_free_bytes)} <span class="muted">(${(n.disk_used_pct || 0).toFixed(1)}% 已用)</span></td>
+        <td>${n.active_streams} 个任务</td>
+        <td class="mono">${fmtSpeed(n.speed_bps)}</td>
+        <td>
+          <div class="btn-row">
+            <button class="btn sm" data-action="open-b-script" data-id="${esc(n.id)}">安装脚本</button>
+            <button class="btn sm danger" data-action="delete-node" data-id="${esc(n.id)}">删除</button>
+          </div>
+        </td>
+      </tr>
+    `;
+  }).join('') : '<tr><td colspan="8" class="empty">暂无注册的 B 节点</td></tr>';
+
+  document.getElementById('chk-all-a').checked = as.length > 0 && as.every(n => selectedNodes.agent_a.has(n.id));
+  document.getElementById('chk-all-b').checked = bs.length > 0 && bs.every(n => selectedNodes.agent_b.has(n.id));
+}
+
+function populateReleaseSelect(selectEl, role, emptyLabel) {
+  if (!selectEl) return;
+  const prev = selectEl.value;
+  const list = cachedReleases.filter(r => r.role === role);
+  const opts = [];
+  if (emptyLabel) opts.push(`<option value="">${esc(emptyLabel)}</option>`);
+  if (!list.length && !emptyLabel) {
+    opts.push('<option value="">请先在「部署与版本」上传发布包</option>');
+  }
+  for (const r of list) {
+    opts.push(`<option value="${esc(r.id)}">${esc(r.version)} (${esc(r.os)}/${esc(r.arch)} · ${fmtBytes(r.size)})</option>`);
+  }
+  selectEl.innerHTML = opts.join('');
+  if (prev && list.some(r => r.id === prev)) {
+    selectEl.value = prev;
+  }
+}
+
+function renderReleases(list) {
+  populateReleaseSelect(document.getElementById('batch-rel-a'), 'agent_a', '');
+  populateReleaseSelect(document.getElementById('batch-rel-b'), 'agent_b', '');
+  populateReleaseSelect(document.getElementById('deploy-a-release-select'), 'agent_a', '自动匹配最新 agent_a 发布包');
+  populateReleaseSelect(document.getElementById('b-script-release-select'), 'agent_b', '自动匹配最新 agent_b 发布包');
+
+  const tbody = document.getElementById('releases-tbody');
+  tbody.innerHTML = list.length ? list.map(r => `
     <tr>
-      <td><strong>${esc(n.name)}</strong><div class="mono muted">${esc(n.id)}</div></td>
-      <td><span class="badge ${n.online ? 'online' : 'offline'}">${n.online ? '在线' : '离线'}</span></td>
-      <td class="mono">${(n.projects && n.projects.length) ? esc(n.projects.join(', ')) : '全部'}</td>
-      <td>${fmtBytes(n.disk_free_bytes)} <span class="muted">(${(n.disk_used_pct || 0).toFixed(1)}% 已用)</span></td>
-      <td>${n.active_streams} 个任务</td>
-      <td class="mono">${fmtSpeed(n.speed_bps)}</td>
-      <td><button class="btn sm danger" data-action="delete-node" data-id="${esc(n.id)}">删除</button></td>
+      <td><span class="badge">${r.role === 'agent_a' ? 'A 节点' : 'B 节点'}</span></td>
+      <td class="mono"><strong>${esc(r.version)}</strong></td>
+      <td class="mono">${esc(r.os)}/${esc(r.arch)}</td>
+      <td>${fmtBytes(r.size)}</td>
+      <td class="mono muted">${esc((r.sha256 || '').slice(0, 14))}…</td>
+      <td class="muted">${esc(r.notes || '-')}</td>
+      <td><button class="btn sm danger" data-action="delete-release" data-id="${esc(r.id)}">删除</button></td>
     </tr>
-  `).join('') : '<tr><td colspan="7" class="empty">暂无注册的 B 节点</td></tr>';
+  `).join('') : '<tr><td colspan="7" class="empty">暂未上传发布包，请先在上方上传 Linux 编译产物</td></tr>';
+}
+
+function renderDeployTasks(tasks) {
+  const el = document.getElementById('deploy-tasks-list');
+  if (!tasks.length) {
+    el.innerHTML = '<div class="empty">暂无一键部署记录</div>';
+    return;
+  }
+  el.innerHTML = tasks.slice(0, 8).map(t => {
+    const cls = t.status === 'succeeded' ? 'online' : (t.status === 'failed' ? 'offline' : 'alarm');
+    const lbl = t.status === 'succeeded' ? '成功' : (t.status === 'failed' ? '失败' : '部署中');
+    return `
+      <div class="transfer-row">
+        <div class="transfer-meta">
+          <div>
+            <strong>${esc(t.node_id)}</strong>
+            <span class="mono muted">${esc(t.host)}</span>
+            <span class="badge ${cls}">${lbl}</span>
+          </div>
+          <button class="btn sm" data-action="view-deploy-task" data-id="${esc(t.id)}">查看日志</button>
+        </div>
+        <div class="muted">版本: ${esc(t.release_version || '-')} · 阶段: ${esc(t.step)}${t.error ? ' · ' + esc(t.error) : ''}</div>
+      </div>
+    `;
+  }).join('');
 }
 
 window.viewNodeLive = async function(nodeId) {
@@ -324,26 +448,227 @@ async function deleteProject(id) {
   }
 }
 
+async function deleteRelease(id) {
+  if (!confirm('确认删除该发布包吗？')) return;
+  try {
+    await api(`/api/v1/admin/releases/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    refreshAll();
+  } catch (e) {
+    if (e.message !== 'unauthorized') alert(`删除发布包失败: ${e.message}`);
+  }
+}
+
+async function runBatchUpgrade(role) {
+  const selectId = role === 'agent_a' ? 'batch-rel-a' : 'batch-rel-b';
+  const msgId = role === 'agent_a' ? 'batch-msg-a' : 'batch-msg-b';
+  const releaseID = document.getElementById(selectId).value;
+  const nodeIDs = Array.from(selectedNodes[role]);
+  if (!releaseID) {
+    alert('请先选择目标发布包（如为空，请先在「部署与版本」页签上传）');
+    return;
+  }
+  if (!nodeIDs.length) {
+    alert('请先勾选至少一个节点');
+    return;
+  }
+  if (!confirm(`确认向 ${nodeIDs.length} 个节点下发批量更新指令吗？\n目标节点: ${nodeIDs.join(', ')}`)) return;
+  try {
+    const res = await api('/api/v1/admin/upgrades', {
+      method: 'POST',
+      body: JSON.stringify({ release_id: releaseID, node_ids: nodeIDs }),
+    });
+    const skippedKeys = Object.keys(res.skipped || {});
+    let txt = `已下发 ${res.queued.length} 个节点`;
+    if (skippedKeys.length) {
+      txt += `，跳过 ${skippedKeys.length} 个 (${skippedKeys.map(k => `${k}: ${res.skipped[k]}`).join('; ')})`;
+    }
+    document.getElementById(msgId).textContent = txt;
+    selectedNodes[role].clear();
+    refreshAll();
+  } catch (e) {
+    if (e.message !== 'unauthorized') alert(`批量更新下发失败: ${e.message}`);
+  }
+}
+
+function openDeployAModal() {
+  lastPrecheck = null;
+  const form = document.getElementById('deploy-a-form');
+  form.reset();
+  document.getElementById('precheck-result').classList.add('hidden');
+  document.getElementById('deploy-progress-box').classList.add('hidden');
+  document.getElementById('deploy-force-wrap').classList.add('hidden');
+  document.getElementById('deploy-force-chk').checked = false;
+  document.getElementById('btn-confirm-deploy-a').disabled = true;
+  populateReleaseSelect(document.getElementById('deploy-a-release-select'), 'agent_a', '自动匹配最新 agent_a 发布包');
+  openModal('deploy-a-modal');
+}
+
+function readDeployAForm() {
+  const fd = new FormData(document.getElementById('deploy-a-form'));
+  const projs = String(fd.get('projects') || '').split(',').map(s => s.trim()).filter(Boolean);
+  return {
+    host: String(fd.get('host') || '').trim(),
+    ssh_port: Number(fd.get('ssh_port') || 22),
+    ssh_user: String(fd.get('ssh_user') || 'root').trim(),
+    ssh_password: String(fd.get('ssh_password') || ''),
+    node_id: String(fd.get('node_id') || '').trim(),
+    node_name: String(fd.get('node_name') || '').trim(),
+    public_port: Number(fd.get('public_port') || 8443),
+    local_port: Number(fd.get('local_port') || 18081),
+    install_dir: String(fd.get('install_dir') || '/opt/relay-agent-a').trim(),
+    data_dir: String(fd.get('data_dir') || '/data/relay-a').trim(),
+    projects: projs,
+    release_id: String(fd.get('release_id') || ''),
+    force_overwrite: document.getElementById('deploy-force-chk').checked,
+  };
+}
+
+function renderPrecheckResult(res) {
+  const box = document.getElementById('precheck-result');
+  let banner = '';
+  if (res.ok) {
+    banner = '<div class="banner pass">全部环境检测通过！确认参数无误后点击「2. 确认一键部署」。</div>';
+  } else if (res.can_force) {
+    banner = '<div class="banner warn">检测到可覆盖的警告项（例如目录非空或已有服务），请勾选「确认覆盖」后再点击部署。</div>';
+  } else {
+    banner = '<div class="banner fail">存在阻断性环境错误，请先解决红色 FAIL 项后重新执行预检。</div>';
+  }
+  const rows = (res.checks || []).map(c => {
+    const cls = c.status === 'pass' ? 'online' : (c.status === 'warn' ? 'alarm' : 'offline');
+    return `
+      <div class="check-row">
+        <div><strong>${esc(c.label)}</strong><div class="muted">${esc(c.detail)}</div></div>
+        <span class="badge ${cls}">${esc(c.status.toUpperCase())}</span>
+      </div>
+    `;
+  }).join('');
+  box.innerHTML = `${banner}<div class="check-list">${rows}</div>`;
+  box.classList.remove('hidden');
+
+  const forceWrap = document.getElementById('deploy-force-wrap');
+  const forceChk = document.getElementById('deploy-force-chk');
+  const deployBtn = document.getElementById('btn-confirm-deploy-a');
+  forceChk.checked = false;
+  if (res.ok) {
+    forceWrap.classList.add('hidden');
+    deployBtn.disabled = false;
+  } else if (res.can_force) {
+    forceWrap.classList.remove('hidden');
+    deployBtn.disabled = true;
+  } else {
+    forceWrap.classList.add('hidden');
+    deployBtn.disabled = true;
+  }
+}
+
+function renderDeployTaskDetail(t, targetEl) {
+  const cls = t.status === 'succeeded' ? 'pass' : (t.status === 'failed' ? 'fail' : 'warn');
+  const title = t.status === 'succeeded'
+    ? `部署成功！公网地址: ${t.public_addr}`
+    : (t.status === 'failed' ? `部署失败: ${t.error}` : `正在部署 (${t.step})...`);
+  let tokHtml = '';
+  if (t.local_token) {
+    tokHtml = `
+      <div class="token-box" style="margin-bottom:10px">
+        <strong>请保存该 A 节点的本机上传密钥 X-Local-Token（仅展示一次）：</strong>
+        <div class="mono" style="margin-top:6px">${esc(t.local_token)}</div>
+      </div>
+    `;
+  }
+  targetEl.innerHTML = `
+    <div class="banner ${cls}">${esc(title)}</div>
+    ${tokHtml}
+    <div class="log-box">${esc((t.logs || []).join('\n'))}</div>
+  `;
+  targetEl.classList.remove('hidden');
+}
+
+function startDeployPolling(taskId) {
+  if (deployPollTimer) clearInterval(deployPollTimer);
+  const box = document.getElementById('deploy-progress-box');
+  const poll = async () => {
+    try {
+      const t = await api(`/api/v1/admin/deploy/tasks/${encodeURIComponent(taskId)}`);
+      renderDeployTaskDetail(t, box);
+      if (t.status !== 'running') {
+        clearInterval(deployPollTimer);
+        deployPollTimer = null;
+        refreshAll();
+      }
+    } catch (e) {
+      clearInterval(deployPollTimer);
+      deployPollTimer = null;
+    }
+  };
+  poll();
+  deployPollTimer = setInterval(poll, 1000);
+}
+
+async function viewDeployTaskLog(taskId) {
+  document.getElementById('live-modal-title').textContent = `部署任务日志: ${taskId.slice(0, 8)}`;
+  const body = document.getElementById('live-modal-body');
+  body.innerHTML = '<div class="empty">加载日志...</div>';
+  openModal('live-modal');
+  try {
+    const t = await api(`/api/v1/admin/deploy/tasks/${encodeURIComponent(taskId)}`);
+    renderDeployTaskDetail(t, body);
+  } catch (e) {
+    body.innerHTML = `<div class="err-msg">${esc(e.message)}</div>`;
+  }
+}
+
+function openBScriptModal(nodeId, presetToken = '') {
+  const form = document.getElementById('b-script-form');
+  form.reset();
+  form.elements.node_id.value = nodeId;
+  form.elements.node_token.value = presetToken;
+  document.getElementById('b-script-title').textContent = `内网 B 节点一键安装脚本: ${nodeId}`;
+  document.getElementById('b-script-output').classList.add('hidden');
+  document.getElementById('btn-copy-b-script').classList.add('hidden');
+  populateReleaseSelect(document.getElementById('b-script-release-select'), 'agent_b', '自动匹配最新 agent_b 发布包');
+  openModal('b-script-modal');
+}
+
 function setupEvents() {
   document.addEventListener('click', (e) => {
     const btn = e.target.closest('button[data-action]');
     if (!btn) return;
     const id = btn.dataset.id || '';
     switch (btn.dataset.action) {
-      case 'view-project-live':
-        window.viewProjectLive(id);
-        break;
-      case 'delete-project':
-        deleteProject(id);
-        break;
-      case 'view-node-live':
-        window.viewNodeLive(id);
-        break;
-      case 'delete-node':
-        deleteNode(id);
-        break;
+      case 'view-project-live': window.viewProjectLive(id); break;
+      case 'delete-project': deleteProject(id); break;
+      case 'view-node-live': window.viewNodeLive(id); break;
+      case 'delete-node': deleteNode(id); break;
+      case 'delete-release': deleteRelease(id); break;
+      case 'view-deploy-task': viewDeployTaskLog(id); break;
+      case 'open-b-script': openBScriptModal(id); break;
     }
   });
+
+  document.addEventListener('change', (e) => {
+    const chk = e.target.closest('input.node-chk');
+    if (chk) {
+      const role = chk.dataset.role;
+      const id = chk.dataset.id;
+      if (chk.checked) selectedNodes[role].add(id);
+      else selectedNodes[role].delete(id);
+    }
+  });
+
+  const bindSelectAll = (chkId, role) => {
+    document.getElementById(chkId).addEventListener('change', (e) => {
+      document.querySelectorAll(`input.node-chk[data-role="${role}"]`).forEach(el => {
+        el.checked = e.target.checked;
+        if (e.target.checked) selectedNodes[role].add(el.dataset.id);
+        else selectedNodes[role].delete(el.dataset.id);
+      });
+    });
+  };
+  bindSelectAll('chk-all-a', 'agent_a');
+  bindSelectAll('chk-all-b', 'agent_b');
+
+  document.getElementById('btn-batch-upgrade-a').addEventListener('click', () => runBatchUpgrade('agent_a'));
+  document.getElementById('btn-batch-upgrade-b').addEventListener('click', () => runBatchUpgrade('agent_b'));
 
   document.querySelectorAll('.tab').forEach(btn => {
     btn.addEventListener('click', () => {
@@ -414,7 +739,7 @@ function setupEvents() {
     const form = document.getElementById('create-node-form');
     form.reset();
     form.elements.role.value = role;
-    document.getElementById('node-modal-title').textContent = role === 'agent_a' ? '注册公网 A 节点' : '注册内网 B 节点';
+    document.getElementById('node-modal-title').textContent = role === 'agent_a' ? '手动注册公网 A 节点' : '注册内网 B 节点';
     document.getElementById('node-public-addr-wrap').classList.toggle('hidden', role !== 'agent_a');
     document.getElementById('node-token-result').classList.add('hidden');
     openModal('node-modal');
@@ -426,23 +751,161 @@ function setupEvents() {
     e.preventDefault();
     const fd = new FormData(e.target);
     const projs = String(fd.get('projects') || '').split(',').map(s => s.trim()).filter(Boolean);
+    const role = fd.get('role');
     try {
       const res = await api('/api/v1/admin/nodes', {
         method: 'POST',
         body: JSON.stringify({
           id: fd.get('id'),
           name: fd.get('name'),
-          role: fd.get('role'),
+          role,
           public_addr: fd.get('public_addr'),
           projects: projs,
         }),
       });
       const box = document.getElementById('node-token-result');
-      box.innerHTML = `<strong>节点已创建！请妥善保存接入 Token（仅展示一次）：</strong><div class="mono" style="margin-top:6px">${esc(res.token)}</div>`;
+      const extraBtn = role === 'agent_b'
+        ? `<div style="margin-top:8px"><button type="button" class="btn sm primary" id="btn-gen-b-after-create">生成一键安装脚本</button></div>`
+        : '';
+      box.innerHTML = `<strong>节点已创建！请妥善保存接入 Token（仅展示一次）：</strong><div class="mono" style="margin-top:6px">${esc(res.token)}</div>${extraBtn}`;
       box.classList.remove('hidden');
+      if (role === 'agent_b') {
+        document.getElementById('btn-gen-b-after-create').addEventListener('click', () => {
+          closeModal('node-modal');
+          openBScriptModal(res.node.id, res.token);
+        });
+      }
       refreshAll();
     } catch (err) {
       if (err.message !== 'unauthorized') alert(`创建节点失败: ${err.message}`);
+    }
+  });
+
+  // Release upload
+  document.getElementById('upload-release-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const msgEl = document.getElementById('release-upload-msg');
+    msgEl.textContent = '正在上传并校验 SHA256...';
+    const fd = new FormData(e.target);
+    try {
+      const rel = await api('/api/v1/admin/releases', { method: 'POST', body: fd });
+      msgEl.textContent = `上传成功: ${rel.role} ${rel.version} (${rel.os}/${rel.arch}, ${fmtBytes(rel.size)})`;
+      e.target.reset();
+      refreshAll();
+    } catch (err) {
+      msgEl.textContent = '';
+      if (err.message !== 'unauthorized') alert(`上传发布包失败: ${err.message}`);
+    }
+  });
+
+  // One-click Deploy A wizard
+  document.getElementById('open-deploy-a-modal').addEventListener('click', openDeployAModal);
+  document.getElementById('open-deploy-a-from-tab').addEventListener('click', openDeployAModal);
+
+  document.getElementById('deploy-force-chk').addEventListener('change', (e) => {
+    if (lastPrecheck && lastPrecheck.can_force && !lastPrecheck.ok) {
+      document.getElementById('btn-confirm-deploy-a').disabled = !e.target.checked;
+    }
+  });
+
+  document.getElementById('btn-run-precheck').addEventListener('click', async () => {
+    const payload = readDeployAForm();
+    if (!payload.host) {
+      alert('请先输入目标服务器公网 IP');
+      return;
+    }
+    const btn = document.getElementById('btn-run-precheck');
+    const box = document.getElementById('precheck-result');
+    btn.disabled = true;
+    btn.textContent = '正在连接预检...';
+    box.innerHTML = '<div class="empty">正在通过 SSH 探测目标主机 root 权限、端口、目录、磁盘与服务...</div>';
+    box.classList.remove('hidden');
+    document.getElementById('btn-confirm-deploy-a').disabled = true;
+    try {
+      const res = await api('/api/v1/admin/deploy/precheck', {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      });
+      lastPrecheck = res;
+      renderPrecheckResult(res);
+    } catch (err) {
+      box.innerHTML = `<div class="banner fail">预检请求失败: ${esc(err.message)}</div>`;
+    } finally {
+      btn.disabled = false;
+      btn.textContent = '1. 执行环境预检';
+    }
+  });
+
+  document.getElementById('deploy-a-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const payload = readDeployAForm();
+    if (!payload.node_id) {
+      alert('请输入节点 ID');
+      return;
+    }
+    if (!lastPrecheck || (!lastPrecheck.ok && !(lastPrecheck.can_force && payload.force_overwrite))) {
+      alert('请先完成环境预检并确认通过');
+      return;
+    }
+    document.getElementById('btn-confirm-deploy-a').disabled = true;
+    try {
+      const task = await api('/api/v1/admin/deploy/agent-a', {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      });
+      startDeployPolling(task.id);
+    } catch (err) {
+      if (err.message !== 'unauthorized') alert(`启动部署失败: ${err.message}`);
+      document.getElementById('btn-confirm-deploy-a').disabled = false;
+    }
+  });
+
+  // Agent B Install Script generator
+  let lastBScript = '';
+  document.getElementById('b-script-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    const projects = {};
+    String(fd.get('projects_map') || '').split('\n').forEach(line => {
+      const trimmed = line.trim();
+      if (!trimmed || !trimmed.includes('=')) return;
+      const idx = trimmed.indexOf('=');
+      const k = trimmed.slice(0, idx).trim();
+      const v = trimmed.slice(idx + 1).trim();
+      if (k && v) projects[k] = v;
+    });
+    try {
+      const res = await api('/api/v1/admin/deploy/agent-b-script', {
+        method: 'POST',
+        body: JSON.stringify({
+          node_id: fd.get('node_id'),
+          node_token: fd.get('node_token'),
+          rotate_token: fd.get('rotate_token') === 'on',
+          install_dir: fd.get('install_dir'),
+          state_dir: fd.get('state_dir'),
+          release_id: fd.get('release_id'),
+          projects,
+        }),
+      });
+      lastBScript = res.script || '';
+      const out = document.getElementById('b-script-output');
+      out.innerHTML = `<div class="log-box">${esc(lastBScript)}</div>`;
+      out.classList.remove('hidden');
+      document.getElementById('btn-copy-b-script').classList.remove('hidden');
+    } catch (err) {
+      if (err.message !== 'unauthorized') alert(`生成安装脚本失败: ${err.message}`);
+    }
+  });
+
+  document.getElementById('btn-copy-b-script').addEventListener('click', async () => {
+    if (!lastBScript) return;
+    try {
+      await navigator.clipboard.writeText(lastBScript);
+      const b = document.getElementById('btn-copy-b-script');
+      b.textContent = '已复制！';
+      setTimeout(() => { b.textContent = '复制脚本'; }, 1500);
+    } catch {
+      alert('剪贴板复制失败，请手动选中下方脚本复制');
     }
   });
 }

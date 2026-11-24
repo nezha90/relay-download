@@ -60,11 +60,15 @@ func newTestEnv(t *testing.T) *testEnv {
 	}
 
 	cPort := freePort(t)
+	centerURL := fmt.Sprintf("https://127.0.0.1:%d", cPort)
 	cfg := &center.Config{
 		Listen:         fmt.Sprintf("127.0.0.1:%d", cPort),
 		TLSCert:        cCert,
 		TLSKey:         cKey,
 		CACert:         caCert,
+		CAKey:          caKey,
+		PublicURL:      centerURL,
+		ReleasesDir:    filepath.Join(dir, "releases"),
 		DBPath:         filepath.Join(dir, "center.db"),
 		JWTSecret:      "test-jwt-secret-12345",
 		CenterSecret:   "test-center-secret-12345",
@@ -204,6 +208,70 @@ func (e *testEnv) startAgentA(ctx context.Context, nodeID string, projects []str
 	}, "agent-a "+nodeID+" ready")
 
 	return ag, localAddr, cfg.LocalToken
+}
+
+func (e *testEnv) startAgentAWithUpgrade(ctx context.Context, nodeID, exePath string, onRestart func(string)) (*agenta.Agent, string, string) {
+	e.t.Helper()
+	certDir := filepath.Join(e.dir, "certs")
+	certPath := filepath.Join(certDir, nodeID+".crt")
+	keyPath := filepath.Join(certDir, nodeID+".key")
+	if err := pki.IssueCert(e.caCert, e.caKey, certPath, keyPath, nodeID, []string{"127.0.0.1"}, nil, 365); err != nil {
+		e.t.Fatalf("IssueCert %s: %v", nodeID, err)
+	}
+	localPort := freePort(e.t)
+	pubPort := freePort(e.t)
+	pubAddr := fmt.Sprintf("https://127.0.0.1:%d", pubPort)
+	localAddr := fmt.Sprintf("http://127.0.0.1:%d", localPort)
+	nodeTok := auth.GenerateRandomToken(16)
+	if err := e.centerSrv.Store().UpsertNode(context.Background(), protocol.NodeRecord{
+		ID: nodeID, Name: "Node " + nodeID, Role: protocol.RoleAgentA, PublicAddr: pubAddr,
+	}, nodeTok); err != nil {
+		e.t.Fatalf("UpsertNode %s: %v", nodeID, err)
+	}
+	cfg := &agenta.Config{
+		NodeID: nodeID, NodeName: "Node " + nodeID, PublicAddr: pubAddr,
+		CenterURL: e.centerURL, CenterToken: nodeTok, JWTSecret: e.jwtSecret, CenterSecret: e.centerSecret,
+		LocalListen: fmt.Sprintf("127.0.0.1:%d", localPort), LocalToken: "local-secret-" + nodeID,
+		PublicListen: fmt.Sprintf("127.0.0.1:%d", pubPort), TLSCert: certPath, TLSKey: keyPath, CACert: e.caCert,
+		DataDir: filepath.Join(e.dir, "data-"+nodeID), MaxDiskUsagePct: 99.9, LeaseTTLSec: 60,
+		MaxConcurrentStreams: 8, HeartbeatIntervalSec: 1,
+	}
+	ag, err := agenta.New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		e.t.Fatalf("agenta.New %s: %v", nodeID, err)
+	}
+	ag.UpgradeExePath = exePath
+	ag.UpgradeRestartHook = onRestart
+	go func() { _ = ag.Start(ctx) }()
+	e.t.Cleanup(func() { _ = ag.Shutdown(context.Background()) })
+	return ag, localAddr, cfg.LocalToken
+}
+
+func (e *testEnv) startAgentBWithUpgrade(ctx context.Context, nodeID string, projects map[string]string, exePath string, onRestart func(string)) *agentb.Agent {
+	e.t.Helper()
+	nodeTok := auth.GenerateRandomToken(16)
+	projIDs := make([]string, 0, len(projects))
+	for k := range projects {
+		projIDs = append(projIDs, k)
+	}
+	if err := e.centerSrv.Store().UpsertNode(context.Background(), protocol.NodeRecord{
+		ID: nodeID, Name: "Node " + nodeID, Role: protocol.RoleAgentB, Projects: projIDs,
+	}, nodeTok); err != nil {
+		e.t.Fatalf("UpsertNode %s: %v", nodeID, err)
+	}
+	cfg := &agentb.Config{
+		NodeID: nodeID, NodeName: "Node " + nodeID, CenterURL: e.centerURL, CenterToken: nodeTok,
+		CACert: e.caCert, Projects: projects, StateDir: filepath.Join(e.dir, "state-"+nodeID),
+		MaxConcurrent: 2, PollIntervalSec: 1, HeartbeatIntervalSec: 1,
+	}
+	ag, err := agentb.New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		e.t.Fatalf("agentb.New %s: %v", nodeID, err)
+	}
+	ag.UpgradeExePath = exePath
+	ag.UpgradeRestartHook = onRestart
+	go func() { _ = ag.Start(ctx) }()
+	return ag
 }
 
 func (e *testEnv) startAgentB(ctx context.Context, nodeID string, projects map[string]string, maxConc int) *agentb.Agent {

@@ -2,6 +2,13 @@ listen: "0.0.0.0:8440"
 tls_cert: "./certs/center.crt"
 tls_key: "./certs/center.key"
 ca_cert: "./certs/ca.crt"
+# 一键部署公网 A 节点与生成 B 节点安装脚本所需配置（按需填写）
+ca_key: "./certs/ca.key"
+public_url: "https://5.6.7.8:8440"
+releases_dir: "./data-center/releases"
+# 留空默认自动读取当前用户 ~/.ssh/id_ed25519 或 ~/.ssh/id_rsa
+ssh_key_path: ""
+
 db_path: "./data-center/center.db"
 
 # 务必替换为高强度随机密钥（可用 openssl rand -hex 32 生成）

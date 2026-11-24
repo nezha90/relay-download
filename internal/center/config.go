@@ -14,6 +14,10 @@ type Config struct {
 	TLSCert        string `yaml:"tls_cert"`
 	TLSKey         string `yaml:"tls_key"`
 	CACert         string `yaml:"ca_cert"`
+	CAKey          string `yaml:"ca_key"`       // optional: required for one-click A node TLS cert issuance
+	PublicURL      string `yaml:"public_url"`   // optional: e.g. "https://5.6.7.8:8440", written into deployed agents
+	ReleasesDir    string `yaml:"releases_dir"` // directory storing uploaded agent binaries
+	SSHKeyPath     string `yaml:"ssh_key_path"` // optional: default SSH private key path on Center host
 	DBPath         string `yaml:"db_path"`
 	JWTSecret      string `yaml:"jwt_secret"`
 	CenterSecret   string `yaml:"center_secret"`
@@ -44,6 +48,9 @@ func (c *Config) ApplyDefaults() {
 	}
 	if c.DBPath == "" {
 		c.DBPath = "./data-center/center.db"
+	}
+	if c.ReleasesDir == "" {
+		c.ReleasesDir = "./data-center/releases"
 	}
 	if c.NodeOfflineSec <= 0 {
 		c.NodeOfflineSec = 20

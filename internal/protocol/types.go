@@ -66,6 +66,12 @@ type AgentAHeartbeatReq struct {
 	Name           string                `json:"name"`
 	PublicAddr     string                `json:"public_addr"`
 	Projects       []string              `json:"projects"`
+	Version          string                `json:"version,omitempty"`
+	OS               string                `json:"os,omitempty"`
+	Arch             string                `json:"arch,omitempty"`
+	UpgradeAttemptID string                `json:"upgrade_attempt_id,omitempty"`
+	UpgradeStatus    string                `json:"upgrade_status,omitempty"`
+	UpgradeError     string                `json:"upgrade_error,omitempty"`
 	DiskTotalBytes uint64                `json:"disk_total_bytes"`
 	DiskFreeBytes  uint64                `json:"disk_free_bytes"`
 	DiskUsedPct    float64               `json:"disk_used_pct"`
@@ -105,11 +111,29 @@ type AgentBHeartbeatReq struct {
 	NodeID          string            `json:"node_id"`
 	Name            string            `json:"name"`
 	Projects        []string          `json:"projects"`
+	Version          string            `json:"version,omitempty"`
+	OS               string            `json:"os,omitempty"`
+	Arch             string            `json:"arch,omitempty"`
+	UpgradeAttemptID string            `json:"upgrade_attempt_id,omitempty"`
+	UpgradeStatus    string            `json:"upgrade_status,omitempty"`
+	UpgradeError     string            `json:"upgrade_error,omitempty"`
 	DiskTotalBytes  uint64            `json:"disk_total_bytes"`
 	DiskFreeBytes   uint64            `json:"disk_free_bytes"`
 	DiskUsedPct     float64           `json:"disk_used_pct"`
 	ActiveTransfers []BActiveTransfer `json:"active_transfers"`
 	InSpeedBps      int64             `json:"in_speed_bps"`
+}
+
+type UpgradeDirective struct {
+	ReleaseID   string `json:"release_id"`
+	AttemptID   string `json:"attempt_id,omitempty"`
+	Version     string `json:"version"`
+	SHA256      string `json:"sha256"`
+	DownloadURL string `json:"download_url"`
+}
+
+type HeartbeatResp struct {
+	Upgrade *UpgradeDirective `json:"upgrade,omitempty"`
 }
 
 type DiscoverCandidate struct {
@@ -272,6 +296,12 @@ type LiveNodeView struct {
 	Projects        []string              `json:"projects"`
 	PublicAddr      string                `json:"public_addr,omitempty"`
 	Online          bool                  `json:"online"`
+	Version         string                `json:"version,omitempty"`
+	OS              string                `json:"os,omitempty"`
+	Arch            string                `json:"arch,omitempty"`
+	TargetVersion   string                `json:"target_version,omitempty"`
+	UpgradeStatus   string                `json:"upgrade_status,omitempty"`
+	UpgradeMessage  string                `json:"upgrade_message,omitempty"`
 	LastSeenAt      *time.Time            `json:"last_seen_at,omitempty"`
 	DiskTotalBytes  uint64                `json:"disk_total_bytes"`
 	DiskFreeBytes   uint64                `json:"disk_free_bytes"`
@@ -306,4 +336,138 @@ type OverviewResp struct {
 
 type ErrorResp struct {
 	Error string `json:"error"`
+}
+
+// --- Releases, Batch Upgrades & One-Click Deployment ---
+
+type ReleaseRecord struct {
+	ID        string    `json:"id"`
+	Role      string    `json:"role"` // "agent_a" | "agent_b"
+	Version   string    `json:"version"`
+	OS        string    `json:"os"`
+	Arch      string    `json:"arch"`
+	SHA256    string    `json:"sha256"`
+	Size      int64     `json:"size"`
+	Filename  string    `json:"filename"`
+	Notes     string    `json:"notes,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+type NodeUpgradeRecord struct {
+	NodeID        string    `json:"node_id"`
+	ReleaseID     string    `json:"release_id"`
+	AttemptID     string    `json:"attempt_id"`
+	TargetVersion string    `json:"target_version"`
+	Status        string    `json:"status"` // "pending" | "downloading" | "restarting" | "completed" | "failed"
+	Message       string    `json:"message,omitempty"`
+	UpdatedAt     time.Time `json:"updated_at"`
+}
+
+type BatchUpgradeReq struct {
+	ReleaseID string   `json:"release_id"`
+	NodeIDs   []string `json:"node_ids"`
+}
+
+type BatchUpgradeResult struct {
+	Queued  []string          `json:"queued"`
+	Skipped map[string]string `json:"skipped,omitempty"`
+}
+
+type DeployPrecheckReq struct {
+	Host          string `json:"host"`
+	SSHPort       int    `json:"ssh_port,omitempty"`
+	SSHUser       string `json:"ssh_user,omitempty"`
+	SSHPassword   string `json:"ssh_password,omitempty"`
+	SSHPrivateKey string `json:"ssh_private_key,omitempty"`
+	NodeID        string `json:"node_id,omitempty"`
+	PublicPort    int    `json:"public_port,omitempty"`
+	LocalPort     int    `json:"local_port,omitempty"`
+	InstallDir    string `json:"install_dir,omitempty"`
+	DataDir       string `json:"data_dir,omitempty"`
+	ReleaseID     string `json:"release_id,omitempty"`
+}
+
+type PrecheckItem struct {
+	Key    string `json:"key"`
+	Label  string `json:"label"`
+	Status string `json:"status"` // "pass" | "warn" | "fail"
+	Detail string `json:"detail"`
+}
+
+type RemoteHostInfo struct {
+	OS              string  `json:"os"`
+	Arch            string  `json:"arch"`
+	Distro          string  `json:"distro"`
+	Hostname        string  `json:"hostname"`
+	HostFingerprint string  `json:"host_fingerprint,omitempty"`
+	IsRoot          bool    `json:"is_root"`
+	HasSystemd      bool    `json:"has_systemd"`
+	DiskTotalBytes  uint64  `json:"disk_total_bytes"`
+	DiskFreeBytes   uint64  `json:"disk_free_bytes"`
+	DiskUsedPct     float64 `json:"disk_used_pct"`
+	ExistingService string  `json:"existing_service,omitempty"`
+	ExistingVersion string  `json:"existing_version,omitempty"`
+}
+
+type DeployPrecheckResp struct {
+	OK             bool           `json:"ok"`
+	CanForce       bool           `json:"can_force"`
+	HostInfo       RemoteHostInfo `json:"host_info"`
+	Checks         []PrecheckItem `json:"checks"`
+	MatchedRelease *ReleaseRecord `json:"matched_release,omitempty"`
+}
+
+type DeployAgentAReq struct {
+	Host                 string   `json:"host"`
+	SSHPort              int      `json:"ssh_port,omitempty"`
+	SSHUser              string   `json:"ssh_user,omitempty"`
+	SSHPassword          string   `json:"ssh_password,omitempty"`
+	SSHPrivateKey        string   `json:"ssh_private_key,omitempty"`
+	NodeID               string   `json:"node_id"`
+	NodeName             string   `json:"node_name,omitempty"`
+	Projects             []string `json:"projects,omitempty"`
+	PublicPort           int      `json:"public_port,omitempty"`
+	LocalPort            int      `json:"local_port,omitempty"`
+	InstallDir           string   `json:"install_dir,omitempty"`
+	DataDir              string   `json:"data_dir,omitempty"`
+	ReleaseID            string   `json:"release_id,omitempty"`
+	MaxDiskUsagePct      float64  `json:"max_disk_usage_pct,omitempty"`
+	MinFreeDiskBytes     uint64   `json:"min_free_disk_bytes,omitempty"`
+	LeaseTTLSec          int      `json:"lease_ttl_sec,omitempty"`
+	MaxConcurrentStreams int      `json:"max_concurrent_streams,omitempty"`
+	RateLimitMBps        float64  `json:"rate_limit_mbps,omitempty"`
+	ForceOverwrite       bool     `json:"force_overwrite,omitempty"`
+}
+
+type DeployTask struct {
+	ID             string     `json:"id"`
+	NodeID         string     `json:"node_id"`
+	Host           string     `json:"host"`
+	Status         string     `json:"status"` // "running" | "succeeded" | "failed"
+	Step           string     `json:"step"`
+	Logs           []string   `json:"logs"`
+	Error          string     `json:"error,omitempty"`
+	LocalToken     string     `json:"local_token,omitempty"`
+	PublicAddr     string     `json:"public_addr,omitempty"`
+	ReleaseVersion string     `json:"release_version,omitempty"`
+	StartedAt      time.Time  `json:"started_at"`
+	FinishedAt     *time.Time `json:"finished_at,omitempty"`
+}
+
+type AgentBScriptReq struct {
+	NodeID           string            `json:"node_id"`
+	NodeToken        string            `json:"node_token,omitempty"`
+	RotateToken      bool              `json:"rotate_token,omitempty"`
+	InstallDir       string            `json:"install_dir,omitempty"`
+	StateDir         string            `json:"state_dir,omitempty"`
+	Projects         map[string]string `json:"projects,omitempty"`
+	MaxConcurrent    int               `json:"max_concurrent,omitempty"`
+	MinFreeDiskBytes uint64            `json:"min_free_disk_bytes,omitempty"`
+	ReleaseID        string            `json:"release_id,omitempty"`
+}
+
+type AgentBScriptResp struct {
+	NodeID       string `json:"node_id"`
+	Script       string `json:"script"`
+	RotatedToken string `json:"rotated_token,omitempty"`
 }

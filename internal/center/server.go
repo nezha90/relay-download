@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"relay-download/internal/auth"
+	"relay-download/internal/deployer"
 	"relay-download/internal/pki"
 	"relay-download/internal/protocol"
 )
@@ -38,14 +39,18 @@ func validateHTTPSAddr(raw string) error {
 var embeddedWeb embed.FS
 
 type Server struct {
-	cfg        *Config
-	store      *Store
-	hub        *Hub
-	logger     *slog.Logger
-	proxyHTTP  *http.Client
-	httpServer *http.Server
-	ln         net.Listener
-	closeOnce  sync.Once
+	cfg         *Config
+	store       *Store
+	hub         *Hub
+	deployer    *deployer.Deployer
+	logger      *slog.Logger
+	proxyHTTP   *http.Client
+	httpServer  *http.Server
+	ln          net.Listener
+	deployMu    sync.RWMutex
+	deployTasks map[string]*protocol.DeployTask
+	deployOrder []string
+	closeOnce   sync.Once
 }
 
 func New(cfg *Config, logger *slog.Logger) (*Server, error) {
@@ -66,10 +71,19 @@ func New(cfg *Config, logger *slog.Logger) (*Server, error) {
 		return nil, err
 	}
 	return &Server{
-		cfg:    cfg,
-		store:  store,
-		hub:    NewHub(cfg.NodeOfflineTimeout()),
-		logger: logger.With("component", "center"),
+		cfg:   cfg,
+		store: store,
+		hub:   NewHub(cfg.NodeOfflineTimeout()),
+		deployer: deployer.New(deployer.Config{
+			DefaultSSHKeyPath: cfg.SSHKeyPath,
+			CACertPath:        cfg.CACert,
+			CAKeyPath:         cfg.CAKey,
+			CenterPublicURL:   cfg.PublicURL,
+			JWTSecret:         cfg.JWTSecret,
+			CenterSecret:      cfg.CenterSecret,
+		}),
+		logger:      logger.With("component", "center"),
+		deployTasks: make(map[string]*protocol.DeployTask),
 		proxyHTTP: &http.Client{
 			Timeout: 2 * time.Second, // Strict 2s timeout for live proxy queries to A nodes
 			Transport: &http.Transport{
@@ -173,6 +187,9 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("GET /api/v1/b/events", s.requireNode(protocol.RoleAgentB, s.handleBEventsSSE))
 	mux.HandleFunc("GET /api/v1/b/discover", s.requireNode(protocol.RoleAgentB, s.handleBDiscover))
 
+	// Shared node release download (Agent A or B pulls its own role's binary over TLS 1.3)
+	mux.HandleFunc("GET /api/v1/releases/{id}/download", s.requireNode("", s.handleNodeDownloadRelease))
+
 	// Admin & Web UI API
 	mux.HandleFunc("GET /api/v1/admin/overview", s.requireAdmin(s.handleAdminOverview))
 	mux.HandleFunc("GET /api/v1/admin/projects", s.requireAdmin(s.handleAdminListProjects))
@@ -184,6 +201,18 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("GET /api/v1/admin/nodes/{id}/live-files", s.requireAdmin(s.handleAdminNodeLiveFiles))
 	mux.HandleFunc("GET /api/v1/admin/projects/{id}/live-files", s.requireAdmin(s.handleAdminProjectLiveFiles))
 	mux.HandleFunc("GET /api/v1/admin/stats/daily", s.requireAdmin(s.handleAdminDailyStats))
+
+	// Releases, Batch Upgrades & One-Click Deployment API
+	mux.HandleFunc("GET /api/v1/admin/releases", s.requireAdmin(s.handleAdminListReleases))
+	mux.HandleFunc("POST /api/v1/admin/releases", s.requireAdmin(s.handleAdminUploadRelease))
+	mux.HandleFunc("DELETE /api/v1/admin/releases/{id}", s.requireAdmin(s.handleAdminDeleteRelease))
+	mux.HandleFunc("POST /api/v1/admin/upgrades", s.requireAdmin(s.handleAdminBatchUpgrade))
+	mux.HandleFunc("DELETE /api/v1/admin/upgrades/{id}", s.requireAdmin(s.handleAdminCancelUpgrade))
+	mux.HandleFunc("POST /api/v1/admin/deploy/precheck", s.requireAdmin(s.handleAdminDeployPrecheck))
+	mux.HandleFunc("POST /api/v1/admin/deploy/agent-a", s.requireAdmin(s.handleAdminDeployAgentA))
+	mux.HandleFunc("GET /api/v1/admin/deploy/tasks", s.requireAdmin(s.handleAdminListDeployTasks))
+	mux.HandleFunc("GET /api/v1/admin/deploy/tasks/{id}", s.requireAdmin(s.handleAdminGetDeployTask))
+	mux.HandleFunc("POST /api/v1/admin/deploy/agent-b-script", s.requireAdmin(s.handleAdminAgentBInstallScript))
 
 	// Embedded Web UI
 	webSub, err := fs.Sub(embeddedWeb, "web")
@@ -256,7 +285,8 @@ func (s *Server) handleAHeartbeat(w http.ResponseWriter, r *http.Request, node *
 		req.Availability = filtered
 	}
 	s.hub.UpdateA(req)
-	w.WriteHeader(http.StatusOK)
+	hbResp := s.processNodeHeartbeatUpgrade(r.Context(), node.ID, req.Version, req.UpgradeAttemptID, req.UpgradeStatus, req.UpgradeError)
+	protocol.WriteJSON(w, http.StatusOK, hbResp)
 }
 
 func (s *Server) handleAEvents(w http.ResponseWriter, r *http.Request, node *StoredNode) {
@@ -301,7 +331,8 @@ func (s *Server) handleBHeartbeat(w http.ResponseWriter, r *http.Request, node *
 		req.Projects = filtered
 	}
 	s.hub.UpdateB(req)
-	w.WriteHeader(http.StatusOK)
+	hbResp := s.processNodeHeartbeatUpgrade(r.Context(), node.ID, req.Version, req.UpgradeAttemptID, req.UpgradeStatus, req.UpgradeError)
+	protocol.WriteJSON(w, http.StatusOK, hbResp)
 }
 
 func (s *Server) handleBEventsSSE(w http.ResponseWriter, r *http.Request, node *StoredNode) {
@@ -620,6 +651,7 @@ func (s *Server) handleAdminListNodes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	aSnap, bSnap := s.hub.Snapshot()
+	upgrades, _ := s.store.ListNodeUpgrades(r.Context())
 	views := make([]protocol.LiveNodeView, 0, len(nodes))
 	for _, n := range nodes {
 		v := protocol.LiveNodeView{
@@ -629,11 +661,19 @@ func (s *Server) handleAdminListNodes(w http.ResponseWriter, r *http.Request) {
 			Projects:   n.Projects,
 			PublicAddr: n.PublicAddr,
 		}
+		if upg, ok := upgrades[n.ID]; ok {
+			v.TargetVersion = upg.TargetVersion
+			v.UpgradeStatus = upg.Status
+			v.UpgradeMessage = upg.Message
+		}
 		if n.Role == protocol.RoleAgentA {
 			if st, ok := aSnap[n.ID]; ok {
 				ls := st.LastSeen
 				v.LastSeenAt = &ls
 				v.Online = s.hub.IsOnline(st.LastSeen)
+				v.Version = st.Version
+				v.OS = st.OS
+				v.Arch = st.Arch
 				if st.PublicAddr != "" {
 					v.PublicAddr = st.PublicAddr
 				}
@@ -655,6 +695,9 @@ func (s *Server) handleAdminListNodes(w http.ResponseWriter, r *http.Request) {
 				ls := st.LastSeen
 				v.LastSeenAt = &ls
 				v.Online = s.hub.IsOnline(st.LastSeen)
+				v.Version = st.Version
+				v.OS = st.OS
+				v.Arch = st.Arch
 				v.DiskTotalBytes = st.DiskTotalBytes
 				v.DiskFreeBytes = st.DiskFreeBytes
 				v.DiskUsedPct = st.DiskUsedPct
@@ -741,6 +784,7 @@ func (s *Server) handleAdminDeleteNode(w http.ResponseWriter, r *http.Request) {
 		protocol.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	_ = s.store.DeleteNodeUpgrade(r.Context(), nodeID)
 	s.hub.RemoveNode(nodeID)
 	w.WriteHeader(http.StatusNoContent)
 }

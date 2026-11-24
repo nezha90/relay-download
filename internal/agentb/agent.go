@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -24,6 +25,8 @@ import (
 	"relay-download/internal/pki"
 	"relay-download/internal/protocol"
 	"relay-download/internal/transfer"
+	"relay-download/internal/updater"
+	"relay-download/internal/version"
 )
 
 type activeProgress struct {
@@ -44,6 +47,8 @@ type Agent struct {
 	workSem   chan struct{}
 	wakeupCh  chan string
 	ackWakeCh chan struct{}
+	hbWakeCh  chan struct{}
+	updater   *updater.Updater
 
 	mu       sync.RWMutex
 	progress map[string]*activeProgress
@@ -51,12 +56,16 @@ type Agent struct {
 	inBytes      atomic.Int64
 	lastSpeedBps atomic.Int64
 
-	// Optional metrics for test assertions.
-	ResumeCount atomic.Int64
+	// Optional metrics & test hooks.
+	ResumeCount        atomic.Int64
+	UpgradeExePath     string
+	UpgradeRestartHook func(targetVersion string)
 
-	commitMu sync.Mutex
-	wg       sync.WaitGroup
-	bgWG     sync.WaitGroup
+	runMu     sync.Mutex
+	runCancel context.CancelFunc
+	commitMu  sync.Mutex
+	wg        sync.WaitGroup
+	bgWG      sync.WaitGroup
 }
 
 func New(cfg *Config, logger *slog.Logger) (*Agent, error) {
@@ -102,7 +111,7 @@ func New(cfg *Config, logger *slog.Logger) (*Agent, error) {
 		limiter = transfer.NewRateLimiter(int64(cfg.RateLimitMBps * 1024 * 1024))
 	}
 
-	return &Agent{
+	ag := &Agent{
 		cfg:     cfg,
 		store:   store,
 		logger:  logger.With("component", "agent-b", "node_id", cfg.NodeID),
@@ -125,25 +134,79 @@ func New(cfg *Config, logger *slog.Logger) (*Agent, error) {
 		workSem:   make(chan struct{}, cfg.MaxConcurrent),
 		wakeupCh:  make(chan string, 64),
 		ackWakeCh: make(chan struct{}, 1),
+		hbWakeCh:  make(chan struct{}, 1),
 		progress:  make(map[string]*activeProgress),
-	}, nil
+	}
+	ag.updater = updater.New(updater.Options{
+		Component:    "relay-agent-b",
+		NodeID:       cfg.NodeID,
+		CenterURL:    cfg.CenterURL,
+		CenterToken:  cfg.CenterToken,
+		HTTPClient:   ag.streamClient,
+		Logger:       ag.logger,
+		OnStatusSync: ag.triggerHeartbeat,
+		OnRestart: func(targetVer string) {
+			if ag.UpgradeRestartHook != nil {
+				ag.UpgradeRestartHook(targetVer)
+				return
+			}
+			ag.runMu.Lock()
+			cancel := ag.runCancel
+			ag.runMu.Unlock()
+			if cancel != nil {
+				cancel()
+			}
+		},
+	})
+	return ag, nil
 }
 
 func (a *Agent) Start(ctx context.Context) error {
+	if a.UpgradeExePath != "" {
+		a.updater = updater.New(updater.Options{
+			Component:    "relay-agent-b",
+			NodeID:       a.cfg.NodeID,
+			CenterURL:    a.cfg.CenterURL,
+			CenterToken:  a.cfg.CenterToken,
+			HTTPClient:   a.streamClient,
+			Logger:       a.logger,
+			ExePath:      a.UpgradeExePath,
+			OnStatusSync: a.triggerHeartbeat,
+			OnRestart: func(targetVer string) {
+				if a.UpgradeRestartHook != nil {
+					a.UpgradeRestartHook(targetVer)
+					return
+				}
+				a.runMu.Lock()
+				cancel := a.runCancel
+				a.runMu.Unlock()
+				if cancel != nil {
+					cancel()
+				}
+			},
+		})
+	}
+
+	runCtx, runCancel := context.WithCancel(ctx)
+	a.runMu.Lock()
+	a.runCancel = runCancel
+	a.runMu.Unlock()
+
 	defer func() {
+		runCancel()
 		a.bgWG.Wait()
 		a.wg.Wait()
 		_ = a.store.Close()
 	}()
 
 	// Resume any downloads persisted before a process restart.
-	a.resumePersistedDownloads(ctx)
+	a.resumePersistedDownloads(runCtx)
 
 	launchBG := func(fn func(context.Context)) {
 		a.bgWG.Add(1)
 		go func() {
 			defer a.bgWG.Done()
-			fn(ctx)
+			fn(runCtx)
 		}()
 	}
 	launchBG(a.speedMeterLoop)
@@ -152,8 +215,15 @@ func (a *Agent) Start(ctx context.Context) error {
 	launchBG(a.sseLoop)
 	launchBG(a.dispatchLoop)
 
-	<-ctx.Done()
+	<-runCtx.Done()
 	return nil
+}
+
+func (a *Agent) triggerHeartbeat() {
+	select {
+	case a.hbWakeCh <- struct{}{}:
+	default:
+	}
 }
 
 func (a *Agent) resumePersistedDownloads(ctx context.Context) {
@@ -894,6 +964,8 @@ func (a *Agent) heartbeatLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 			a.sendHeartbeat(ctx)
+		case <-a.hbWakeCh:
+			a.sendHeartbeat(ctx)
 		}
 	}
 }
@@ -916,15 +988,26 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 	}
 	a.mu.RUnlock()
 
+	upgAttempt, upgStatus, upgErr := "", "", ""
+	if a.updater != nil {
+		upgAttempt, upgStatus, upgErr = a.updater.Status()
+	}
+
 	payload := protocol.AgentBHeartbeatReq{
-		NodeID:          a.cfg.NodeID,
-		Name:            a.cfg.NodeName,
-		Projects:        a.cfg.ProjectIDs(),
-		DiskTotalBytes:  totalDisk,
-		DiskFreeBytes:   freeDisk,
-		DiskUsedPct:     usedPct,
-		ActiveTransfers: active,
-		InSpeedBps:      a.lastSpeedBps.Load(),
+		NodeID:           a.cfg.NodeID,
+		Name:             a.cfg.NodeName,
+		Projects:         a.cfg.ProjectIDs(),
+		Version:          version.Version,
+		OS:               runtime.GOOS,
+		Arch:             runtime.GOARCH,
+		UpgradeAttemptID: upgAttempt,
+		UpgradeStatus:    upgStatus,
+		UpgradeError:     upgErr,
+		DiskTotalBytes:   totalDisk,
+		DiskFreeBytes:    freeDisk,
+		DiskUsedPct:      usedPct,
+		ActiveTransfers:  active,
+		InSpeedBps:       a.lastSpeedBps.Load(),
 	}
 	body, _ := json.Marshal(payload)
 	u := strings.TrimRight(a.cfg.CenterURL, "/") + "/api/v1/b/heartbeat"
@@ -940,7 +1023,14 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 	if err != nil {
 		return
 	}
-	_ = resp.Body.Close()
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return
+	}
+	var hbResp protocol.HeartbeatResp
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 64*1024)).Decode(&hbResp); err == nil && hbResp.Upgrade != nil && a.updater != nil {
+		a.updater.HandleDirective(ctx, hbResp.Upgrade)
+	}
 }
 
 func (p *activeProgress) setTransferred(total int64) {
