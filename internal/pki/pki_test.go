@@ -52,6 +52,29 @@ func TestInitCAAndIssueIPCert(t *testing.T) {
 	if err != nil {
 		t.Fatalf("tls.Dial with IP SAN failed: %v", err)
 	}
+	if conn.ConnectionState().Version != tls.VersionTLS13 {
+		t.Fatalf("expected TLS 1.3, got 0x%x", conn.ConnectionState().Version)
+	}
 	_ = conn.Close()
 	<-done
+
+	// Verify TLS 1.2 client downgrade is strictly rejected.
+	done12 := make(chan struct{})
+	go func() {
+		defer close(done12)
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_ = conn.(*tls.Conn).Handshake()
+	}()
+	tls12Client := cTLS.Clone()
+	tls12Client.MinVersion = tls.VersionTLS12
+	tls12Client.MaxVersion = tls.VersionTLS12
+	if c12, err := tls.Dial("tcp", ln.Addr().String(), tls12Client); err == nil {
+		_ = c12.Close()
+		t.Fatalf("expected TLS 1.2 handshake to be rejected, but succeeded")
+	}
+	<-done12
 }

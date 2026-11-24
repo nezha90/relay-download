@@ -1,6 +1,7 @@
 package center
 
 import (
+	"context"
 	"math/rand/v2"
 	"sort"
 	"sync"
@@ -36,6 +37,11 @@ type LiveBState struct {
 	LastSeen        time.Time
 }
 
+type bSub struct {
+	ch     chan string
+	cancel context.CancelFunc
+}
+
 // Hub maintains purely in-memory live availability and B wakeup SSE subscribers.
 // No file lists are stored here; only per-(project, A-node) ready counts.
 type Hub struct {
@@ -43,8 +49,8 @@ type Hub struct {
 	offlineTimeout time.Duration
 	aNodes         map[string]*LiveAState
 	bNodes         map[string]*LiveBState
-	// projectID -> bNodeID -> wakeup channel carrying projectID
-	bSubs map[string]map[string]chan string
+	// projectID -> bNodeID -> wakeup subscription
+	bSubs map[string]map[string]*bSub
 }
 
 func NewHub(offlineTimeout time.Duration) *Hub {
@@ -52,7 +58,7 @@ func NewHub(offlineTimeout time.Duration) *Hub {
 		offlineTimeout: offlineTimeout,
 		aNodes:         make(map[string]*LiveAState),
 		bNodes:         make(map[string]*LiveBState),
-		bSubs:          make(map[string]map[string]chan string),
+		bSubs:          make(map[string]map[string]*bSub),
 	}
 }
 
@@ -106,14 +112,14 @@ func (h *Hub) UpdateB(hb protocol.AgentBHeartbeatReq) {
 	h.mu.Unlock()
 }
 
-func (h *Hub) SubscribeB(bNodeID string, projects []string) (<-chan string, func()) {
-	ch := make(chan string, 16)
+func (h *Hub) SubscribeB(bNodeID string, projects []string, cancel context.CancelFunc) (<-chan string, func()) {
+	sub := &bSub{ch: make(chan string, 16), cancel: cancel}
 	h.mu.Lock()
 	for _, p := range projects {
 		if _, ok := h.bSubs[p]; !ok {
-			h.bSubs[p] = make(map[string]chan string)
+			h.bSubs[p] = make(map[string]*bSub)
 		}
-		h.bSubs[p][bNodeID] = ch
+		h.bSubs[p][bNodeID] = sub
 	}
 	h.mu.Unlock()
 
@@ -121,7 +127,7 @@ func (h *Hub) SubscribeB(bNodeID string, projects []string) (<-chan string, func
 		h.mu.Lock()
 		for _, p := range projects {
 			if m, ok := h.bSubs[p]; ok {
-				if cur, exists := m[bNodeID]; exists && cur == ch {
+				if cur, exists := m[bNodeID]; exists && cur == sub {
 					delete(m, bNodeID)
 				}
 				if len(m) == 0 {
@@ -131,7 +137,36 @@ func (h *Hub) SubscribeB(bNodeID string, projects []string) (<-chan string, func
 		}
 		h.mu.Unlock()
 	}
-	return ch, unsub
+	return sub.ch, unsub
+}
+
+// RemoveNode evicts a deleted node from in-memory state and disconnects any active SSE streams.
+func (h *Hub) RemoveNode(nodeID string) {
+	var cancels []context.CancelFunc
+	seen := make(map[*bSub]struct{})
+
+	h.mu.Lock()
+	delete(h.aNodes, nodeID)
+	delete(h.bNodes, nodeID)
+	for p, m := range h.bSubs {
+		if sub, ok := m[nodeID]; ok {
+			delete(m, nodeID)
+			if len(m) == 0 {
+				delete(h.bSubs, p)
+			}
+			if _, dup := seen[sub]; !dup {
+				seen[sub] = struct{}{}
+				if sub.cancel != nil {
+					cancels = append(cancels, sub.cancel)
+				}
+			}
+		}
+	}
+	h.mu.Unlock()
+
+	for _, c := range cancels {
+		c()
+	}
 }
 
 // WakeupB wakes up at most readyCount+1 subscribed B nodes for projectID,
@@ -149,12 +184,12 @@ func (h *Hub) WakeupB(projectID string, readyCount int) {
 		ch      chan string
 	}
 	subs := make([]subInfo, 0, len(subsMap))
-	for bID, ch := range subsMap {
+	for bID, sub := range subsMap {
 		active := 0
 		if st, ok := h.bNodes[bID]; ok {
 			active = len(st.ActiveTransfers)
 		}
-		subs = append(subs, subInfo{bNodeID: bID, active: active, ch: ch})
+		subs = append(subs, subInfo{bNodeID: bID, active: active, ch: sub.ch})
 	}
 	h.mu.RUnlock()
 
@@ -184,7 +219,7 @@ func (h *Hub) IsOnline(lastSeen time.Time) bool {
 // shuffled to spread preemptive B load across A1/A2/A3.
 func (h *Hub) DiscoverCandidates(projectID string) []protocol.DiscoverCandidate {
 	h.mu.RLock()
-	var list []protocol.DiscoverCandidate
+	list := make([]protocol.DiscoverCandidate, 0)
 	for _, st := range h.aNodes {
 		if !h.IsOnline(st.LastSeen) {
 			continue

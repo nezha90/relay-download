@@ -82,10 +82,21 @@ func runPKI(args []string) {
 		outDir := fs.String("out", "./certs", "output directory")
 		org := fs.String("org", "Relay-Download Internal CA", "CA organization name")
 		days := fs.Int("days", 3650, "validity in days")
+		force := fs.Bool("force", false, "overwrite existing ca.crt / ca.key if present")
 		_ = fs.Parse(args[1:])
 
 		certPath := filepath.Join(*outDir, "ca.crt")
 		keyPath := filepath.Join(*outDir, "ca.key")
+		if !*force {
+			if _, err := os.Stat(certPath); err == nil {
+				fmt.Fprintf(os.Stderr, "init-ca refused: %s already exists (use -force to overwrite)\n", certPath)
+				os.Exit(1)
+			}
+			if _, err := os.Stat(keyPath); err == nil {
+				fmt.Fprintf(os.Stderr, "init-ca refused: %s already exists (use -force to overwrite)\n", keyPath)
+				os.Exit(1)
+			}
+		}
 		if err := pki.InitCA(certPath, keyPath, *org, *days); err != nil {
 			fmt.Fprintf(os.Stderr, "init-ca failed: %v\n", err)
 			os.Exit(1)

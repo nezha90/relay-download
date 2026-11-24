@@ -28,6 +28,8 @@ async function api(path, opts = {}) {
     },
   });
   if (res.status === 401) {
+    adminToken = '';
+    sessionStorage.removeItem(STORAGE_KEY);
     showLogin('鉴权失败，请重新输入 Admin Token');
     throw new Error('unauthorized');
   }
@@ -168,7 +170,10 @@ function renderProjects(projects) {
             <h3>${esc(p.name)} <span class="mono muted">(${esc(p.id)})</span></h3>
             <div class="muted">${esc(p.description || '无描述')} · 策略: ${esc(p.conflict_policy)} · 租约: ${p.lease_ttl_sec}s</div>
           </div>
-          <button class="btn sm" onclick="viewProjectLive('${esc(p.id)}')">穿透看实时队列</button>
+          <div style="display:flex;gap:6px">
+            <button class="btn sm" data-action="view-project-live" data-id="${esc(p.id)}">穿透看实时队列</button>
+            <button class="btn sm danger" data-action="delete-project" data-id="${esc(p.id)}">删除</button>
+          </div>
         </div>
         <div style="display:flex;gap:16px;margin-bottom:10px" class="muted">
           <span>在线 A: <strong>${ps.online_a_nodes}</strong></span>
@@ -207,8 +212,8 @@ function renderNodes(nodes) {
         <td>${ready} 待下 / ${claimed} 传中</td>
         <td class="mono">${fmtSpeed(n.speed_bps)}</td>
         <td>
-          <button class="btn sm" onclick="viewNodeLive('${esc(n.id)}')">实时队列</button>
-          <button class="btn sm danger" onclick="deleteNode('${esc(n.id)}')">删除</button>
+          <button class="btn sm" data-action="view-node-live" data-id="${esc(n.id)}">实时队列</button>
+          <button class="btn sm danger" data-action="delete-node" data-id="${esc(n.id)}">删除</button>
         </td>
       </tr>
     `;
@@ -222,7 +227,7 @@ function renderNodes(nodes) {
       <td>${fmtBytes(n.disk_free_bytes)} <span class="muted">(${(n.disk_used_pct || 0).toFixed(1)}% 已用)</span></td>
       <td>${n.active_streams} 个任务</td>
       <td class="mono">${fmtSpeed(n.speed_bps)}</td>
-      <td><button class="btn sm danger" onclick="deleteNode('${esc(n.id)}')">删除</button></td>
+      <td><button class="btn sm danger" data-action="delete-node" data-id="${esc(n.id)}">删除</button></td>
     </tr>
   `).join('') : '<tr><td colspan="7" class="empty">暂无注册的 B 节点</td></tr>';
 }
@@ -286,13 +291,47 @@ function renderLiveBlock(res) {
   `;
 }
 
-window.deleteNode = async function(id) {
+async function deleteNode(id) {
   if (!confirm(`确认删除节点 ${id} 吗？`)) return;
-  await api(`/api/v1/admin/nodes/${encodeURIComponent(id)}`, { method: 'DELETE' });
-  refreshAll();
-};
+  try {
+    await api(`/api/v1/admin/nodes/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    refreshAll();
+  } catch (e) {
+    if (e.message !== 'unauthorized') alert(`删除节点失败: ${e.message}`);
+  }
+}
+
+async function deleteProject(id) {
+  if (!confirm(`确认删除项目 ${id} 吗？`)) return;
+  try {
+    await api(`/api/v1/admin/projects/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    refreshAll();
+  } catch (e) {
+    if (e.message !== 'unauthorized') alert(`删除项目失败: ${e.message}`);
+  }
+}
 
 function setupEvents() {
+  document.addEventListener('click', (e) => {
+    const btn = e.target.closest('button[data-action]');
+    if (!btn) return;
+    const id = btn.dataset.id || '';
+    switch (btn.dataset.action) {
+      case 'view-project-live':
+        window.viewProjectLive(id);
+        break;
+      case 'delete-project':
+        deleteProject(id);
+        break;
+      case 'view-node-live':
+        window.viewNodeLive(id);
+        break;
+      case 'delete-node':
+        deleteNode(id);
+        break;
+    }
+  });
+
   document.querySelectorAll('.tab').forEach(btn => {
     btn.addEventListener('click', () => {
       document.querySelectorAll('.tab').forEach(b => b.classList.remove('active'));
@@ -302,7 +341,7 @@ function setupEvents() {
     });
   });
 
-  document.getElementById('login-btn').addEventListener('click', async () => {
+  const doLogin = async () => {
     const v = document.getElementById('login-token').value.trim();
     if (!v) return;
     adminToken = v;
@@ -314,6 +353,10 @@ function setupEvents() {
     } catch {
       adminToken = '';
     }
+  };
+  document.getElementById('login-btn').addEventListener('click', doLogin);
+  document.getElementById('login-token').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') doLogin();
   });
 
   document.getElementById('logout-btn').addEventListener('click', () => {
@@ -337,18 +380,22 @@ function setupEvents() {
   document.getElementById('create-project-form').addEventListener('submit', async (e) => {
     e.preventDefault();
     const fd = new FormData(e.target);
-    await api('/api/v1/admin/projects', {
-      method: 'POST',
-      body: JSON.stringify({
-        id: fd.get('id'),
-        name: fd.get('name'),
-        description: fd.get('description'),
-        conflict_policy: fd.get('conflict_policy'),
-        lease_ttl_sec: Number(fd.get('lease_ttl_sec') || 300),
-      }),
-    });
-    closeModal('project-modal');
-    refreshAll();
+    try {
+      await api('/api/v1/admin/projects', {
+        method: 'POST',
+        body: JSON.stringify({
+          id: fd.get('id'),
+          name: fd.get('name'),
+          description: fd.get('description'),
+          conflict_policy: fd.get('conflict_policy'),
+          lease_ttl_sec: Number(fd.get('lease_ttl_sec') || 300),
+        }),
+      });
+      closeModal('project-modal');
+      refreshAll();
+    } catch (err) {
+      if (err.message !== 'unauthorized') alert(`保存项目失败: ${err.message}`);
+    }
   });
 
   const openNodeModal = (role) => {
@@ -367,20 +414,24 @@ function setupEvents() {
     e.preventDefault();
     const fd = new FormData(e.target);
     const projs = String(fd.get('projects') || '').split(',').map(s => s.trim()).filter(Boolean);
-    const res = await api('/api/v1/admin/nodes', {
-      method: 'POST',
-      body: JSON.stringify({
-        id: fd.get('id'),
-        name: fd.get('name'),
-        role: fd.get('role'),
-        public_addr: fd.get('public_addr'),
-        projects: projs,
-      }),
-    });
-    const box = document.getElementById('node-token-result');
-    box.innerHTML = `<strong>节点已创建！请妥善保存接入 Token（仅展示一次）：</strong><div class="mono" style="margin-top:6px">${esc(res.token)}</div>`;
-    box.classList.remove('hidden');
-    refreshAll();
+    try {
+      const res = await api('/api/v1/admin/nodes', {
+        method: 'POST',
+        body: JSON.stringify({
+          id: fd.get('id'),
+          name: fd.get('name'),
+          role: fd.get('role'),
+          public_addr: fd.get('public_addr'),
+          projects: projs,
+        }),
+      });
+      const box = document.getElementById('node-token-result');
+      box.innerHTML = `<strong>节点已创建！请妥善保存接入 Token（仅展示一次）：</strong><div class="mono" style="margin-top:6px">${esc(res.token)}</div>`;
+      box.classList.remove('hidden');
+      refreshAll();
+    } catch (err) {
+      if (err.message !== 'unauthorized') alert(`创建节点失败: ${err.message}`);
+    }
   });
 }
 

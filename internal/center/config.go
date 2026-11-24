@@ -60,6 +60,9 @@ func (c *Config) Validate() error {
 	if c.JWTSecret == "" {
 		return errors.New("jwt_secret is required")
 	}
+	if c.CenterSecret == "" {
+		return errors.New("center_secret is required")
+	}
 	if c.AdminToken == "" {
 		return errors.New("admin_token is required")
 	}

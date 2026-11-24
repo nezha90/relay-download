@@ -54,6 +54,9 @@ type Agent struct {
 	// Optional test hook to inject fault during streaming (unused in production).
 	StreamChunkHook func(fileID string, sentTotal int64) error
 
+	runMu     sync.Mutex
+	runCancel context.CancelFunc
+	bgWG      sync.WaitGroup
 	closeOnce sync.Once
 }
 
@@ -164,10 +167,22 @@ func (a *Agent) Start(ctx context.Context) error {
 		}
 	}()
 
-	go a.speedMeterLoop(ctx)
-	go a.reapLoop(ctx)
-	go a.heartbeatLoop(ctx)
-	go a.eventFlushLoop(ctx)
+	runCtx, runCancel := context.WithCancel(ctx)
+	a.runMu.Lock()
+	a.runCancel = runCancel
+	a.runMu.Unlock()
+
+	launchBG := func(fn func(context.Context)) {
+		a.bgWG.Add(1)
+		go func() {
+			defer a.bgWG.Done()
+			fn(runCtx)
+		}()
+	}
+	launchBG(a.speedMeterLoop)
+	launchBG(a.reapLoop)
+	launchBG(a.heartbeatLoop)
+	launchBG(a.eventFlushLoop)
 
 	select {
 	case <-ctx.Done():
@@ -195,14 +210,21 @@ func (a *Agent) PublicListenAddr() string {
 func (a *Agent) Shutdown(ctx context.Context) error {
 	var shutdownErr error
 	a.closeOnce.Do(func() {
-		shCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		defer cancel()
+		a.runMu.Lock()
+		cancel := a.runCancel
+		a.runMu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+		shCtx, cancelSh := context.WithTimeout(ctx, 10*time.Second)
+		defer cancelSh()
 		if a.localSrv != nil {
 			_ = a.localSrv.Shutdown(shCtx)
 		}
 		if a.publicSrv != nil {
 			_ = a.publicSrv.Shutdown(shCtx)
 		}
+		a.bgWG.Wait()
 		if a.store != nil {
 			shutdownErr = a.store.Close()
 		}
@@ -311,12 +333,10 @@ func (a *Agent) publicRoutes() http.Handler {
 
 func (a *Agent) requireLocalAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if a.cfg.LocalToken != "" {
-			tok := r.Header.Get(protocol.HeaderLocalToken)
-			if !auth.EqualConstantTime(tok, a.cfg.LocalToken) {
-				protocol.WriteError(w, http.StatusUnauthorized, "invalid local token")
-				return
-			}
+		tok := r.Header.Get(protocol.HeaderLocalToken)
+		if a.cfg.LocalToken == "" || !auth.EqualConstantTime(tok, a.cfg.LocalToken) {
+			protocol.WriteError(w, http.StatusUnauthorized, "invalid local token")
+			return
 		}
 		next(w, r)
 	}
@@ -342,7 +362,13 @@ func (a *Agent) handleLocalUpload(w http.ResponseWriter, r *http.Request) {
 		projectID      = strings.TrimSpace(r.Header.Get(protocol.HeaderProject))
 		filename       = strings.TrimSpace(r.Header.Get(protocol.HeaderFilename))
 		expectedSHA256 = strings.TrimSpace(r.Header.Get(protocol.HeaderExpectedSHA256))
-		srcReader      io.Reader
+	)
+
+	fileID := uuid.NewString()
+	tmpPath := filepath.Join(a.uploadDir, fileID+".tmp")
+	var (
+		written   int64
+		actualSHA string
 	)
 
 	ct := r.Header.Get("Content-Type")
@@ -352,12 +378,17 @@ func (a *Agent) handleLocalUpload(w http.ResponseWriter, r *http.Request) {
 			protocol.WriteError(w, http.StatusBadRequest, "invalid multipart upload: "+err.Error())
 			return
 		}
+		var (
+			sawFile      bool
+			partFilename string
+		)
 		for {
 			part, err := mr.NextPart()
 			if errors.Is(err, io.EOF) {
 				break
 			}
 			if err != nil {
+				_ = os.Remove(tmpPath)
 				protocol.WriteError(w, http.StatusBadRequest, "read multipart: "+err.Error())
 				return
 			}
@@ -375,59 +406,87 @@ func (a *Agent) handleLocalUpload(w http.ResponseWriter, r *http.Request) {
 				expectedSHA256 = strings.TrimSpace(string(b))
 				_ = part.Close()
 			case "file":
-				if filename == "" {
-					filename = strings.TrimSpace(part.FileName())
+				if sawFile {
+					_ = part.Close()
+					_ = os.Remove(tmpPath)
+					protocol.WriteError(w, http.StatusBadRequest, "multiple 'file' parts not supported")
+					return
 				}
-				srcReader = part
+				sawFile = true
+				partFilename = strings.TrimSpace(part.FileName())
+				f, createErr := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+				if createErr != nil {
+					_ = part.Close()
+					protocol.WriteError(w, http.StatusInternalServerError, "create temp file: "+createErr.Error())
+					return
+				}
+				var copyErr error
+				written, actualSHA, copyErr = transfer.CopyStream(r.Context(), f, part, nil, nil)
+				syncErr := f.Sync()
+				closeErr := f.Close()
+				_ = part.Close()
+				if copyErr != nil || syncErr != nil || closeErr != nil {
+					_ = os.Remove(tmpPath)
+					errMsg := fmt.Sprintf("upload write failed: %v %v %v", copyErr, syncErr, closeErr)
+					protocol.WriteError(w, http.StatusInternalServerError, errMsg)
+					return
+				}
 			default:
 				_ = part.Close()
 			}
-			if srcReader != nil {
-				break
-			}
 		}
-		if srcReader == nil {
+		if !sawFile {
+			_ = os.Remove(tmpPath)
 			protocol.WriteError(w, http.StatusBadRequest, "missing multipart field 'file'")
 			return
 		}
-		defer func() {
-			if c, ok := srcReader.(io.Closer); ok {
-				_ = c.Close()
-			}
-		}()
+		if filename == "" {
+			filename = partFilename
+		}
+		if projectID == "" {
+			_ = os.Remove(tmpPath)
+			protocol.WriteError(w, http.StatusBadRequest, "project is required")
+			return
+		}
+		if !a.cfg.AllowsProject(projectID) {
+			_ = os.Remove(tmpPath)
+			protocol.WriteError(w, http.StatusForbidden, "project not allowed on this node")
+			return
+		}
 	} else {
-		srcReader = r.Body
+		if projectID == "" {
+			protocol.WriteError(w, http.StatusBadRequest, "project is required")
+			return
+		}
+		if !a.cfg.AllowsProject(projectID) {
+			protocol.WriteError(w, http.StatusForbidden, "project not allowed on this node")
+			return
+		}
+		if _, err := transfer.SanitizeRelativePath(filename); err != nil {
+			protocol.WriteError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+		if err != nil {
+			protocol.WriteError(w, http.StatusInternalServerError, "create temp file: "+err.Error())
+			return
+		}
+		var copyErr error
+		written, actualSHA, copyErr = transfer.CopyStream(r.Context(), f, r.Body, nil, nil)
+		syncErr := f.Sync()
+		closeErr := f.Close()
+		if copyErr != nil || syncErr != nil || closeErr != nil {
+			_ = os.Remove(tmpPath)
+			errMsg := fmt.Sprintf("upload write failed: %v %v %v", copyErr, syncErr, closeErr)
+			protocol.WriteError(w, http.StatusInternalServerError, errMsg)
+			return
+		}
 	}
 
-	if projectID == "" {
-		protocol.WriteError(w, http.StatusBadRequest, "project is required")
-		return
-	}
-	if !a.cfg.AllowsProject(projectID) {
-		protocol.WriteError(w, http.StatusForbidden, "project not allowed on this node")
-		return
-	}
 	cleanName, err := transfer.SanitizeRelativePath(filename)
 	if err != nil {
-		protocol.WriteError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
-	fileID := uuid.NewString()
-	tmpPath := filepath.Join(a.uploadDir, fileID+".tmp")
-	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
-	if err != nil {
-		protocol.WriteError(w, http.StatusInternalServerError, "create temp file: "+err.Error())
-		return
-	}
-
-	written, actualSHA, copyErr := transfer.CopyStream(r.Context(), f, srcReader, nil, nil)
-	syncErr := f.Sync()
-	closeErr := f.Close()
-	if copyErr != nil || syncErr != nil || closeErr != nil {
 		_ = os.Remove(tmpPath)
-		errMsg := fmt.Sprintf("upload write failed: %v %v %v", copyErr, syncErr, closeErr)
-		protocol.WriteError(w, http.StatusInternalServerError, errMsg)
+		protocol.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -521,9 +580,9 @@ func (a *Agent) handleLocalRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	st, err := os.Stat(req.LocalPath)
+	st, err := os.Lstat(req.LocalPath)
 	if err != nil || !st.Mode().IsRegular() {
-		protocol.WriteError(w, http.StatusBadRequest, "local_path must exist and be a regular file")
+		protocol.WriteError(w, http.StatusBadRequest, "local_path must exist and be a regular file (symlinks not allowed)")
 		return
 	}
 	_, _, _, alarm, err := a.diskWatermarkStatus(0)
@@ -556,6 +615,12 @@ func (a *Agent) handleLocalRegister(w http.ResponseWriter, r *http.Request) {
 		}
 	} else {
 		if err := os.Rename(req.LocalPath, readyPath); err != nil {
+			// Cross-device fallback requires extra space on DataDir: enforce disk watermark before copying.
+			if _, _, _, xAlarm, wErr := a.diskWatermarkStatus(uint64(size)); wErr == nil && xAlarm {
+				a.triggerHeartbeat()
+				protocol.WriteError(w, http.StatusInsufficientStorage, "disk watermark exceeded on agent-a")
+				return
+			}
 			// Cross-device fallback: stream copy into tmp then rename and delete source.
 			if err := a.crossDeviceMove(r.Context(), req.LocalPath, readyPath, actualSHA); err != nil {
 				protocol.WriteError(w, http.StatusInternalServerError, "move failed: "+err.Error())
@@ -650,6 +715,20 @@ func (a *Agent) handleLocalStatus(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (a *Agent) validateLeaseTTL(requestedSec int) (time.Duration, error) {
+	if requestedSec == 0 {
+		return a.cfg.DefaultLeaseTTL(), nil
+	}
+	maxSec := 3600
+	if a.cfg.LeaseTTLSec > maxSec {
+		maxSec = a.cfg.LeaseTTLSec
+	}
+	if requestedSec < 1 || requestedSec > maxSec {
+		return 0, fmt.Errorf("lease_ttl_sec must be between 1 and %d", maxSec)
+	}
+	return time.Duration(requestedSec) * time.Second, nil
+}
+
 func (a *Agent) handleClaim(w http.ResponseWriter, r *http.Request) {
 	tok := auth.ExtractBearer(r.Header.Get("Authorization"))
 	claims, err := auth.VerifyAccessJWT(a.cfg.JWTSecret, tok)
@@ -667,9 +746,10 @@ func (a *Agent) handleClaim(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	leaseTTL := a.cfg.DefaultLeaseTTL()
-	if req.LeaseTTLSec > 0 {
-		leaseTTL = time.Duration(req.LeaseTTLSec) * time.Second
+	leaseTTL, err := a.validateLeaseTTL(req.LeaseTTLSec)
+	if err != nil {
+		protocol.WriteError(w, http.StatusBadRequest, err.Error())
+		return
 	}
 
 	rec, err := a.store.ClaimNext(req.ProjectID, req.BNodeID, req.AvailableDiskBytes, leaseTTL)
@@ -700,6 +780,10 @@ func (a *Agent) handleClaim(w http.ResponseWriter, r *http.Request) {
 func (a *Agent) handleStream(w http.ResponseWriter, r *http.Request) {
 	fileID := r.PathValue("id")
 	leaseToken := r.Header.Get(protocol.HeaderLeaseToken)
+	if leaseToken == "" {
+		protocol.WriteError(w, http.StatusUnauthorized, "missing lease token")
+		return
+	}
 	rec, err := a.store.VerifyActiveLease(fileID, leaseToken)
 	if err != nil {
 		if errors.Is(err, ErrFileNotFound) {
@@ -774,6 +858,9 @@ func (a *Agent) handleStream(w http.ResponseWriter, r *http.Request) {
 	sentSinceStart := int64(0)
 	lastRenew := time.Now()
 	leaseTTL := a.cfg.DefaultLeaseTTL()
+	if rec.LeaseTTLSec > 0 {
+		leaseTTL = time.Duration(rec.LeaseTTLSec) * time.Second
+	}
 
 	for remaining > 0 {
 		if r.Context().Err() != nil {
@@ -833,14 +920,19 @@ func (a *Agent) handleStream(w http.ResponseWriter, r *http.Request) {
 func (a *Agent) handleRenew(w http.ResponseWriter, r *http.Request) {
 	fileID := r.PathValue("id")
 	leaseToken := r.Header.Get(protocol.HeaderLeaseToken)
+	if leaseToken == "" {
+		protocol.WriteError(w, http.StatusUnauthorized, "missing lease token")
+		return
+	}
 	var req protocol.RenewReq
 	if err := protocol.DecodeJSON(r.Body, &req); err != nil {
 		protocol.WriteError(w, http.StatusBadRequest, "invalid renew request")
 		return
 	}
-	ttl := a.cfg.DefaultLeaseTTL()
-	if req.LeaseTTLSec > 0 {
-		ttl = time.Duration(req.LeaseTTLSec) * time.Second
+	ttl, err := a.validateLeaseTTL(req.LeaseTTLSec)
+	if err != nil {
+		protocol.WriteError(w, http.StatusBadRequest, err.Error())
+		return
 	}
 	exp, err := a.store.RenewLease(fileID, req.LeaseID, leaseToken, req.BNodeID, ttl)
 	if err != nil {
@@ -857,9 +949,17 @@ func (a *Agent) handleRenew(w http.ResponseWriter, r *http.Request) {
 func (a *Agent) handleAck(w http.ResponseWriter, r *http.Request) {
 	fileID := r.PathValue("id")
 	leaseToken := r.Header.Get(protocol.HeaderLeaseToken)
+	if leaseToken == "" {
+		protocol.WriteError(w, http.StatusUnauthorized, "missing lease token")
+		return
+	}
 	var req protocol.AckReq
 	if err := protocol.DecodeJSON(r.Body, &req); err != nil {
 		protocol.WriteError(w, http.StatusBadRequest, "invalid ack request")
+		return
+	}
+	if req.LeaseID == "" || req.BNodeID == "" {
+		protocol.WriteError(w, http.StatusBadRequest, "lease_id and b_node_id are required")
 		return
 	}
 
@@ -907,6 +1007,10 @@ func (a *Agent) handleAck(w http.ResponseWriter, r *http.Request) {
 func (a *Agent) handleNack(w http.ResponseWriter, r *http.Request) {
 	fileID := r.PathValue("id")
 	leaseToken := r.Header.Get(protocol.HeaderLeaseToken)
+	if leaseToken == "" {
+		protocol.WriteError(w, http.StatusUnauthorized, "missing lease token")
+		return
+	}
 	var req protocol.NackReq
 	if err := protocol.DecodeJSON(r.Body, &req); err != nil {
 		protocol.WriteError(w, http.StatusBadRequest, "invalid nack request")
@@ -937,12 +1041,10 @@ func (a *Agent) handleNack(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *Agent) handleInternalLiveFiles(w http.ResponseWriter, r *http.Request) {
-	if a.cfg.CenterSecret != "" {
-		sec := r.Header.Get(protocol.HeaderCenterSecret)
-		if !auth.EqualConstantTime(sec, a.cfg.CenterSecret) {
-			protocol.WriteError(w, http.StatusUnauthorized, "invalid center secret")
-			return
-		}
+	sec := r.Header.Get(protocol.HeaderCenterSecret)
+	if a.cfg.CenterSecret == "" || !auth.EqualConstantTime(sec, a.cfg.CenterSecret) {
+		protocol.WriteError(w, http.StatusUnauthorized, "invalid center secret")
+		return
 	}
 	total, free, pct, alarm, _ := a.diskWatermarkStatus(0)
 	files, err := a.store.ListLive(r.URL.Query().Get("project"))

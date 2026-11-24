@@ -10,11 +10,14 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime/multipart"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -632,23 +635,72 @@ func TestLeaseExpiryFailoverAndIdempotentAck(t *testing.T) {
 		return len(live.Files) == 0
 	}, "a1 deleted file after b2 ack")
 
-	// Duplicate ACK to A1 must return 200 OK {"status":"already_deleted"}.
-	dupAckBody, _ := json.Marshal(protocol.AckReq{
+	// Unauthenticated duplicate ACK must be rejected with 401; forged token must get 404.
+	forgedAckBody, _ := json.Marshal(protocol.AckReq{
 		LeaseID: claimed.LeaseID,
 		BNodeID: "b2",
 		SHA256:  sha,
 	})
-	dupReq, _ := http.NewRequest(http.MethodPost, aPubURL+"/api/v1/files/"+claimed.FileID+"/ack", bytes.NewReader(dupAckBody))
-	dupReq.Header.Set("Content-Type", "application/json")
-	dupResp, err := env.httpClient.Do(dupReq)
+	unauthReq, _ := http.NewRequest(http.MethodPost, aPubURL+"/api/v1/files/"+claimed.FileID+"/ack", bytes.NewReader(forgedAckBody))
+	unauthReq.Header.Set("Content-Type", "application/json")
+	unauthResp, err := env.httpClient.Do(unauthReq)
 	if err != nil {
-		t.Fatalf("dup ack req: %v", err)
+		t.Fatalf("unauth ack req: %v", err)
 	}
-	var ackRes protocol.AckResp
-	_ = json.NewDecoder(dupResp.Body).Decode(&ackRes)
-	_ = dupResp.Body.Close()
-	if dupResp.StatusCode != http.StatusOK || ackRes.Status != "already_deleted" {
-		t.Fatalf("expected 200 already_deleted on duplicate ack, got %d %+v", dupResp.StatusCode, ackRes)
+	_ = unauthResp.Body.Close()
+	if unauthResp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 on unauthenticated ack, got %d", unauthResp.StatusCode)
+	}
+
+	forgedReq, _ := http.NewRequest(http.MethodPost, aPubURL+"/api/v1/files/"+claimed.FileID+"/ack", bytes.NewReader(forgedAckBody))
+	forgedReq.Header.Set("Content-Type", "application/json")
+	forgedReq.Header.Set(protocol.HeaderLeaseToken, "forged-token")
+	forgedResp, err := env.httpClient.Do(forgedReq)
+	if err != nil {
+		t.Fatalf("forged ack req: %v", err)
+	}
+	_ = forgedResp.Body.Close()
+	if forgedResp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 on forged duplicate ack, got %d", forgedResp.StatusCode)
+	}
+
+	// Genuine duplicate ACK with matching lease credentials must return 200 OK {"status":"already_deleted"}.
+	dataIdem, shaIdem := randBytes(t, 16*1024)
+	upResp, _ := uploadToA(t, a1Local, a1Tok, "proj-lease", "idem.bin", dataIdem, shaIdem)
+	if upResp.StatusCode != http.StatusOK {
+		t.Fatalf("upload idem.bin failed: %d", upResp.StatusCode)
+	}
+	idemClaimBody, _ := json.Marshal(protocol.ClaimReq{ProjectID: "proj-lease", BNodeID: "b-dead", LeaseTTLSec: 30})
+	idemClaimReq, _ := http.NewRequest(http.MethodPost, aPubURL+"/api/v1/claim", bytes.NewReader(idemClaimBody))
+	idemClaimReq.Header.Set("Content-Type", "application/json")
+	idemClaimReq.Header.Set("Authorization", "Bearer "+deadJWT)
+	idemClaimResp, err := env.httpClient.Do(idemClaimReq)
+	if err != nil || idemClaimResp.StatusCode != http.StatusOK {
+		t.Fatalf("claim idem.bin failed: err=%v resp=%v", err, idemClaimResp)
+	}
+	var idemClaim protocol.ClaimResp
+	_ = json.NewDecoder(idemClaimResp.Body).Decode(&idemClaim)
+	_ = idemClaimResp.Body.Close()
+
+	ackPayload, _ := json.Marshal(protocol.AckReq{
+		LeaseID: idemClaim.LeaseID,
+		BNodeID: "b-dead",
+		SHA256:  shaIdem,
+	})
+	for i, wantStatus := range []string{"deleted", "already_deleted"} {
+		req, _ := http.NewRequest(http.MethodPost, aPubURL+"/api/v1/files/"+idemClaim.FileID+"/ack", bytes.NewReader(ackPayload))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set(protocol.HeaderLeaseToken, idemClaim.LeaseToken)
+		resp, err := env.httpClient.Do(req)
+		if err != nil {
+			t.Fatalf("ack #%d req: %v", i+1, err)
+		}
+		var ackRes protocol.AckResp
+		_ = json.NewDecoder(resp.Body).Decode(&ackRes)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK || ackRes.Status != wantStatus {
+			t.Fatalf("ack #%d: expected 200 %s, got %d %+v", i+1, wantStatus, resp.StatusCode, ackRes)
+		}
 	}
 
 	// Duplicate summary event to Center must be deduplicated cleanly.
@@ -661,12 +713,12 @@ func TestLeaseExpiryFailoverAndIdempotentAck(t *testing.T) {
 		Bytes:     int64(len(data)),
 		Timestamp: time.Now().UTC(),
 	}
-	// Ensure first event flushed first.
+	// Ensure both completed events flushed first.
 	waitUntil(t, 5*time.Second, func() bool {
 		var ov protocol.OverviewResp
 		env.adminGet("/api/v1/admin/overview", &ov)
-		return ov.AllTimeCompleted == 1
-	}, "center recorded initial completed event")
+		return ov.AllTimeCompleted == 2
+	}, "center recorded initial completed events")
 
 	applied, err := env.centerSrv.Store().RecordSummaryEvents(context.Background(), []protocol.SummaryEvent{dupEv})
 	if err != nil {
@@ -702,4 +754,283 @@ func TestAgentADiskWatermarkAlarm(t *testing.T) {
 		}
 		return false
 	}, "center reports disk_alarm=true for a-disk")
+}
+
+func TestQARegressions(t *testing.T) {
+	env := newTestEnv(t)
+	adminReq := func(method, path string, body any) (*http.Response, []byte) {
+		t.Helper()
+		var r io.Reader
+		if body != nil {
+			b, _ := json.Marshal(body)
+			r = bytes.NewReader(b)
+		}
+		req, _ := http.NewRequest(method, env.centerURL+path, r)
+		req.Header.Set(protocol.HeaderAdminToken, env.adminToken)
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := env.httpClient.Do(req)
+		if err != nil {
+			t.Fatalf("%s %s: %v", method, path, err)
+		}
+		defer resp.Body.Close()
+		out, _ := io.ReadAll(resp.Body)
+		return resp, out
+	}
+
+	// 1. Center API validation: empty lists are JSON [], invalid policy/IDs/public_addr rejected, created_at non-zero.
+	resp, rawProjs := adminReq(http.MethodGet, "/api/v1/admin/projects", nil)
+	if resp.StatusCode != http.StatusOK || strings.TrimSpace(string(rawProjs)) != "[]" {
+		t.Fatalf("expected [] for empty projects, got %d %s", resp.StatusCode, string(rawProjs))
+	}
+	if r, _ := adminReq(http.MethodPost, "/api/v1/admin/projects", map[string]any{"id": "bad", "conflict_policy": "bogus"}); r.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 for invalid conflict_policy, got %d", r.StatusCode)
+	}
+	if r, _ := adminReq(http.MethodPost, "/api/v1/admin/projects", map[string]any{"id": "a');alert(1);//", "name": "xss"}); r.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 for XSS project id, got %d", r.StatusCode)
+	}
+	if r, _ := adminReq(http.MethodPost, "/api/v1/admin/nodes", map[string]any{"id": "a-http", "role": "agent_a", "public_addr": "http://127.0.0.1:8080"}); r.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 for plaintext http public_addr, got %d", r.StatusCode)
+	}
+	rProj, bProj := adminReq(http.MethodPost, "/api/v1/admin/projects", map[string]any{"id": "proj-zero", "name": "Zero", "conflict_policy": "overwrite", "lease_ttl_sec": 30})
+	var savedProj protocol.Project
+	_ = json.Unmarshal(bProj, &savedProj)
+	if rProj.StatusCode != http.StatusOK || savedProj.CreatedAt.IsZero() {
+		t.Fatalf("expected 200 and non-zero created_at, got %d %+v", rProj.StatusCode, savedProj)
+	}
+	env.createProject("proj-rename", protocol.ConflictAutoRename, 30)
+	env.createProject("proj-skip", protocol.ConflictSkip, 30)
+	env.createProject("proj-collide", protocol.ConflictOverwrite, 30)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	agA1, a1Local, a1Tok := env.startAgentA(ctx, "a1", nil, 30, 0)
+	agA2, a2Local, a2Tok := env.startAgentA(ctx, "a2", nil, 30, 0)
+
+	// 2. Multipart field-order independence: file BEFORE project succeeds; wrong sha256 AFTER file is rejected!
+	sendMultipart := func(fields [][3]string) int {
+		var buf bytes.Buffer
+		mw := multipart.NewWriter(&buf)
+		for _, f := range fields {
+			if f[1] != "" {
+				fw, _ := mw.CreateFormFile(f[0], f[1])
+				_, _ = fw.Write([]byte(f[2]))
+			} else {
+				_ = mw.WriteField(f[0], f[2])
+			}
+		}
+		_ = mw.Close()
+		req, _ := http.NewRequest(http.MethodPost, a1Local+"/local/v1/upload", &buf)
+		req.Header.Set(protocol.HeaderLocalToken, a1Tok)
+		req.Header.Set("Content-Type", mw.FormDataContentType())
+		r, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("multipart upload: %v", err)
+		}
+		_ = r.Body.Close()
+		return r.StatusCode
+	}
+	if st := sendMultipart([][3]string{
+		{"file", "rev.bin", "reverse-order-ok"},
+		{"project", "", "proj-zero"},
+	}); st != http.StatusOK {
+		t.Fatalf("expected 200 when multipart file precedes project, got %d", st)
+	}
+	if st := sendMultipart([][3]string{
+		{"project", "", "proj-zero"},
+		{"file", "badsha.bin", "actual-bytes"},
+		{"sha256", "", "0000000000000000000000000000000000000000000000000000000000000000"},
+	}); st != http.StatusBadRequest {
+		t.Fatalf("expected 400 when trailing multipart sha256 mismatches, got %d", st)
+	}
+
+	// 3. Symlink registration must be rejected.
+	realF := filepath.Join(env.dir, "real.bin")
+	_ = os.WriteFile(realF, []byte("sym"), 0o600)
+	symF := filepath.Join(env.dir, "sym.bin")
+	_ = os.Symlink("real.bin", symF)
+	regBody, _ := json.Marshal(protocol.LocalRegisterReq{ProjectID: "proj-zero", LocalPath: symF, Filename: "sym.bin", Mode: "move"})
+	regReq, _ := http.NewRequest(http.MethodPost, a1Local+"/local/v1/register", bytes.NewReader(regBody))
+	regReq.Header.Set(protocol.HeaderLocalToken, a1Tok)
+	regReq.Header.Set("Content-Type", "application/json")
+	regResp, err := http.DefaultClient.Do(regReq)
+	if err != nil || regResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 for symlink register, got err=%v resp=%v", err, regResp)
+	}
+	_ = regResp.Body.Close()
+
+	// 4. Lease TTL bounds & int64 overflow rejection on /api/v1/claim.
+	validJWT, _ := auth.SignAccessJWT(env.jwtSecret, auth.AccessClaims{
+		BNodeID: "b1", ProjectID: "proj-zero", ANodeID: "a1",
+		IssuedAt: time.Now().Unix(), ExpiresAt: time.Now().Add(time.Minute).Unix(),
+	})
+	for _, badTTL := range []int{-5, 31536000, 10000000000} {
+		cb, _ := json.Marshal(protocol.ClaimReq{ProjectID: "proj-zero", BNodeID: "b1", LeaseTTLSec: badTTL})
+		cr, _ := http.NewRequest(http.MethodPost, "https://"+agA1.PublicListenAddr()+"/api/v1/claim", bytes.NewReader(cb))
+		cr.Header.Set("Authorization", "Bearer "+validJWT)
+		cr.Header.Set("Content-Type", "application/json")
+		cResp, err := env.httpClient.Do(cr)
+		if err != nil {
+			t.Fatalf("claim badTTL %d: %v", badTTL, err)
+		}
+		_ = cResp.Body.Close()
+		if cResp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("expected 400 for bad lease_ttl_sec=%d, got %d", badTTL, cResp.StatusCode)
+		}
+	}
+
+	// 5. Center live-files query param escaping prevents injection ("proj-zero&x=1" must NOT return proj-zero files).
+	var qLive protocol.LiveFilesResp
+	env.adminGet("/api/v1/admin/nodes/a1/live-files?project="+url.QueryEscape("proj-zero&x=1"), &qLive)
+	if len(qLive.Files) != 0 {
+		t.Fatalf("expected 0 files for escaped project 'proj-zero&x=1', got %d", len(qLive.Files))
+	}
+
+	// 6. 0-byte file E2E + concurrent auto_rename + skip + file/dir collision cleanup & backoff.
+	emptySHA := sha256.Sum256(nil)
+	if r, b := uploadToA(t, a1Local, a1Tok, "proj-zero", "empty.bin", nil, hex.EncodeToString(emptySHA[:])); r.StatusCode != http.StatusOK {
+		t.Fatalf("upload 0-byte file failed: %d %s", r.StatusCode, string(b))
+	}
+
+	bZeroDir := filepath.Join(env.dir, "b-zero")
+	bRenameDir := filepath.Join(env.dir, "b-rename")
+	bSkipDir := filepath.Join(env.dir, "b-skip")
+	bCollideDir := filepath.Join(env.dir, "b-collide")
+	_ = os.MkdirAll(bSkipDir, 0o755)
+	_ = os.WriteFile(filepath.Join(bSkipDir, "keep.txt"), []byte("ORIGINAL"), 0o600)
+	_ = os.MkdirAll(bCollideDir, 0o755)
+	_ = os.WriteFile(filepath.Join(bCollideDir, "collide"), []byte("FILE"), 0o600)
+
+	// Upload 5 same-named files for concurrent auto_rename test + 1 skip file + 1 colliding file.
+	for i := 0; i < 5; i++ {
+		content := []byte(fmt.Sprintf("payload-%d", i))
+		if r, _ := uploadToA(t, a1Local, a1Tok, "proj-rename", "same.txt", content, ""); r.StatusCode != http.StatusOK {
+			t.Fatalf("upload auto_rename #%d failed: %d", i, r.StatusCode)
+		}
+	}
+	if r, _ := uploadToA(t, a1Local, a1Tok, "proj-skip", "keep.txt", []byte("NEW"), ""); r.StatusCode != http.StatusOK {
+		t.Fatalf("upload skip failed: %d", r.StatusCode)
+	}
+	colResp, colBody := uploadToA(t, a1Local, a1Tok, "proj-collide", "collide/sub.txt", []byte("SUB"), "")
+	if colResp.StatusCode != http.StatusOK {
+		t.Fatalf("upload collide failed: %d", colResp.StatusCode)
+	}
+	var colUp protocol.LocalUploadResp
+	_ = json.Unmarshal(colBody, &colUp)
+
+	env.startAgentB(ctx, "b1", map[string]string{
+		"proj-zero":    bZeroDir,
+		"proj-rename":  bRenameDir,
+		"proj-skip":    bSkipDir,
+		"proj-collide": bCollideDir,
+	}, 4)
+
+	// Verify 0-byte empty.bin + rev.bin downloaded cleanly with 0 failures!
+	waitUntil(t, 10*time.Second, func() bool {
+		st0, err0 := os.Stat(filepath.Join(bZeroDir, "empty.bin"))
+		st1, err1 := os.Stat(filepath.Join(bZeroDir, "rev.bin"))
+		return err0 == nil && st0.Size() == 0 && err1 == nil && st1.Size() == int64(len("reverse-order-ok"))
+	}, "b1 downloaded 0-byte empty.bin and reversed-multipart rev.bin")
+
+	// Verify all 5 concurrent auto_rename files exist without overwriting each other!
+	waitUntil(t, 10*time.Second, func() bool {
+		ents, err := os.ReadDir(bRenameDir)
+		if err != nil {
+			return false
+		}
+		cnt := 0
+		for _, e := range ents {
+			if !e.IsDir() {
+				cnt++
+			}
+		}
+		return cnt == 5
+	}, "all 5 concurrent auto_rename files saved distinctly")
+
+	// Verify skip preserved ORIGINAL and removed file from A1.
+	waitUntil(t, 10*time.Second, func() bool {
+		var live protocol.LiveFilesResp
+		env.adminGet("/api/v1/admin/nodes/a1/live-files?project=proj-skip", &live)
+		return len(live.Files) == 0
+	}, "proj-skip file ACKed and deleted on A1")
+	if got, _ := os.ReadFile(filepath.Join(bSkipDir, "keep.txt")); string(got) != "ORIGINAL" {
+		t.Fatalf("proj-skip modified existing file: got %q", string(got))
+	}
+
+	// Verify collide/sub.txt did NOT leak .part and NACK backoff prevented rapid retry storm.
+	waitUntil(t, 5*time.Second, func() bool {
+		var live protocol.LiveFilesResp
+		env.adminGet("/api/v1/admin/nodes/a1/live-files?project=proj-collide", &live)
+		return len(live.Files) == 1 && live.Files[0].RetryCount >= 1
+	}, "collide file NACKed once")
+	time.Sleep(1500 * time.Millisecond)
+	if _, err := os.Stat(filepath.Join(bCollideDir, ".relay_tmp", colUp.FileID+".part")); !os.IsNotExist(err) {
+		t.Fatalf("expected .part to be cleaned up on mkdir failure, got err=%v", err)
+	}
+	var colLive protocol.LiveFilesResp
+	env.adminGet("/api/v1/admin/nodes/a1/live-files?project=proj-collide", &colLive)
+	if len(colLive.Files) != 1 || colLive.Files[0].RetryCount > 3 {
+		t.Fatalf("expected NACK backoff to limit retry_count <= 3, got %+v", colLive.Files)
+	}
+
+	// 7. Deleted A node is immediately evicted from Hub (discover, live-files, overview),
+	//    spoofed heartbeat public_addr cannot override Center-registered addr (SSRF protection),
+	//    and deleting a B node immediately closes its active SSE stream.
+	env.createProject("proj-a2-only", protocol.ConflictOverwrite, 30)
+	if r, _ := uploadToA(t, a2Local, a2Tok, "proj-a2-only", "on-a2.bin", []byte("a2data"), ""); r.StatusCode != http.StatusOK {
+		t.Fatalf("upload to a2 failed: %d", r.StatusCode)
+	}
+	waitUntil(t, 5*time.Second, func() bool {
+		var live protocol.LiveFilesResp
+		env.adminGet("/api/v1/admin/nodes/a2/live-files", &live)
+		return len(live.Files) == 1
+	}, "a2 online with 1 file")
+
+	// Register a dedicated B node to test SSE disconnect on delete.
+	sseBTok := auth.GenerateRandomToken(16)
+	if err := env.centerSrv.Store().UpsertNode(context.Background(), protocol.NodeRecord{
+		ID: "b-sse-del", Name: "b-sse-del", Role: protocol.RoleAgentB, Projects: []string{"proj-a2-only"},
+	}, sseBTok); err != nil {
+		t.Fatalf("UpsertNode b-sse-del: %v", err)
+	}
+	sseReq, _ := http.NewRequestWithContext(ctx, http.MethodGet, env.centerURL+"/api/v1/b/events?projects=proj-a2-only", nil)
+	sseReq.Header.Set(protocol.HeaderNodeID, "b-sse-del")
+	sseReq.Header.Set(protocol.HeaderNodeToken, sseBTok)
+	sseClient := &http.Client{Transport: env.httpClient.Transport}
+	sseResp, err := sseClient.Do(sseReq)
+	if err != nil || sseResp.StatusCode != http.StatusOK {
+		t.Fatalf("open SSE for b-sse-del failed: err=%v resp=%v", err, sseResp)
+	}
+	sseClosed := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(io.Discard, sseResp.Body)
+		_ = sseResp.Body.Close()
+		close(sseClosed)
+	}()
+	if r, _ := adminReq(http.MethodDelete, "/api/v1/admin/nodes/b-sse-del", nil); r.StatusCode != http.StatusNoContent {
+		t.Fatalf("delete b-sse-del failed: %d", r.StatusCode)
+	}
+	select {
+	case <-sseClosed:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("expected active SSE stream to close immediately after deleting b-sse-del")
+	}
+
+	_ = agA2.Shutdown(context.Background())
+
+	if r, _ := adminReq(http.MethodDelete, "/api/v1/admin/nodes/a2", nil); r.StatusCode != http.StatusNoContent {
+		t.Fatalf("delete a2 failed: %d", r.StatusCode)
+	}
+	if r, _ := adminReq(http.MethodGet, "/api/v1/admin/nodes/a2/live-files", nil); r.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 for deleted a2 live-files, got %d", r.StatusCode)
+	}
+	var ov protocol.OverviewResp
+	env.adminGet("/api/v1/admin/overview", &ov)
+	for _, ps := range ov.Projects {
+		for _, av := range ps.ANodeAvailability {
+			if av.ANodeID == "a2" {
+				t.Fatalf("deleted node a2 still present in overview availability")
+			}
+		}
+	}
 }

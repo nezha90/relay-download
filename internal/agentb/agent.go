@@ -54,7 +54,9 @@ type Agent struct {
 	// Optional metrics for test assertions.
 	ResumeCount atomic.Int64
 
-	wg sync.WaitGroup
+	commitMu sync.Mutex
+	wg       sync.WaitGroup
+	bgWG     sync.WaitGroup
 }
 
 func New(cfg *Config, logger *slog.Logger) (*Agent, error) {
@@ -129,6 +131,7 @@ func New(cfg *Config, logger *slog.Logger) (*Agent, error) {
 
 func (a *Agent) Start(ctx context.Context) error {
 	defer func() {
+		a.bgWG.Wait()
 		a.wg.Wait()
 		_ = a.store.Close()
 	}()
@@ -136,11 +139,18 @@ func (a *Agent) Start(ctx context.Context) error {
 	// Resume any downloads persisted before a process restart.
 	a.resumePersistedDownloads(ctx)
 
-	go a.speedMeterLoop(ctx)
-	go a.heartbeatLoop(ctx)
-	go a.ackFlushLoop(ctx)
-	go a.sseLoop(ctx)
-	go a.dispatchLoop(ctx)
+	launchBG := func(fn func(context.Context)) {
+		a.bgWG.Add(1)
+		go func() {
+			defer a.bgWG.Done()
+			fn(ctx)
+		}()
+	}
+	launchBG(a.speedMeterLoop)
+	launchBG(a.heartbeatLoop)
+	launchBG(a.ackFlushLoop)
+	launchBG(a.sseLoop)
+	launchBG(a.dispatchLoop)
 
 	<-ctx.Done()
 	return nil
@@ -207,9 +217,12 @@ func (a *Agent) sseLoop(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		err := a.consumeSSE(ctx, u)
+		connected, err := a.consumeSSE(ctx, u)
 		if ctx.Err() != nil {
 			return
+		}
+		if connected {
+			backoff = 500 * time.Millisecond
 		}
 		if err != nil {
 			a.logger.Warn("center SSE disconnected, reconnecting", "err", err, "backoff", backoff)
@@ -228,10 +241,10 @@ func (a *Agent) sseLoop(ctx context.Context) {
 	}
 }
 
-func (a *Agent) consumeSSE(ctx context.Context, sseURL string) error {
+func (a *Agent) consumeSSE(ctx context.Context, sseURL string) (bool, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, sseURL, nil)
 	if err != nil {
-		return err
+		return false, err
 	}
 	req.Header.Set("Accept", "text/event-stream")
 	req.Header.Set(protocol.HeaderNodeID, a.cfg.NodeID)
@@ -239,11 +252,11 @@ func (a *Agent) consumeSSE(ctx context.Context, sseURL string) error {
 
 	resp, err := a.streamClient.Do(req)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("SSE returned HTTP %d", resp.StatusCode)
+		return false, fmt.Errorf("SSE returned HTTP %d", resp.StatusCode)
 	}
 
 	scanner := bufio.NewScanner(resp.Body)
@@ -272,7 +285,7 @@ func (a *Agent) consumeSSE(ctx context.Context, sseURL string) error {
 			eventName = ""
 		}
 	}
-	return scanner.Err()
+	return true, scanner.Err()
 }
 
 func (a *Agent) dispatchLoop(ctx context.Context) {
@@ -520,8 +533,12 @@ func (a *Agent) runDownload(ctx context.Context, dl ActiveDownload) {
 			// Keep .part and BoltDB record intact so next startup can resume!
 			return
 		}
-		var offset int64
+		var (
+			offset     int64
+			partExists bool
+		)
 		if st, err := os.Stat(dl.PartPath); err == nil {
+			partExists = true
 			offset = st.Size()
 			if offset > dl.Size {
 				_ = os.Truncate(dl.PartPath, 0)
@@ -530,7 +547,7 @@ func (a *Agent) runDownload(ctx context.Context, dl ActiveDownload) {
 		}
 		prog.setTransferred(offset)
 
-		if offset == dl.Size {
+		if partExists && offset == dl.Size {
 			break
 		}
 		if offset > 0 {
@@ -601,9 +618,11 @@ func (a *Agent) runDownload(ctx context.Context, dl ActiveDownload) {
 		return
 	}
 
-	// Safe atomic commit into project destination directory.
+	// Safe atomic commit into project destination directory (serialized to prevent conflict-policy TOCTOU).
+	a.commitMu.Lock()
 	targetPath, skipCommit, err := resolveTargetPath(dl.DestDir, dl.Filename, dl.ConflictPolicy, dl.FileID)
 	if err != nil {
+		a.commitMu.Unlock()
 		a.logger.Error("invalid target path", "file_id", dl.FileID, "filename", dl.Filename, "err", err)
 		_ = os.Remove(dl.PartPath)
 		_ = a.store.DeleteActive(dl.FileID)
@@ -612,19 +631,25 @@ func (a *Agent) runDownload(ctx context.Context, dl ActiveDownload) {
 	}
 	if skipCommit {
 		_ = os.Remove(dl.PartPath)
+		a.commitMu.Unlock()
 	} else {
 		if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
+			a.commitMu.Unlock()
 			a.logger.Error("mkdir target parent failed", "err", err)
-			_ = a.sendNack(ctx, dl, "mkdir target failed")
+			_ = os.Remove(dl.PartPath)
 			_ = a.store.DeleteActive(dl.FileID)
+			_ = a.sendNack(ctx, dl, "mkdir target failed")
 			return
 		}
 		if err := os.Rename(dl.PartPath, targetPath); err != nil {
+			a.commitMu.Unlock()
 			a.logger.Error("atomic rename failed", "src", dl.PartPath, "dst", targetPath, "err", err)
-			_ = a.sendNack(ctx, dl, "rename failed")
+			_ = os.Remove(dl.PartPath)
 			_ = a.store.DeleteActive(dl.FileID)
+			_ = a.sendNack(ctx, dl, "rename failed")
 			return
 		}
+		a.commitMu.Unlock()
 	}
 
 	_ = a.store.DeleteActive(dl.FileID)
@@ -878,7 +903,8 @@ func (a *Agent) heartbeatLoop(ctx context.Context) {
 func (a *Agent) sendHeartbeat(ctx context.Context) {
 	var totalDisk, freeDisk uint64
 	var usedPct float64
-	for _, dir := range a.cfg.Projects {
+	for _, projID := range a.cfg.ProjectIDs() {
+		dir := a.cfg.Projects[projID]
 		if t, f, pct, err := transfer.DiskUsage(dir); err == nil {
 			totalDisk, freeDisk, usedPct = t, f, pct
 			break

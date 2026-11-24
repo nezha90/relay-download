@@ -143,14 +143,14 @@ func ServerTLSConfig(certFile, keyFile string) (*tls.Config, error) {
 	}
 	return &tls.Config{
 		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS12,
+		MinVersion:   tls.VersionTLS13,
 		NextProtos:   []string{"h2", "http/1.1"},
 	}, nil
 }
 
 func ClientTLSConfig(caCertPath string) (*tls.Config, error) {
 	cfg := &tls.Config{
-		MinVersion: tls.VersionTLS12,
+		MinVersion: tls.VersionTLS13,
 	}
 	if caCertPath != "" {
 		pemBytes, err := os.ReadFile(caCertPath)

@@ -159,7 +159,7 @@ FROM projects ORDER BY created_at ASC
 		return nil, err
 	}
 	defer rows.Close()
-	var list []protocol.Project
+	list := make([]protocol.Project, 0)
 	for rows.Next() {
 		var p protocol.Project
 		if err := rows.Scan(&p.ID, &p.Name, &p.Description, &p.ConflictPolicy, &p.LeaseTTLSec, &p.CreatedAt); err != nil {
@@ -233,7 +233,7 @@ FROM nodes ORDER BY role ASC, created_at ASC
 		return nil, err
 	}
 	defer rows.Close()
-	var list []protocol.NodeRecord
+	list := make([]protocol.NodeRecord, 0)
 	for rows.Next() {
 		var n protocol.NodeRecord
 		var projJSON string
@@ -407,7 +407,7 @@ ORDER BY date ASC
 		return nil, err
 	}
 	defer rows.Close()
-	var list []protocol.DailyStat
+	list := make([]protocol.DailyStat, 0)
 	for rows.Next() {
 		var d protocol.DailyStat
 		if err := rows.Scan(&d.Date, &d.ProjectID, &d.ANodeID, &d.FilesUploaded, &d.FilesCompleted, &d.FilesFailed, &d.BytesTransferred, &d.TotalDurationMs); err != nil {

@@ -3,6 +3,8 @@ package agenta
 import (
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"time"
 
@@ -83,6 +85,9 @@ func (c *Config) Validate() error {
 	if c.PublicAddr == "" {
 		return errors.New("public_addr is required")
 	}
+	if u, err := url.Parse(c.PublicAddr); err != nil || u.Scheme != "https" || u.Host == "" {
+		return fmt.Errorf("public_addr must be a valid https:// URL (got %q)", c.PublicAddr)
+	}
 	if c.CenterURL == "" {
 		return errors.New("center_url is required")
 	}
@@ -91,6 +96,22 @@ func (c *Config) Validate() error {
 	}
 	if c.JWTSecret == "" {
 		return errors.New("jwt_secret is required")
+	}
+	if c.CenterSecret == "" {
+		return errors.New("center_secret is required")
+	}
+	if c.LocalToken == "" {
+		return errors.New("local_token is required")
+	}
+	host, _, err := net.SplitHostPort(c.LocalListen)
+	if err != nil {
+		return fmt.Errorf("invalid local_listen %q: %w", c.LocalListen, err)
+	}
+	if host != "localhost" {
+		ip := net.ParseIP(host)
+		if ip == nil || !ip.IsLoopback() {
+			return fmt.Errorf("local_listen must bind to a loopback address (got %q)", c.LocalListen)
+		}
 	}
 	if c.TLSCert == "" || c.TLSKey == "" {
 		return errors.New("tls_cert and tls_key are required for public listener")

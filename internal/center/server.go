@@ -11,6 +11,8 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -21,6 +23,16 @@ import (
 	"relay-download/internal/pki"
 	"relay-download/internal/protocol"
 )
+
+var validIDRe = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
+
+func validateHTTPSAddr(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme != "https" || u.Host == "" {
+		return fmt.Errorf("public_addr must be a valid https:// URL")
+	}
+	return nil
+}
 
 //go:embed web/*
 var embeddedWeb embed.FS
@@ -224,8 +236,24 @@ func (s *Server) handleAHeartbeat(w http.ResponseWriter, r *http.Request, node *
 	if req.Name == "" {
 		req.Name = node.Name
 	}
-	if req.PublicAddr == "" {
+	// Pin public_addr to the Center-registered address to prevent SSRF via spoofed heartbeats.
+	if node.PublicAddr != "" {
 		req.PublicAddr = node.PublicAddr
+	} else if req.PublicAddr != "" {
+		if err := validateHTTPSAddr(req.PublicAddr); err != nil {
+			protocol.WriteError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	if len(node.Projects) > 0 {
+		req.Projects = append([]string(nil), node.Projects...)
+		filtered := make([]protocol.ProjectAvailability, 0, len(req.Availability))
+		for _, av := range req.Availability {
+			if nodeAllowsProject(node.Projects, av.ProjectID) {
+				filtered = append(filtered, av)
+			}
+		}
+		req.Availability = filtered
 	}
 	s.hub.UpdateA(req)
 	w.WriteHeader(http.StatusOK)
@@ -237,10 +265,15 @@ func (s *Server) handleAEvents(w http.ResponseWriter, r *http.Request, node *Sto
 		protocol.WriteError(w, http.StatusBadRequest, "invalid events payload")
 		return
 	}
-	for i := range req.Events {
-		req.Events[i].ANodeID = node.ID
+	validEvents := make([]protocol.SummaryEvent, 0, len(req.Events))
+	for _, ev := range req.Events {
+		if !nodeAllowsProject(node.Projects, ev.ProjectID) || ev.Bytes < 0 || ev.DurationMs < 0 {
+			continue
+		}
+		ev.ANodeID = node.ID
+		validEvents = append(validEvents, ev)
 	}
-	applied, err := s.store.RecordSummaryEvents(r.Context(), req.Events)
+	applied, err := s.store.RecordSummaryEvents(r.Context(), validEvents)
 	if err != nil {
 		protocol.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -257,6 +290,15 @@ func (s *Server) handleBHeartbeat(w http.ResponseWriter, r *http.Request, node *
 	req.NodeID = node.ID
 	if req.Name == "" {
 		req.Name = node.Name
+	}
+	if len(node.Projects) > 0 {
+		filtered := make([]string, 0, len(req.Projects))
+		for _, p := range req.Projects {
+			if nodeAllowsProject(node.Projects, p) {
+				filtered = append(filtered, p)
+			}
+		}
+		req.Projects = filtered
 	}
 	s.hub.UpdateB(req)
 	w.WriteHeader(http.StatusOK)
@@ -288,7 +330,10 @@ func (s *Server) handleBEventsSSE(w http.ResponseWriter, r *http.Request, node *
 	_, _ = fmt.Fprint(w, ": connected\n\n")
 	flusher.Flush()
 
-	ch, unsub := s.hub.SubscribeB(node.ID, projects)
+	sseCtx, cancelSSE := context.WithCancel(r.Context())
+	defer cancelSSE()
+
+	ch, unsub := s.hub.SubscribeB(node.ID, projects, cancelSSE)
 	defer unsub()
 
 	// Immediately notify if any subscribed project already has ready files.
@@ -304,7 +349,7 @@ func (s *Server) handleBEventsSSE(w http.ResponseWriter, r *http.Request, node *
 
 	for {
 		select {
-		case <-r.Context().Done():
+		case <-sseCtx.Done():
 			return
 		case proj := <-ch:
 			_, _ = fmt.Fprintf(w, "event: wakeup\ndata: %s\n\n", proj)
@@ -418,7 +463,7 @@ func (s *Server) handleAdminOverview(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Build active transfers list from online B nodes.
-	var allActive []protocol.BActiveTransferView
+	allActive := make([]protocol.BActiveTransferView, 0)
 	activeByProj := make(map[string][]protocol.BActiveTransferView)
 	for _, st := range bSnap {
 		if !s.hub.IsOnline(st.LastSeen) {
@@ -448,13 +493,18 @@ func (s *Server) handleAdminOverview(w http.ResponseWriter, r *http.Request) {
 	projSummaries := make([]protocol.ProjectSummary, 0, len(projects))
 	for _, p := range projects {
 		t := totalsMap[p.ID]
+		act := activeByProj[p.ID]
+		if act == nil {
+			act = make([]protocol.BActiveTransferView, 0)
+		}
 		ps := protocol.ProjectSummary{
-			Project:         p,
-			TotalUploaded:   t.TotalUploaded,
-			TotalCompleted:  t.TotalCompleted,
-			TotalFailed:     t.TotalFailed,
-			TotalBytes:      t.TotalBytes,
-			ActiveTransfers: activeByProj[p.ID],
+			Project:           p,
+			TotalUploaded:     t.TotalUploaded,
+			TotalCompleted:    t.TotalCompleted,
+			TotalFailed:       t.TotalFailed,
+			TotalBytes:        t.TotalBytes,
+			ANodeAvailability: make([]protocol.ANodeAvailSummary, 0),
+			ActiveTransfers:   act,
 		}
 		for _, aSt := range aSnap {
 			if !s.hub.IsOnline(aSt.LastSeen) {
@@ -516,18 +566,37 @@ func (s *Server) handleAdminUpsertProject(w http.ResponseWriter, r *http.Request
 		protocol.WriteError(w, http.StatusBadRequest, "project id required")
 		return
 	}
+	if !validIDRe.MatchString(p.ID) {
+		protocol.WriteError(w, http.StatusBadRequest, "invalid project id: only [A-Za-z0-9._-] (1-64 chars) allowed")
+		return
+	}
 	if p.Name == "" {
 		p.Name = p.ID
 	}
+	p.ConflictPolicy = strings.TrimSpace(p.ConflictPolicy)
 	if p.ConflictPolicy == "" {
 		p.ConflictPolicy = protocol.ConflictOverwrite
+	}
+	switch p.ConflictPolicy {
+	case protocol.ConflictOverwrite, protocol.ConflictAutoRename, protocol.ConflictSkip:
+	default:
+		protocol.WriteError(w, http.StatusBadRequest, "conflict_policy must be overwrite, auto_rename, or skip")
+		return
 	}
 	if p.LeaseTTLSec <= 0 {
 		p.LeaseTTLSec = 300
 	}
+	if p.LeaseTTLSec > 3600 {
+		protocol.WriteError(w, http.StatusBadRequest, "lease_ttl_sec must be <= 3600")
+		return
+	}
+	p.CreatedAt = time.Now().UTC()
 	if err := s.store.UpsertProject(r.Context(), p); err != nil {
 		protocol.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	if saved, err := s.store.GetProject(r.Context(), p.ID); err == nil {
+		p = *saved
 	}
 	protocol.WriteJSON(w, http.StatusOK, p)
 }
@@ -616,13 +685,24 @@ func (s *Server) handleAdminCreateNode(w http.ResponseWriter, r *http.Request) {
 	}
 	req.ID = strings.TrimSpace(req.ID)
 	req.Name = strings.TrimSpace(req.Name)
+	req.PublicAddr = strings.TrimSpace(req.PublicAddr)
 	if req.ID == "" {
 		protocol.WriteError(w, http.StatusBadRequest, "node id required")
+		return
+	}
+	if !validIDRe.MatchString(req.ID) {
+		protocol.WriteError(w, http.StatusBadRequest, "invalid node id: only [A-Za-z0-9._-] (1-64 chars) allowed")
 		return
 	}
 	if req.Role != protocol.RoleAgentA && req.Role != protocol.RoleAgentB {
 		protocol.WriteError(w, http.StatusBadRequest, "role must be agent_a or agent_b")
 		return
+	}
+	if req.Role == protocol.RoleAgentA && req.PublicAddr != "" {
+		if err := validateHTTPSAddr(req.PublicAddr); err != nil {
+			protocol.WriteError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 	}
 	if req.Name == "" {
 		req.Name = req.ID
@@ -636,7 +716,7 @@ func (s *Server) handleAdminCreateNode(w http.ResponseWriter, r *http.Request) {
 		Name:       req.Name,
 		Role:       req.Role,
 		Projects:   req.Projects,
-		PublicAddr: strings.TrimSpace(req.PublicAddr),
+		PublicAddr: req.PublicAddr,
 		CreatedAt:  time.Now().UTC(),
 	}
 	if err := s.store.UpsertNode(r.Context(), rec, rawToken); err != nil {
@@ -650,7 +730,8 @@ func (s *Server) handleAdminCreateNode(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAdminDeleteNode(w http.ResponseWriter, r *http.Request) {
-	if err := s.store.DeleteNode(r.Context(), r.PathValue("id")); err != nil {
+	nodeID := r.PathValue("id")
+	if err := s.store.DeleteNode(r.Context(), nodeID); err != nil {
 		if errors.Is(err, ErrNotFound) {
 			protocol.WriteError(w, http.StatusNotFound, "node not found")
 			return
@@ -658,6 +739,7 @@ func (s *Server) handleAdminDeleteNode(w http.ResponseWriter, r *http.Request) {
 		protocol.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	s.hub.RemoveNode(nodeID)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -710,14 +792,19 @@ func (s *Server) fetchALiveFiles(ctx context.Context, nodeID, nodeName, publicAd
 		ANodeID:    nodeID,
 		AName:      nodeName,
 		PublicAddr: publicAddr,
+		Files:      make([]protocol.LiveFileItem, 0),
 	}
 	if publicAddr == "" {
 		fallback.Error = "node has no public_addr"
 		return fallback
 	}
+	if err := validateHTTPSAddr(publicAddr); err != nil {
+		fallback.Error = err.Error()
+		return fallback
+	}
 	u := strings.TrimRight(publicAddr, "/") + "/internal/v1/files"
 	if projectFilter != "" {
-		u += "?project=" + projectFilter
+		u += "?project=" + url.QueryEscape(projectFilter)
 	}
 	qCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
