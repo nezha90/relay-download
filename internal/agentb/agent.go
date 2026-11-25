@@ -231,12 +231,20 @@ func New(cfg *Config, logger *slog.Logger) (*Agent, error) {
 		discCache:     make(map[string]cachedDiscover),
 		progress:      make(map[string]*activeProgress),
 	}
+	upgradeClient := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig:     clientTLS.Clone(),
+			ForceAttemptHTTP2:   true,
+			DisableKeepAlives:   true,
+			TLSHandshakeTimeout: 10 * time.Second,
+		},
+	}
 	ag.updater = updater.New(updater.Options{
 		Component:    "relay-agent-b",
 		NodeID:       cfg.NodeID,
 		CenterURL:    cfg.CenterURL,
 		CenterToken:  cfg.CenterToken,
-		HTTPClient:   ag.sseClient,
+		HTTPClient:   upgradeClient,
 		Logger:       ag.logger,
 		OnStatusSync: ag.triggerHeartbeat,
 		OnRestart: func(targetVer string) {
@@ -1287,44 +1295,59 @@ func (a *Agent) downloadChunked(ctx context.Context, dl ActiveDownload, prog *ac
 	defer cancelChunks()
 
 	// Pipelined prefix SHA256 hasher (for fresh downloads): hashes completed sequential prefix chunks
-	// while they are still hot in Linux page cache, avoiding a full 2x disk re-read on 100s-of-GB files!
+	// directly from bounded in-RAM buffers (zero disk readback on spinning HDDs and 10Gbps NVMe!),
+	// falling back to SectionReader only if out-of-order lag exceeds the 32MiB RAM cache budget.
+	type hashedChunk struct {
+		idx  int
+		data []byte // nil if omitted to stay within RAM budget
+	}
 	var (
-		hashCh       chan int
-		hashDone     chan struct{}
-		pipelinedSHA string
-		hashErr      error
+		hashCh        chan hashedChunk
+		hashDone      chan struct{}
+		pipelinedSHA  string
+		hashErr       error
+		hashRAMBudget atomic.Int64
 	)
+	const maxHashRAMPerFile = 16 << 20
 	if !resumed {
 		chCap := numChunks
 		if chCap > 256 {
 			chCap = 256
 		}
-		hashCh = make(chan int, chCap)
+		hashCh = make(chan hashedChunk, chCap)
 		hashDone = make(chan struct{})
 		go func() {
 			defer close(hashDone)
 			ready := make([]bool, numChunks)
+			cached := make([][]byte, numChunks)
 			nextIdx := 0
 			h := sha256.New()
 			bufPtr := transfer.GetBuf()
 			defer transfer.PutBuf(bufPtr)
 			buf := *bufPtr
 
-			for idx := range hashCh {
-				ready[idx] = true
+			for item := range hashCh {
+				ready[item.idx] = true
+				cached[item.idx] = item.data
 				for nextIdx < numChunks && ready[nextIdx] {
 					if chunkCtx.Err() != nil {
 						return
 					}
-					st := int64(nextIdx) * chunkSize
-					ln := chunkSize
-					if st+ln > dl.Size {
-						ln = dl.Size - st
-					}
-					sr := io.NewSectionReader(f, st, ln)
-					if _, err := io.CopyBuffer(h, sr, buf); err != nil {
-						hashErr = err
-						return
+					if mem := cached[nextIdx]; mem != nil {
+						_, _ = h.Write(mem)
+						cached[nextIdx] = nil
+						hashRAMBudget.Add(-int64(len(mem)))
+					} else {
+						st := int64(nextIdx) * chunkSize
+						ln := chunkSize
+						if st+ln > dl.Size {
+							ln = dl.Size - st
+						}
+						sr := io.NewSectionReader(f, st, ln)
+						if _, err := io.CopyBuffer(h, sr, buf); err != nil {
+							hashErr = err
+							return
+						}
 					}
 					nextIdx++
 				}
@@ -1385,17 +1408,33 @@ func (a *Agent) downloadChunked(ctx context.Context, dl ActiveDownload, prog *ac
 				if chunkCtx.Err() != nil {
 					return
 				}
-				status, err := a.fetchRangeWithRetry(chunkCtx, dl, f, rg.start, rg.end, prog, &completedBytes)
+				var memBuf []byte
+				cLen := rg.end - rg.start + 1
+				if hashCh != nil && cLen <= 8<<20 && hashRAMBudget.Add(cLen) <= maxHashRAMPerFile {
+					memBuf = make([]byte, cLen)
+				} else if hashCh != nil && cLen <= 8<<20 {
+					hashRAMBudget.Add(-cLen)
+				}
+				status, err := a.fetchRangeWithRetry(chunkCtx, dl, f, rg.start, rg.end, memBuf, prog, &completedBytes)
 				if err != nil {
+					if memBuf != nil {
+						hashRAMBudget.Add(-int64(len(memBuf)))
+					}
 					recordErr(status, err)
 					return
 				}
 				bm.markDone(rg.idx)
 				if hashCh != nil {
 					select {
-					case hashCh <- rg.idx:
+					case hashCh <- hashedChunk{idx: rg.idx, data: memBuf}:
 					case <-chunkCtx.Done():
+						if memBuf != nil {
+							hashRAMBudget.Add(-int64(len(memBuf)))
+						}
 					case <-hashDone:
+						if memBuf != nil {
+							hashRAMBudget.Add(-int64(len(memBuf)))
+						}
 					}
 				}
 			}
@@ -1408,13 +1447,19 @@ func (a *Agent) downloadChunked(ctx context.Context, dl ActiveDownload, prog *ac
 	}
 
 	if firstErr != nil {
-		_ = f.Sync()
+		if a.cfg.AckBatchIntervalMs <= 0 {
+			_ = f.Sync()
+		}
 		_ = f.Close()
 		return "", firstStatus, firstErr
 	}
-	if err := f.Sync(); err != nil {
-		_ = f.Close()
-		return "", 0, err
+	// When AckBatchIntervalMs > 0, durability is guaranteed by a batched filesystem-level SyncFS
+	// right before sending batch-ack, avoiding 20-30x/sec per-file fsync barriers on HDDs.
+	if a.cfg.AckBatchIntervalMs <= 0 {
+		if err := f.Sync(); err != nil {
+			_ = f.Close()
+			return "", 0, err
+		}
 	}
 	if err := f.Close(); err != nil {
 		return "", 0, err
@@ -1426,7 +1471,7 @@ func (a *Agent) downloadChunked(ctx context.Context, dl ActiveDownload, prog *ac
 	return pipelinedSHA, http.StatusOK, nil
 }
 
-func (a *Agent) fetchRangeWithRetry(ctx context.Context, dl ActiveDownload, f *os.File, start, end int64, prog *activeProgress, completedBytes *atomic.Int64) (int, error) {
+func (a *Agent) fetchRangeWithRetry(ctx context.Context, dl ActiveDownload, f *os.File, start, end int64, memBuf []byte, prog *activeProgress, completedBytes *atomic.Int64) (int, error) {
 	u := strings.TrimRight(dl.PublicAddr, "/") + "/api/v1/files/" + url.PathEscape(dl.FileID) + "/stream"
 	cur := start
 	backoff := 200 * time.Millisecond
@@ -1476,7 +1521,11 @@ func (a *Agent) fetchRangeWithRetry(ctx context.Context, dl ActiveDownload, f *o
 			}
 		}()
 
-		written, status, streamErr := a.streamRangeOnce(reqCtx, u, dl.LeaseToken, f, cur, end, prog, completedBytes, &lastActivity, &attemptBytes)
+		var subMem []byte
+		if memBuf != nil {
+			subMem = memBuf[cur-start:]
+		}
+		written, status, streamErr := a.streamRangeOnce(reqCtx, u, dl.LeaseToken, f, cur, end, subMem, prog, completedBytes, &lastActivity, &attemptBytes)
 		close(watchDone)
 		reqCancel()
 		<-a.streamSem
@@ -1509,7 +1558,7 @@ func (a *Agent) fetchRangeWithRetry(ctx context.Context, dl ActiveDownload, f *o
 	return 0, fmt.Errorf("range %d-%d exhausted retries at offset %d", start, end, cur)
 }
 
-func (a *Agent) streamRangeOnce(ctx context.Context, streamURL, leaseToken string, f *os.File, start, end int64, prog *activeProgress, completedBytes *atomic.Int64, lastActivity *atomic.Int64, attemptBytes *atomic.Int64) (int64, int, error) {
+func (a *Agent) streamRangeOnce(ctx context.Context, streamURL, leaseToken string, f *os.File, start, end int64, memBuf []byte, prog *activeProgress, completedBytes *atomic.Int64, lastActivity *atomic.Int64, attemptBytes *atomic.Int64) (int64, int, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, streamURL, nil)
 	if err != nil {
 		return 0, 0, err
@@ -1551,6 +1600,9 @@ func (a *Agent) streamRangeOnce(ctx context.Context, streamURL, leaseToken strin
 			}
 			nw, wErr := f.WriteAt(buf[:nr], start+written)
 			if nw > 0 {
+				if memBuf != nil && written+int64(nw) <= int64(len(memBuf)) {
+					copy(memBuf[written:written+int64(nw)], buf[:nw])
+				}
 				written += int64(nw)
 				attemptBytes.Add(int64(nw))
 				a.inBytes.Add(int64(nw))
@@ -1689,8 +1741,10 @@ func (a *Agent) streamOnce(ctx context.Context, dl ActiveDownload, offset int64,
 			}
 		}
 		if rErr == io.EOF {
-			if err := f.Sync(); err != nil {
-				return written, "", resp.StatusCode, err
+			if a.cfg.AckBatchIntervalMs <= 0 {
+				if err := f.Sync(); err != nil {
+					return written, "", resp.StatusCode, err
+				}
 			}
 			if offset+written < dl.Size {
 				return written, "", resp.StatusCode, io.ErrUnexpectedEOF
@@ -1869,16 +1923,17 @@ func (a *Agent) flushPendingAcks(ctx context.Context) {
 		return
 	}
 
-	// Ensure every destination directory containing newly landed files is fsynced on disk
-	// BEFORE confirming ACK to Agent A ("没落盘的不准删").
+	// Ensure every destination filesystem containing newly landed files is durably flushed
+	// (SyncFS flushes ALL dirty data, inodes, and atomic renames on the mount in one barrier)
+	// BEFORE confirming batch-ack to Agent A ("没落盘的不准删").
 	syncedDirs := make(map[string]bool)
 	failedDirs := make(map[string]bool)
 	for _, ak := range acks {
 		if ak.DestDir == "" || syncedDirs[ak.DestDir] || failedDirs[ak.DestDir] {
 			continue
 		}
-		if err := transfer.SyncDir(ak.DestDir); err != nil {
-			a.logger.Warn("fsync dest dir failed, deferring ACK", "dir", ak.DestDir, "err", err)
+		if err := transfer.SyncFS(ak.DestDir); err != nil {
+			a.logger.Warn("syncfs dest dir failed, deferring ACK", "dir", ak.DestDir, "err", err)
 			failedDirs[ak.DestDir] = true
 		} else {
 			syncedDirs[ak.DestDir] = true
