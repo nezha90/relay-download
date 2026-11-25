@@ -22,6 +22,10 @@ type Config struct {
 	StateDir             string              `yaml:"state_dir"`
 	MaxConcurrent        int                 `yaml:"max_concurrent"`
 	StreamConns          int                 `yaml:"stream_conns,omitempty"`          // independent TLS 1.3 + HTTP/2 TCP sockets to saturate 1Gbps WAN links
+	MaxTotalStreams      int                 `yaml:"max_total_streams,omitempty"`     // global cap on simultaneous active HTTP range streams across all workers
+	ChunkConcurrency     int                 `yaml:"chunk_concurrency,omitempty"`     // parallel range streams per large file (<=1 disables chunking)
+	ChunkSizeMB          int                 `yaml:"chunk_size_mb,omitempty"`         // range chunk size in MiB (default 4)
+	ChunkThresholdMB     int                 `yaml:"chunk_threshold_mb,omitempty"`    // minimum file size in MiB to activate parallel range chunking (default 4)
 	ClaimBatchSize       int                 `yaml:"claim_batch_size,omitempty"`      // max files claimed per RPC
 	AckBatchIntervalMs   int                 `yaml:"ack_batch_interval_ms,omitempty"` // ms to buffer verified on-disk ACKs before batch-ack (<=0 = immediate)
 	AckBatchSize         int                 `yaml:"ack_batch_size,omitempty"`        // flush early once pending ACKs hit this count
@@ -66,14 +70,35 @@ func (c *Config) ApplyDefaults() {
 			c.StreamConns = 1
 		}
 	}
-	if c.StreamConns > 32 {
-		c.StreamConns = 32
+	if c.StreamConns > 256 {
+		c.StreamConns = 256
+	}
+	if c.ChunkConcurrency < 1 {
+		c.ChunkConcurrency = 1
+	}
+	if c.ChunkConcurrency > 64 {
+		c.ChunkConcurrency = 64
+	}
+	if c.ChunkSizeMB <= 0 {
+		c.ChunkSizeMB = 4
+	}
+	if c.ChunkThresholdMB <= 0 {
+		c.ChunkThresholdMB = c.ChunkSizeMB
+	}
+	if c.MaxTotalStreams <= 0 {
+		c.MaxTotalStreams = c.MaxConcurrent * c.ChunkConcurrency
+		if c.MaxTotalStreams > 256 {
+			c.MaxTotalStreams = 256
+		}
+		if c.MaxTotalStreams < c.MaxConcurrent {
+			c.MaxTotalStreams = c.MaxConcurrent
+		}
 	}
 	if c.ClaimBatchSize <= 0 {
 		c.ClaimBatchSize = 16
 	}
-	if c.ClaimBatchSize > 64 {
-		c.ClaimBatchSize = 64
+	if c.ClaimBatchSize > 128 {
+		c.ClaimBatchSize = 128
 	}
 	if c.AckBatchSize <= 0 {
 		c.AckBatchSize = 50

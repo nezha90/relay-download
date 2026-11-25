@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -55,6 +56,7 @@ type Agent struct {
 	limiter       *transfer.RateLimiter
 
 	workSem   chan struct{}
+	streamSem chan struct{}
 	wakeupCh  chan string
 	ackWakeCh chan struct{}
 	hbWakeCh  chan struct{}
@@ -128,16 +130,16 @@ func New(cfg *Config, logger *slog.Logger) (*Agent, error) {
 			Transport: &http.Transport{
 				TLSClientConfig:     clientTLS.Clone(),
 				ForceAttemptHTTP2:   true,
-				MaxIdleConns:        16,
-				MaxIdleConnsPerHost: 8,
+				MaxIdleConns:        8,
+				MaxIdleConnsPerHost: 4,
 				IdleConnTimeout:     90 * time.Second,
 				TLSHandshakeTimeout: 10 * time.Second,
-				ReadBufferSize:      1 << 20,
-				WriteBufferSize:     1 << 20,
+				ReadBufferSize:      256 << 10,
+				WriteBufferSize:     64 << 10,
 				HTTP2: &http.HTTP2Config{
-					MaxReadFrameSize:              1 << 20,
-					MaxReceiveBufferPerConnection: 3 << 20,
-					MaxReceiveBufferPerStream:     3 << 20,
+					MaxReadFrameSize:              512 << 10,
+					MaxReceiveBufferPerConnection: 2 << 20,
+					MaxReceiveBufferPerStream:     2 << 20,
 				},
 			},
 		}
@@ -165,6 +167,7 @@ func New(cfg *Config, logger *slog.Logger) (*Agent, error) {
 		sseClient:     makeStreamClient(),
 		streamClients: streamClients,
 		workSem:       make(chan struct{}, cfg.MaxConcurrent),
+		streamSem:     make(chan struct{}, cfg.MaxTotalStreams),
 		wakeupCh:      make(chan string, 128),
 		ackWakeCh:     make(chan struct{}, 1),
 		hbWakeCh:      make(chan struct{}, 1),
@@ -825,7 +828,42 @@ func (a *Agent) runDownload(ctx context.Context, dl ActiveDownload) {
 		backoff       = 250 * time.Millisecond
 	)
 
-	for {
+	chunkThreshold := int64(a.cfg.ChunkThresholdMB) << 20
+	useChunked := a.cfg.ChunkConcurrency > 1 && dl.Size > 0 && dl.Size >= chunkThreshold
+	bitmapPath := dl.PartPath + ".bitmap"
+	if useChunked {
+		// If a prior single-stream partial file exists WITHOUT a chunk bitmap, preserve single-stream resume compatibility.
+		if st, err := os.Stat(dl.PartPath); err == nil && st.Size() > 0 && st.Size() < dl.Size {
+			if _, bmErr := os.Stat(bitmapPath); errors.Is(bmErr, os.ErrNotExist) {
+				useChunked = false
+			}
+		}
+	}
+
+	if useChunked {
+		statusCode, chunkErr := a.downloadChunked(ctx, dl, prog)
+		if chunkErr != nil {
+			if ctx.Err() != nil {
+				// Preserve .part and .part.bitmap so restart resumes only unfinished chunks!
+				return
+			}
+			if statusCode == http.StatusConflict || statusCode == http.StatusNotFound || statusCode == http.StatusGone {
+				a.logger.Warn("lease expired or file gone on A during chunked download, abandoning", "file_id", dl.FileID, "status", statusCode)
+				_ = os.Remove(dl.PartPath)
+				_ = os.Remove(bitmapPath)
+				_ = a.store.DeleteActive(dl.FileID)
+				return
+			}
+			a.logger.Warn("chunked download failed, falling back to resumable single-stream", "file_id", dl.FileID, "err", chunkErr)
+			_ = os.Remove(dl.PartPath)
+			_ = os.Remove(bitmapPath)
+			useChunked = false
+		} else {
+			_ = os.Remove(bitmapPath)
+		}
+	}
+
+	for !useChunked {
 		if ctx.Err() != nil {
 			// Keep .part and BoltDB record intact so next startup can resume!
 			return
@@ -938,6 +976,9 @@ func (a *Agent) runDownload(ctx context.Context, dl ActiveDownload) {
 			_ = a.sendNack(ctx, dl, "mkdir target failed")
 			return
 		}
+		if err := os.Chmod(dl.PartPath, 0o644); err != nil {
+			a.logger.Warn("chmod target part file failed", "path", dl.PartPath, "err", err)
+		}
 		if err := os.Rename(dl.PartPath, targetPath); err != nil {
 			a.commitMu.Unlock()
 			a.logger.Error("atomic rename failed", "src", dl.PartPath, "dst", targetPath, "err", err)
@@ -980,7 +1021,377 @@ func (a *Agent) runDownload(ctx context.Context, dl ActiveDownload) {
 	a.logger.Info("download verified and committed", "file_id", dl.FileID, "project", dl.ProjectID, "target", targetPath, "size", dl.Size)
 }
 
+const chunkBitmapHeaderSize = 24
+
+var chunkBitmapMagic = [8]byte{'R', 'C', 'H', 'K', '0', '0', '0', '1'}
+
+// effectiveChunkSize adapts chunk size cleanly across KB..hundreds-of-GB file sizes so
+// multi-100GB files keep sequential disk writes and tiny (<10KB) resume bitmaps.
+func effectiveChunkSize(fileSize int64, baseMB int) int64 {
+	base := int64(baseMB) << 20
+	if base <= 0 {
+		base = 4 << 20
+	}
+	switch {
+	case fileSize >= 4<<30 && base < 32<<20:
+		return 32 << 20 // >= 4 GiB (up to 100s of GiB): 32 MiB chunks
+	case fileSize >= 256<<20 && base < 16<<20:
+		return 16 << 20 // 256 MiB .. 4 GiB: 16 MiB chunks
+	default:
+		return base
+	}
+}
+
+type chunkBitmap struct {
+	mu   sync.Mutex
+	f    *os.File
+	bits []byte
+}
+
+func openOrInitChunkBitmap(partPath, bitmapPath string, fileSize, chunkSize int64, numChunks int) (*os.File, *chunkBitmap, bool, error) {
+	bitBytes := (numChunks + 7) / 8
+	expectedBMSize := int64(chunkBitmapHeaderSize + bitBytes)
+
+	// Try resuming from existing pre-sized .part + matching .bitmap.
+	if pSt, pErr := os.Stat(partPath); pErr == nil && pSt.Size() == fileSize {
+		if raw, bErr := os.ReadFile(bitmapPath); bErr == nil && int64(len(raw)) == expectedBMSize {
+			if bytes.Equal(raw[:8], chunkBitmapMagic[:]) &&
+				int64(binary.BigEndian.Uint64(raw[8:16])) == fileSize &&
+				int64(binary.BigEndian.Uint64(raw[16:24])) == chunkSize {
+				pf, err := os.OpenFile(partPath, os.O_RDWR, 0o644)
+				if err == nil {
+					bf, bOpenErr := os.OpenFile(bitmapPath, os.O_RDWR, 0o644)
+					if bOpenErr == nil {
+						bits := make([]byte, bitBytes)
+						copy(bits, raw[chunkBitmapHeaderSize:])
+						return pf, &chunkBitmap{f: bf, bits: bits}, true, nil
+					}
+					_ = pf.Close()
+				}
+			}
+		}
+	}
+
+	// Fresh chunked download: create pre-sized .part and zeroed .bitmap header.
+	pf, err := os.OpenFile(partPath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	if err := pf.Truncate(fileSize); err != nil {
+		_ = pf.Close()
+		return nil, nil, false, err
+	}
+	bf, err := os.OpenFile(bitmapPath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
+	if err != nil {
+		_ = pf.Close()
+		return nil, nil, false, err
+	}
+	initBuf := make([]byte, expectedBMSize)
+	copy(initBuf[:8], chunkBitmapMagic[:])
+	binary.BigEndian.PutUint64(initBuf[8:16], uint64(fileSize))
+	binary.BigEndian.PutUint64(initBuf[16:24], uint64(chunkSize))
+	if _, err := bf.WriteAt(initBuf, 0); err != nil {
+		_ = bf.Close()
+		_ = pf.Close()
+		return nil, nil, false, err
+	}
+	return pf, &chunkBitmap{f: bf, bits: make([]byte, bitBytes)}, false, nil
+}
+
+func (cb *chunkBitmap) isDone(idx int) bool {
+	return (cb.bits[idx/8] & (1 << uint(idx%8))) != 0
+}
+
+func (cb *chunkBitmap) markDone(idx int) {
+	cb.mu.Lock()
+	bIdx := idx / 8
+	cb.bits[bIdx] |= 1 << uint(idx%8)
+	val := [1]byte{cb.bits[bIdx]}
+	_, _ = cb.f.WriteAt(val[:], int64(chunkBitmapHeaderSize+bIdx))
+	cb.mu.Unlock()
+}
+
+func (cb *chunkBitmap) close() {
+	if cb != nil && cb.f != nil {
+		_ = cb.f.Sync()
+		_ = cb.f.Close()
+	}
+}
+
+func (a *Agent) downloadChunked(ctx context.Context, dl ActiveDownload, prog *activeProgress) (int, error) {
+	chunkSize := effectiveChunkSize(dl.Size, a.cfg.ChunkSizeMB)
+	numChunks := int((dl.Size + chunkSize - 1) / chunkSize)
+	bitmapPath := dl.PartPath + ".bitmap"
+
+	f, bm, resumed, err := openOrInitChunkBitmap(dl.PartPath, bitmapPath, dl.Size, chunkSize, numChunks)
+	if err != nil {
+		return 0, err
+	}
+	defer bm.close()
+
+	type byteRange struct {
+		idx   int
+		start int64
+		end   int64
+	}
+
+	var (
+		completedBytes atomic.Int64
+		pendingCount   int
+	)
+	for i := 0; i < numChunks; i++ {
+		start := int64(i) * chunkSize
+		end := start + chunkSize - 1
+		if end >= dl.Size {
+			end = dl.Size - 1
+		}
+		if bm.isDone(i) {
+			completedBytes.Add(end - start + 1)
+		} else {
+			pendingCount++
+		}
+	}
+	if resumed && completedBytes.Load() > 0 {
+		prog.setTransferred(completedBytes.Load())
+		a.ResumeCount.Add(1)
+		a.logger.Info("resuming chunked download from bitmap", "file_id", dl.FileID, "done_bytes", completedBytes.Load(), "total_bytes", dl.Size, "pending_chunks", pendingCount)
+	}
+	if pendingCount == 0 {
+		if err := f.Sync(); err != nil {
+			_ = f.Close()
+			return 0, err
+		}
+		if err := f.Close(); err != nil {
+			return 0, err
+		}
+		return http.StatusOK, nil
+	}
+
+	chunkCtx, cancelChunks := context.WithCancel(ctx)
+	defer cancelChunks()
+
+	workers := a.cfg.ChunkConcurrency
+	if workers > pendingCount {
+		workers = pendingCount
+	}
+
+	// Bounded channel fed lazily so even a multi-TB file uses O(1) memory.
+	jobs := make(chan byteRange, workers*2)
+	go func() {
+		defer close(jobs)
+		for i := 0; i < numChunks; i++ {
+			if bm.isDone(i) {
+				continue
+			}
+			start := int64(i) * chunkSize
+			end := start + chunkSize - 1
+			if end >= dl.Size {
+				end = dl.Size - 1
+			}
+			select {
+			case jobs <- byteRange{idx: i, start: start, end: end}:
+			case <-chunkCtx.Done():
+				return
+			}
+		}
+	}()
+
+	var (
+		firstErrMu  sync.Mutex
+		firstErr    error
+		firstStatus int
+		wg          sync.WaitGroup
+	)
+	recordErr := func(status int, err error) {
+		firstErrMu.Lock()
+		if firstErr == nil {
+			firstErr = err
+			firstStatus = status
+		}
+		firstErrMu.Unlock()
+		cancelChunks()
+	}
+
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for rg := range jobs {
+				if chunkCtx.Err() != nil {
+					return
+				}
+				status, err := a.fetchRangeWithRetry(chunkCtx, dl, f, rg.start, rg.end, prog, &completedBytes)
+				if err != nil {
+					recordErr(status, err)
+					return
+				}
+				bm.markDone(rg.idx)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if firstErr != nil {
+		_ = f.Sync()
+		_ = f.Close()
+		return firstStatus, firstErr
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return 0, err
+	}
+	if err := f.Close(); err != nil {
+		return 0, err
+	}
+	return http.StatusOK, nil
+}
+
+func (a *Agent) fetchRangeWithRetry(ctx context.Context, dl ActiveDownload, f *os.File, start, end int64, prog *activeProgress, completedBytes *atomic.Int64) (int, error) {
+	u := strings.TrimRight(dl.PublicAddr, "/") + "/api/v1/files/" + url.PathEscape(dl.FileID) + "/stream"
+	cur := start
+	backoff := 200 * time.Millisecond
+
+	for attempt := 0; attempt < 8; attempt++ {
+		if ctx.Err() != nil {
+			return 0, ctx.Err()
+		}
+		select {
+		case a.streamSem <- struct{}{}:
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		}
+
+		// Per-attempt stall watchdog: if a single WAN TCP flow stalls with zero progress for 25s,
+		// abort this range attempt and immediately retry on a fresh TCP socket from the pool.
+		reqCtx, reqCancel := context.WithCancel(ctx)
+		var lastActivity atomic.Int64
+		lastActivity.Store(time.Now().UnixNano())
+		watchDone := make(chan struct{})
+		go func() {
+			t := time.NewTicker(5 * time.Second)
+			defer t.Stop()
+			for {
+				select {
+				case <-watchDone:
+					return
+				case <-reqCtx.Done():
+					return
+				case <-t.C:
+					if time.Since(time.Unix(0, lastActivity.Load())) > 25*time.Second {
+						reqCancel()
+						return
+					}
+				}
+			}
+		}()
+
+		written, status, streamErr := a.streamRangeOnce(reqCtx, u, dl.LeaseToken, f, cur, end, prog, completedBytes, &lastActivity)
+		close(watchDone)
+		reqCancel()
+		<-a.streamSem
+
+		cur += written
+		if streamErr == nil && cur > end {
+			return http.StatusPartialContent, nil
+		}
+		if status == http.StatusConflict || status == http.StatusNotFound || status == http.StatusGone {
+			return status, streamErr
+		}
+		if written > 0 {
+			backoff = 200 * time.Millisecond
+			if attempt > 0 {
+				attempt-- // made forward progress -> don't burn retry budget
+			}
+		}
+		timer := time.NewTimer(backoff)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return 0, ctx.Err()
+		case <-timer.C:
+		}
+		backoff *= 2
+		if backoff > 3*time.Second {
+			backoff = 3 * time.Second
+		}
+	}
+	return 0, fmt.Errorf("range %d-%d exhausted retries at offset %d", start, end, cur)
+}
+
+func (a *Agent) streamRangeOnce(ctx context.Context, streamURL, leaseToken string, f *os.File, start, end int64, prog *activeProgress, completedBytes *atomic.Int64, lastActivity *atomic.Int64) (int64, int, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, streamURL, nil)
+	if err != nil {
+		return 0, 0, err
+	}
+	req.Header.Set(protocol.HeaderLeaseToken, leaseToken)
+	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
+
+	resp, err := a.nextStreamClient().Do(req)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusPartialContent && !(start == 0 && resp.StatusCode == http.StatusOK) {
+		return 0, resp.StatusCode, fmt.Errorf("range stream returned HTTP %d", resp.StatusCode)
+	}
+
+	bufPtr := transfer.GetBuf()
+	defer transfer.PutBuf(bufPtr)
+	buf := *bufPtr
+
+	want := end - start + 1
+	var written int64
+	for written < want {
+		if err := ctx.Err(); err != nil {
+			return written, resp.StatusCode, err
+		}
+		toRead := len(buf)
+		if rem := want - written; int64(toRead) > rem {
+			toRead = int(rem)
+		}
+		nr, rErr := resp.Body.Read(buf[:toRead])
+		if nr > 0 {
+			lastActivity.Store(time.Now().UnixNano())
+			if a.limiter != nil {
+				if err := a.limiter.Wait(ctx, nr); err != nil {
+					return written, resp.StatusCode, err
+				}
+			}
+			nw, wErr := f.WriteAt(buf[:nr], start+written)
+			if nw > 0 {
+				written += int64(nw)
+				a.inBytes.Add(int64(nw))
+				tot := completedBytes.Add(int64(nw))
+				prog.addBytes(tot, int64(nw))
+			}
+			if wErr != nil {
+				return written, resp.StatusCode, wErr
+			}
+			if nw != nr {
+				return written, resp.StatusCode, io.ErrShortWrite
+			}
+		}
+		if rErr == io.EOF {
+			if written < want {
+				return written, resp.StatusCode, io.ErrUnexpectedEOF
+			}
+			return written, resp.StatusCode, nil
+		}
+		if rErr != nil {
+			return written, resp.StatusCode, rErr
+		}
+	}
+	return written, resp.StatusCode, nil
+}
+
 func (a *Agent) streamOnce(ctx context.Context, dl ActiveDownload, offset int64, prog *activeProgress) (written int64, shaFromZero string, statusCode int, err error) {
+	select {
+	case a.streamSem <- struct{}{}:
+		defer func() { <-a.streamSem }()
+	case <-ctx.Done():
+		return 0, "", 0, ctx.Err()
+	}
 	u := strings.TrimRight(dl.PublicAddr, "/") + "/api/v1/files/" + url.PathEscape(dl.FileID) + "/stream"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
@@ -1001,7 +1412,7 @@ func (a *Agent) streamOnce(ctx context.Context, dl ActiveDownload, offset int64,
 		return 0, "", resp.StatusCode, fmt.Errorf("stream returned HTTP %d", resp.StatusCode)
 	}
 
-	f, err := os.OpenFile(dl.PartPath, os.O_CREATE|os.O_RDWR, 0o600)
+	f, err := os.OpenFile(dl.PartPath, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return 0, "", resp.StatusCode, err
 	}

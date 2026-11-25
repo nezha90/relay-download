@@ -111,7 +111,10 @@ func TestHTTPPutBatchClaimBatchAckDelayedDeleteAndMultiDiskAffinity(t *testing.T
 		ProjectDirs:          map[string][]string{projMain: {disk1, disk2}},
 		StateDir:             filepath.Join(env.dir, "state-b-fast"),
 		MaxConcurrent:        8,
-		StreamConns:          4,
+		StreamConns:          8,
+		ChunkConcurrency:     4,
+		ChunkSizeMB:          1,
+		ChunkThresholdMB:     1,
 		ClaimBatchSize:       8,
 		AckBatchIntervalMs:   300,
 		AckBatchSize:         10,
@@ -161,7 +164,7 @@ func TestHTTPPutBatchClaimBatchAckDelayedDeleteAndMultiDiskAffinity(t *testing.T
 			mediaExt = ".webm"
 		}
 		files := map[string][]byte{
-			vid + mediaExt:     bytes.Repeat([]byte(fmt.Sprintf("media-%02d-%s|", i, vid)), 2048),
+			vid + mediaExt:     bytes.Repeat([]byte(fmt.Sprintf("media-%02d-%s|", i, vid)), 65536),
 			vid + ".info.json": []byte(fmt.Sprintf(`{"id":%q,"index":%d}`, vid, i)),
 		}
 		for fname, data := range files {
@@ -262,7 +265,7 @@ func TestHTTPPutBatchClaimBatchAckDelayedDeleteAndMultiDiskAffinity(t *testing.T
 		return len(entries) == 1
 	}, "all 28 files landed on dual disks and Agent A drained projMain spool")
 
-	// Verify exact SHA256 for every file, balanced usage across BOTH disks, and pair affinity!
+	// Verify permissions on landed files are readable (0644) and SHA256 matches.
 	disk1Count, disk2Count := 0, 0
 	fileDisk := make(map[string]int)
 	for fname, wantSHA := range expected {
@@ -279,6 +282,9 @@ func TestHTTPPutBatchClaimBatchAckDelayedDeleteAndMultiDiskAffinity(t *testing.T
 			fileDisk[fname] = 2
 		} else {
 			t.Fatalf("missing landed file %s on both disks", fname)
+		}
+		if fi, err := os.Stat(path); err == nil && fi.Mode().Perm()&0o044 != 0o044 {
+			t.Fatalf("expected readable 0644 permissions on %s, got %o", path, fi.Mode().Perm())
 		}
 		raw, err := os.ReadFile(path)
 		if err != nil {

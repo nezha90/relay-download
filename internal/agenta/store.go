@@ -234,8 +234,8 @@ func (s *Store) ClaimBatch(projectID, bNodeID string, availDiskBytes uint64, lea
 	if maxCount <= 0 {
 		maxCount = 1
 	}
-	if maxCount > 64 {
-		maxCount = 64
+	if maxCount > 128 {
+		maxCount = 128
 	}
 	var chosen []FileRecord
 	now := time.Now().UTC()

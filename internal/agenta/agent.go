@@ -1237,8 +1237,8 @@ func (a *Agent) handleClaimBatch(w http.ResponseWriter, r *http.Request) {
 	if maxCount <= 0 {
 		maxCount = 16
 	}
-	if maxCount > 64 {
-		maxCount = 64
+	if maxCount > 128 {
+		maxCount = 128
 	}
 	recs, err := a.store.ClaimBatch(req.ProjectID, req.BNodeID, req.AvailableDiskBytes, leaseTTL, maxCount)
 	if errors.Is(err, ErrNoReadyFile) {
