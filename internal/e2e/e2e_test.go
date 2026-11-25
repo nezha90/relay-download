@@ -383,6 +383,30 @@ func (e *testEnv) adminGet(path string, out any) {
 	}
 }
 
+func localStatus(t *testing.T, localAddr, localTok, project string) protocol.LiveFilesResp {
+	t.Helper()
+	u := localAddr + "/local/v1/status"
+	if project != "" {
+		u += "?project=" + url.QueryEscape(project)
+	}
+	req, _ := http.NewRequest(http.MethodGet, u, nil)
+	req.Header.Set(protocol.HeaderLocalToken, localTok)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("localStatus %s: %v", u, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("localStatus %s status=%d body=%s", u, resp.StatusCode, string(b))
+	}
+	var out protocol.LiveFilesResp
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decode localStatus: %v", err)
+	}
+	return out
+}
+
 func TestEndToEndFullFlowAndSummaryOnly(t *testing.T) {
 	env := newTestEnv(t)
 	env.createProject("proj-alpha", protocol.ConflictOverwrite, 60)
@@ -397,7 +421,7 @@ func TestEndToEndFullFlowAndSummaryOnly(t *testing.T) {
 			t.Fatalf("center DB should not store file lists, found table: %s", tbl)
 		}
 	}
-	if !slices.Contains(tables, "stats_daily") || !slices.Contains(tables, "stats_project_total") {
+	if !slices.Contains(tables, "stats_daily") || !slices.Contains(tables, "stats_intervals") || !slices.Contains(tables, "stats_project_total") {
 		t.Fatalf("expected summary tables in center DB, got: %v", tables)
 	}
 
@@ -448,12 +472,24 @@ func TestEndToEndFullFlowAndSummaryOnly(t *testing.T) {
 	}
 	_ = regResp.Body.Close()
 
-	// 5. Verify Center Live Proxy Query sees live files on A1 before B starts.
-	waitUntil(t, 5*time.Second, func() bool {
-		var live protocol.LiveFilesResp
-		env.adminGet("/api/v1/admin/nodes/a1/live-files", &live)
-		return len(live.Files) == 1 && live.Files[0].Filename == "nested/file1.bin"
-	}, "live proxy query on a1 shows file1.bin")
+	// 5. Verify real-time live-files proxy routes are removed from Center (404),
+	//    while local Agent A status reflects the queued file before B starts.
+	for _, removedPath := range []string{"/api/v1/admin/nodes/a1/live-files", "/api/v1/admin/projects/proj-alpha/live-files"} {
+		req, _ := http.NewRequest(http.MethodGet, env.centerURL+removedPath, nil)
+		req.Header.Set(protocol.HeaderAdminToken, env.adminToken)
+		r, err := env.httpClient.Do(req)
+		if err != nil {
+			t.Fatalf("GET %s: %v", removedPath, err)
+		}
+		_ = r.Body.Close()
+		if r.StatusCode != http.StatusNotFound {
+			t.Fatalf("expected 404 for removed realtime route %s, got %d", removedPath, r.StatusCode)
+		}
+	}
+	stA1 := localStatus(t, a1Local, a1Tok, "")
+	if len(stA1.Files) != 1 || stA1.Files[0].Filename != "nested/file1.bin" {
+		t.Fatalf("expected local status on a1 to show nested/file1.bin, got %+v", stA1.Files)
+	}
 
 	// 6. Start B1 and verify both files arrive with exact SHA256, A deletes them, and Center updates summary.
 	bDest := filepath.Join(env.dir, "b1-dest", "proj-alpha")
@@ -475,9 +511,8 @@ func TestEndToEndFullFlowAndSummaryOnly(t *testing.T) {
 
 	// Verify A1 and A2 deleted their files immediately ("即用即删").
 	waitUntil(t, 5*time.Second, func() bool {
-		var live1, live2 protocol.LiveFilesResp
-		env.adminGet("/api/v1/admin/nodes/a1/live-files", &live1)
-		env.adminGet("/api/v1/admin/nodes/a2/live-files", &live2)
+		live1 := localStatus(t, a1Local, a1Tok, "")
+		live2 := localStatus(t, a2Local, a2Tok, "")
 		return len(live1.Files) == 0 && len(live2.Files) == 0
 	}, "a1 and a2 deleted files after ACK")
 
@@ -489,13 +524,34 @@ func TestEndToEndFullFlowAndSummaryOnly(t *testing.T) {
 		}
 	}
 
-	// Verify Center summary reflects 2 completed files and exact bytes.
+	// Verify Center interval overview & stats/intervals reflect 2 completed files and exact bytes,
+	// with zero single-task progress or instantaneous real-time speed fields.
 	expectedBytes := int64(len(data1) + len(data2))
 	waitUntil(t, 5*time.Second, func() bool {
 		var ov protocol.OverviewResp
-		env.adminGet("/api/v1/admin/overview", &ov)
-		return ov.AllTimeCompleted == 2 && ov.AllTimeBytes == expectedBytes
-	}, "center overview summary totals accurate")
+		env.adminGet("/api/v1/admin/overview?hours=24&bucket_min=30", &ov)
+		return ov.AllTimeCompleted == 2 && ov.AllTimeBytes == expectedBytes &&
+			ov.WindowCompleted == 2 && ov.WindowBytes == expectedBytes &&
+			len(ov.IntervalCurve) == 48 && ov.ActiveAvgSpeedBps > 0
+	}, "center overview interval summary totals accurate")
+
+	var intervalStats protocol.IntervalStatsResp
+	env.adminGet("/api/v1/admin/stats/intervals?hours=24&bucket_min=30&project=proj-alpha", &intervalStats)
+	if intervalStats.TotalCompleted != 2 || intervalStats.TotalBytes != expectedBytes || len(intervalStats.Buckets) != 48 {
+		t.Fatalf("unexpected interval stats: %+v", intervalStats)
+	}
+
+	var nodes []protocol.LiveNodeView
+	env.adminGet("/api/v1/admin/nodes?hours=24", &nodes)
+	var b1Completed int64
+	for _, n := range nodes {
+		if n.ID == "b1" {
+			b1Completed = n.WindowCompleted
+		}
+	}
+	if b1Completed != 2 {
+		t.Fatalf("expected b1 window_completed=2, got %d", b1Completed)
+	}
 
 	// 7. Test project internal overwrite policy: upload new content with same filename.
 	data2v2, sha2v2 := randBytes(t, 64*1024)
@@ -698,8 +754,7 @@ func TestLeaseExpiryFailoverAndIdempotentAck(t *testing.T) {
 
 	// Wait until A1 deletes the file after B2 ACK.
 	waitUntil(t, 5*time.Second, func() bool {
-		var live protocol.LiveFilesResp
-		env.adminGet("/api/v1/admin/nodes/a1/live-files", &live)
+		live := localStatus(t, a1Local, a1Tok, "")
 		return len(live.Files) == 0
 	}, "a1 deleted file after b2 ack")
 
@@ -947,11 +1002,10 @@ func TestQARegressions(t *testing.T) {
 		}
 	}
 
-	// 5. Center live-files query param escaping prevents injection ("proj-zero&x=1" must NOT return proj-zero files).
-	var qLive protocol.LiveFilesResp
-	env.adminGet("/api/v1/admin/nodes/a1/live-files?project="+url.QueryEscape("proj-zero&x=1"), &qLive)
+	// 5. Local status query param filtering must not match bogus project names.
+	qLive := localStatus(t, a1Local, a1Tok, "proj-zero&x=1")
 	if len(qLive.Files) != 0 {
-		t.Fatalf("expected 0 files for escaped project 'proj-zero&x=1', got %d", len(qLive.Files))
+		t.Fatalf("expected 0 files for project 'proj-zero&x=1', got %d", len(qLive.Files))
 	}
 
 	// 6. 0-byte file E2E + concurrent auto_rename + skip + file/dir collision cleanup & backoff.
@@ -1017,8 +1071,7 @@ func TestQARegressions(t *testing.T) {
 
 	// Verify skip preserved ORIGINAL and removed file from A1.
 	waitUntil(t, 10*time.Second, func() bool {
-		var live protocol.LiveFilesResp
-		env.adminGet("/api/v1/admin/nodes/a1/live-files?project=proj-skip", &live)
+		live := localStatus(t, a1Local, a1Tok, "proj-skip")
 		return len(live.Files) == 0
 	}, "proj-skip file ACKed and deleted on A1")
 	if got, _ := os.ReadFile(filepath.Join(bSkipDir, "keep.txt")); string(got) != "ORIGINAL" {
@@ -1027,21 +1080,19 @@ func TestQARegressions(t *testing.T) {
 
 	// Verify collide/sub.txt did NOT leak .part and NACK backoff prevented rapid retry storm.
 	waitUntil(t, 5*time.Second, func() bool {
-		var live protocol.LiveFilesResp
-		env.adminGet("/api/v1/admin/nodes/a1/live-files?project=proj-collide", &live)
+		live := localStatus(t, a1Local, a1Tok, "proj-collide")
 		return len(live.Files) == 1 && live.Files[0].RetryCount >= 1
 	}, "collide file NACKed once")
 	time.Sleep(1500 * time.Millisecond)
 	if _, err := os.Stat(filepath.Join(bCollideDir, ".relay_tmp", colUp.FileID+".part")); !os.IsNotExist(err) {
 		t.Fatalf("expected .part to be cleaned up on mkdir failure, got err=%v", err)
 	}
-	var colLive protocol.LiveFilesResp
-	env.adminGet("/api/v1/admin/nodes/a1/live-files?project=proj-collide", &colLive)
+	colLive := localStatus(t, a1Local, a1Tok, "proj-collide")
 	if len(colLive.Files) != 1 || colLive.Files[0].RetryCount > 3 {
 		t.Fatalf("expected NACK backoff to limit retry_count <= 3, got %+v", colLive.Files)
 	}
 
-	// 7. Deleted A node is immediately evicted from Hub (discover, live-files, overview),
+	// 7. Deleted A node is immediately evicted from Hub (discover, overview),
 	//    spoofed heartbeat public_addr cannot override Center-registered addr (SSRF protection),
 	//    and deleting a B node immediately closes its active SSE stream.
 	env.createProject("proj-a2-only", protocol.ConflictOverwrite, 30)
@@ -1049,8 +1100,7 @@ func TestQARegressions(t *testing.T) {
 		t.Fatalf("upload to a2 failed: %d", r.StatusCode)
 	}
 	waitUntil(t, 5*time.Second, func() bool {
-		var live protocol.LiveFilesResp
-		env.adminGet("/api/v1/admin/nodes/a2/live-files", &live)
+		live := localStatus(t, a2Local, a2Tok, "")
 		return len(live.Files) == 1
 	}, "a2 online with 1 file")
 
@@ -1163,9 +1213,6 @@ func TestQARegressions(t *testing.T) {
 
 	if r, _ := adminReq(http.MethodDelete, "/api/v1/admin/nodes/a2", nil); r.StatusCode != http.StatusNoContent {
 		t.Fatalf("delete a2 failed: %d", r.StatusCode)
-	}
-	if r, _ := adminReq(http.MethodGet, "/api/v1/admin/nodes/a2/live-files", nil); r.StatusCode != http.StatusNotFound {
-		t.Fatalf("expected 404 for deleted a2 live-files, got %d", r.StatusCode)
 	}
 	var ov protocol.OverviewResp
 	env.adminGet("/api/v1/admin/overview", &ov)

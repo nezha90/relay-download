@@ -1,6 +1,9 @@
 package protocol
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 const (
 	HeaderNodeID         = "X-Node-ID"
@@ -72,13 +75,12 @@ type AgentAHeartbeatReq struct {
 	UpgradeAttemptID string                `json:"upgrade_attempt_id,omitempty"`
 	UpgradeStatus    string                `json:"upgrade_status,omitempty"`
 	UpgradeError     string                `json:"upgrade_error,omitempty"`
-	DiskTotalBytes uint64                `json:"disk_total_bytes"`
-	DiskFreeBytes  uint64                `json:"disk_free_bytes"`
-	DiskUsedPct    float64               `json:"disk_used_pct"`
-	DiskAlarm      bool                  `json:"disk_alarm"`
-	ActiveStreams  int                   `json:"active_streams"`
-	OutSpeedBps    int64                 `json:"out_speed_bps"`
-	Availability   []ProjectAvailability `json:"availability"`
+	DiskTotalBytes   uint64                `json:"disk_total_bytes"`
+	DiskFreeBytes    uint64                `json:"disk_free_bytes"`
+	DiskUsedPct      float64               `json:"disk_used_pct"`
+	DiskAlarm        bool                  `json:"disk_alarm"`
+	ActiveStreams    int                   `json:"active_streams,omitempty"`
+	Availability     []ProjectAvailability `json:"availability"`
 }
 
 type SummaryEvent struct {
@@ -96,32 +98,21 @@ type SummaryEventsReq struct {
 	Events []SummaryEvent `json:"events"`
 }
 
-type BActiveTransfer struct {
-	ProjectID        string    `json:"project_id"`
-	ANodeID          string    `json:"a_node_id"`
-	FileID           string    `json:"file_id"`
-	Filename         string    `json:"filename"`
-	TransferredBytes int64     `json:"transferred_bytes"`
-	TotalBytes       int64     `json:"total_bytes"`
-	SpeedBps         int64     `json:"speed_bps"`
-	StartedAt        time.Time `json:"started_at"`
-}
-
 type AgentBHeartbeatReq struct {
-	NodeID          string            `json:"node_id"`
-	Name            string            `json:"name"`
-	Projects        []string          `json:"projects"`
-	Version          string            `json:"version,omitempty"`
-	OS               string            `json:"os,omitempty"`
-	Arch             string            `json:"arch,omitempty"`
-	UpgradeAttemptID string            `json:"upgrade_attempt_id,omitempty"`
-	UpgradeStatus    string            `json:"upgrade_status,omitempty"`
-	UpgradeError     string            `json:"upgrade_error,omitempty"`
-	DiskTotalBytes  uint64            `json:"disk_total_bytes"`
-	DiskFreeBytes   uint64            `json:"disk_free_bytes"`
-	DiskUsedPct     float64           `json:"disk_used_pct"`
-	ActiveTransfers []BActiveTransfer `json:"active_transfers"`
-	InSpeedBps      int64             `json:"in_speed_bps"`
+	NodeID                string            `json:"node_id"`
+	Name                  string            `json:"name"`
+	Projects              []string          `json:"projects"`
+	Version               string            `json:"version,omitempty"`
+	OS                    string            `json:"os,omitempty"`
+	Arch                  string            `json:"arch,omitempty"`
+	UpgradeAttemptID      string            `json:"upgrade_attempt_id,omitempty"`
+	UpgradeStatus         string            `json:"upgrade_status,omitempty"`
+	UpgradeError          string            `json:"upgrade_error,omitempty"`
+	DiskTotalBytes        uint64            `json:"disk_total_bytes"`
+	DiskFreeBytes         uint64            `json:"disk_free_bytes"`
+	DiskUsedPct           float64           `json:"disk_used_pct"`
+	ActiveCount           int               `json:"active_count"`
+	LegacyActiveTransfers []json.RawMessage `json:"active_transfers,omitempty"`
 }
 
 type UpgradeDirective struct {
@@ -306,19 +297,53 @@ type DailyStat struct {
 	TotalDurationMs  int64  `json:"total_duration_ms"`
 }
 
+type IntervalStat struct {
+	BucketStart      time.Time `json:"bucket_start"`
+	BucketEnd        time.Time `json:"bucket_end"`
+	BucketSec        int64     `json:"bucket_sec"`
+	EffectiveSec     int64     `json:"effective_sec"`
+	FilesUploaded    int64     `json:"files_uploaded"`
+	FilesCompleted   int64     `json:"files_completed"`
+	FilesFailed      int64     `json:"files_failed"`
+	BytesTransferred int64     `json:"bytes_transferred"`
+	AvgSpeedBps      int64     `json:"avg_speed_bps"`
+}
+
+type IntervalStatsResp struct {
+	GeneratedAt       time.Time      `json:"generated_at"`
+	WindowStart       time.Time      `json:"window_start"`
+	WindowEnd         time.Time      `json:"window_end"`
+	WindowHours       int            `json:"window_hours"`
+	BucketMinutes     int            `json:"bucket_minutes"`
+	ProjectID         string         `json:"project_id,omitempty"`
+	ANodeID           string         `json:"a_node_id,omitempty"`
+	BNodeID           string         `json:"b_node_id,omitempty"`
+	TotalUploaded     int64          `json:"total_uploaded"`
+	TotalCompleted    int64          `json:"total_completed"`
+	TotalFailed       int64          `json:"total_failed"`
+	TotalBytes        int64          `json:"total_bytes"`
+	WindowAvgSpeedBps int64          `json:"window_avg_speed_bps"`
+	ActiveAvgSpeedBps int64          `json:"active_avg_speed_bps"`
+	PeakSpeedBps      int64          `json:"peak_speed_bps"`
+	Buckets           []IntervalStat `json:"buckets"`
+}
+
 type ProjectSummary struct {
-	Project           Project               `json:"project"`
-	TotalUploaded     int64                 `json:"total_uploaded"`
-	TotalCompleted    int64                 `json:"total_completed"`
-	TotalFailed       int64                 `json:"total_failed"`
-	TotalBytes        int64                 `json:"total_bytes"`
-	LiveReadyCount    int                   `json:"live_ready_count"`
-	LiveClaimedCount  int                   `json:"live_claimed_count"`
-	LiveReadyBytes    int64                 `json:"live_ready_bytes"`
-	OnlineANodes      int                   `json:"online_a_nodes"`
-	OnlineBNodes      int                   `json:"online_b_nodes"`
-	ANodeAvailability []ANodeAvailSummary   `json:"a_node_availability"`
-	ActiveTransfers   []BActiveTransferView `json:"active_transfers"`
+	Project           Project             `json:"project"`
+	TotalUploaded     int64               `json:"total_uploaded"`
+	TotalCompleted    int64               `json:"total_completed"`
+	TotalFailed       int64               `json:"total_failed"`
+	TotalBytes        int64               `json:"total_bytes"`
+	WindowCompleted   int64               `json:"window_completed"`
+	WindowFailed      int64               `json:"window_failed"`
+	WindowBytes       int64               `json:"window_bytes"`
+	WindowAvgSpeedBps int64               `json:"window_avg_speed_bps"`
+	ActiveAvgSpeedBps int64               `json:"active_avg_speed_bps"`
+	QueuedFiles       int                 `json:"queued_files"`
+	QueuedBytes       int64               `json:"queued_bytes"`
+	OnlineANodes      int                 `json:"online_a_nodes"`
+	OnlineBNodes      int                 `json:"online_b_nodes"`
+	ANodeAvailability []ANodeAvailSummary `json:"a_node_availability"`
 }
 
 type ANodeAvailSummary struct {
@@ -331,62 +356,63 @@ type ANodeAvailSummary struct {
 	DiskAlarm    bool   `json:"disk_alarm"`
 }
 
-type BActiveTransferView struct {
-	BNodeID          string    `json:"b_node_id"`
-	BName            string    `json:"b_name"`
-	ProjectID        string    `json:"project_id"`
-	ANodeID          string    `json:"a_node_id"`
-	FileID           string    `json:"file_id"`
-	Filename         string    `json:"filename"`
-	TransferredBytes int64     `json:"transferred_bytes"`
-	TotalBytes       int64     `json:"total_bytes"`
-	SpeedBps         int64     `json:"speed_bps"`
-	StartedAt        time.Time `json:"started_at"`
-}
-
 type LiveNodeView struct {
-	ID              string                `json:"id"`
-	Name            string                `json:"name"`
-	Role            string                `json:"role"`
-	Projects        []string              `json:"projects"`
-	PublicAddr      string                `json:"public_addr,omitempty"`
-	Online          bool                  `json:"online"`
-	Version         string                `json:"version,omitempty"`
-	OS              string                `json:"os,omitempty"`
-	Arch            string                `json:"arch,omitempty"`
-	TargetVersion   string                `json:"target_version,omitempty"`
-	UpgradeStatus   string                `json:"upgrade_status,omitempty"`
-	UpgradeMessage  string                `json:"upgrade_message,omitempty"`
-	LastSeenAt      *time.Time            `json:"last_seen_at,omitempty"`
-	DiskTotalBytes  uint64                `json:"disk_total_bytes"`
-	DiskFreeBytes   uint64                `json:"disk_free_bytes"`
-	DiskUsedPct     float64               `json:"disk_used_pct"`
-	DiskAlarm       bool                  `json:"disk_alarm"`
-	ActiveStreams   int                   `json:"active_streams"`
-	SpeedBps        int64                 `json:"speed_bps"`
-	Availability    []ProjectAvailability `json:"availability,omitempty"`
-	ActiveTransfers []BActiveTransfer     `json:"active_transfers,omitempty"`
+	ID                string                `json:"id"`
+	Name              string                `json:"name"`
+	Role              string                `json:"role"`
+	Projects          []string              `json:"projects"`
+	PublicAddr        string                `json:"public_addr,omitempty"`
+	Online            bool                  `json:"online"`
+	Version           string                `json:"version,omitempty"`
+	OS                string                `json:"os,omitempty"`
+	Arch              string                `json:"arch,omitempty"`
+	TargetVersion     string                `json:"target_version,omitempty"`
+	UpgradeStatus     string                `json:"upgrade_status,omitempty"`
+	UpgradeMessage    string                `json:"upgrade_message,omitempty"`
+	LastSeenAt        *time.Time            `json:"last_seen_at,omitempty"`
+	DiskTotalBytes    uint64                `json:"disk_total_bytes"`
+	DiskFreeBytes     uint64                `json:"disk_free_bytes"`
+	DiskUsedPct       float64               `json:"disk_used_pct"`
+	DiskAlarm         bool                  `json:"disk_alarm"`
+	WindowHours       int                   `json:"window_hours"`
+	WindowCompleted   int64                 `json:"window_completed"`
+	WindowFailed      int64                 `json:"window_failed"`
+	WindowBytes       int64                 `json:"window_bytes"`
+	WindowAvgSpeedBps int64                 `json:"window_avg_speed_bps"`
+	ActiveAvgSpeedBps int64                 `json:"active_avg_speed_bps"`
+	Availability      []ProjectAvailability `json:"availability,omitempty"`
 }
 
 type OverviewResp struct {
-	TotalProjects      int                   `json:"total_projects"`
-	OnlineANodes       int                   `json:"online_a_nodes"`
-	TotalANodes        int                   `json:"total_a_nodes"`
-	OnlineBNodes       int                   `json:"online_b_nodes"`
-	TotalBNodes        int                   `json:"total_b_nodes"`
-	LiveReadyFiles     int                   `json:"live_ready_files"`
-	LiveReadyBytes     int64                 `json:"live_ready_bytes"`
-	LiveActiveFiles    int                   `json:"live_active_files"`
-	LiveTotalSpeedBps  int64                 `json:"live_total_speed_bps"`
-	TodayCompleted     int64                 `json:"today_completed"`
-	TodayBytes         int64                 `json:"today_bytes"`
-	TodayFailed        int64                 `json:"today_failed"`
-	AllTimeCompleted   int64                 `json:"all_time_completed"`
-	AllTimeBytes       int64                 `json:"all_time_bytes"`
-	AllTimeFailed      int64                 `json:"all_time_failed"`
-	DailyTrend         []DailyStat           `json:"daily_trend"`
-	Projects           []ProjectSummary      `json:"projects"`
-	ActiveTransfers    []BActiveTransferView `json:"active_transfers"`
+	GeneratedAt        time.Time        `json:"generated_at"`
+	AuthTrustedIP      bool             `json:"auth_trusted_ip,omitempty"`
+	WindowStart        time.Time        `json:"window_start"`
+	WindowEnd          time.Time        `json:"window_end"`
+	WindowHours        int              `json:"window_hours"`
+	BucketMinutes      int              `json:"bucket_minutes"`
+	ProjectFilter      string           `json:"project_filter,omitempty"`
+	TotalProjects      int              `json:"total_projects"`
+	OnlineANodes       int              `json:"online_a_nodes"`
+	TotalANodes        int              `json:"total_a_nodes"`
+	OnlineBNodes       int              `json:"online_b_nodes"`
+	TotalBNodes        int              `json:"total_b_nodes"`
+	QueuedFiles        int              `json:"queued_files"`
+	QueuedBytes        int64            `json:"queued_bytes"`
+	WindowCompleted    int64            `json:"window_completed"`
+	WindowBytes        int64            `json:"window_bytes"`
+	WindowFailed       int64            `json:"window_failed"`
+	WindowAvgSpeedBps  int64            `json:"window_avg_speed_bps"`
+	ActiveAvgSpeedBps  int64            `json:"active_avg_speed_bps"`
+	WindowPeakSpeedBps int64            `json:"window_peak_speed_bps"`
+	TodayCompleted     int64            `json:"today_completed"`
+	TodayBytes         int64            `json:"today_bytes"`
+	TodayFailed        int64            `json:"today_failed"`
+	AllTimeCompleted   int64            `json:"all_time_completed"`
+	AllTimeBytes       int64            `json:"all_time_bytes"`
+	AllTimeFailed      int64            `json:"all_time_failed"`
+	IntervalCurve      []IntervalStat   `json:"interval_curve"`
+	DailyTrend         []DailyStat      `json:"daily_trend"`
+	Projects           []ProjectSummary `json:"projects"`
 }
 
 type ErrorResp struct {

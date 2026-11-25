@@ -48,8 +48,6 @@ type Agent struct {
 
 	streamSem     chan struct{}
 	activeStreams atomic.Int32
-	outBytes      atomic.Int64
-	lastSpeedBps  atomic.Int64
 
 	hbWakeCh     chan struct{}
 	eventWakeCh  chan struct{}
@@ -249,7 +247,6 @@ func (a *Agent) Start(ctx context.Context) error {
 			fn(runCtx)
 		}()
 	}
-	launchBG(a.speedMeterLoop)
 	launchBG(a.reapLoop)
 	launchBG(a.heartbeatLoop)
 	launchBG(a.eventFlushLoop)
@@ -405,7 +402,6 @@ func (a *Agent) publicRoutes() http.Handler {
 	mux.HandleFunc("POST /api/v1/files/{id}/ack", a.handleAck)
 	mux.HandleFunc("POST /api/v1/files/batch-ack", a.handleBatchAck)
 	mux.HandleFunc("POST /api/v1/files/{id}/nack", a.handleNack)
-	mux.HandleFunc("GET /internal/v1/files", a.handleInternalLiveFiles)
 	return mux
 }
 
@@ -1380,7 +1376,6 @@ func (a *Agent) handleStream(w http.ResponseWriter, r *http.Request) {
 			if nw > 0 {
 				remaining -= int64(nw)
 				sentSinceStart += int64(nw)
-				a.outBytes.Add(int64(nw))
 			}
 			if wErr != nil {
 				return
@@ -1611,58 +1606,6 @@ func (a *Agent) handleNack(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-func (a *Agent) handleInternalLiveFiles(w http.ResponseWriter, r *http.Request) {
-	sec := r.Header.Get(protocol.HeaderCenterSecret)
-	if a.cfg.CenterSecret == "" || !auth.EqualConstantTime(sec, a.cfg.CenterSecret) {
-		protocol.WriteError(w, http.StatusUnauthorized, "invalid center secret")
-		return
-	}
-	total, free, pct, alarm, _ := a.diskWatermarkStatus(0)
-	proj := r.URL.Query().Get("project")
-	limit := 500
-	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
-		if v, err := strconv.Atoi(raw); err == nil && v >= 0 {
-			limit = v
-		}
-	}
-	files, totalFiles, truncated, err := a.store.ListLiveLimit(proj, limit)
-	if err != nil {
-		protocol.WriteError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	readyCnt, claimedCnt, readyBytes, claimedBytes, _ := a.store.ComputeStats(proj)
-	protocol.WriteJSON(w, http.StatusOK, protocol.LiveFilesResp{
-		ANodeID:      a.cfg.NodeID,
-		AName:        a.cfg.NodeName,
-		PublicAddr:   a.cfg.PublicAddr,
-		Files:        files,
-		TotalFiles:   totalFiles,
-		Truncated:    truncated,
-		ReadyCount:   readyCnt,
-		ClaimedCount: claimedCnt,
-		ReadyBytes:   readyBytes,
-		ClaimedBytes: claimedBytes,
-		DiskTotal:    total,
-		DiskFree:     free,
-		DiskUsedPct:  pct,
-		DiskAlarm:    alarm,
-	})
-}
-
-func (a *Agent) speedMeterLoop(ctx context.Context) {
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			delta := a.outBytes.Swap(0)
-			a.lastSpeedBps.Store(delta)
-		}
-	}
-}
-
 func (a *Agent) reapLoop(ctx context.Context) {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
@@ -1761,7 +1704,6 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 		DiskUsedPct:      pct,
 		DiskAlarm:        alarm,
 		ActiveStreams:    int(a.activeStreams.Load()),
-		OutSpeedBps:      a.lastSpeedBps.Load(),
 		Availability:     avail,
 	}
 	body, _ := json.Marshal(payload)

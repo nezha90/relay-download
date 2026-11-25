@@ -34,29 +34,22 @@ import (
 	"relay-download/internal/version"
 )
 
-type activeProgress struct {
-	mu          sync.Mutex
-	info        protocol.BActiveTransfer
-	windowBytes int64
-	windowStart time.Time
-}
-
 type cachedDiscover struct {
 	resp      *protocol.DiscoverResp
 	expiresAt time.Time
 }
 
 type Agent struct {
-	cfg            *Config
-	store          *Store
-	logger         *slog.Logger
-	apiClient      *http.Client
-	sseClient      *http.Client
-	streamMu       sync.RWMutex
-	streamClients  []*http.Client
-	makeStreamCli  func() *http.Client
-	streamIdx      atomic.Uint64
-	limiter        *transfer.RateLimiter
+	cfg           *Config
+	store         *Store
+	logger        *slog.Logger
+	apiClient     *http.Client
+	sseClient     *http.Client
+	streamMu      sync.RWMutex
+	streamClients []*http.Client
+	makeStreamCli func() *http.Client
+	streamIdx     atomic.Uint64
+	limiter       *transfer.RateLimiter
 
 	workSem   chan struct{}
 	streamSem chan struct{}
@@ -68,11 +61,7 @@ type Agent struct {
 	discMu    sync.Mutex
 	discCache map[string]cachedDiscover
 
-	mu       sync.RWMutex
-	progress map[string]*activeProgress
-
-	inBytes         atomic.Int64
-	lastSpeedBps    atomic.Int64
+	activeCount     atomic.Int32
 	pendingAckCount atomic.Int64
 	hashRAMBytes    atomic.Int64
 
@@ -230,7 +219,6 @@ func New(cfg *Config, logger *slog.Logger) (*Agent, error) {
 		ackWakeCh:     make(chan struct{}, 1),
 		hbWakeCh:      make(chan struct{}, 1),
 		discCache:     make(map[string]cachedDiscover),
-		progress:      make(map[string]*activeProgress),
 	}
 	upgradeClient := &http.Client{
 		Transport: &http.Transport{
@@ -375,7 +363,6 @@ func (a *Agent) Start(ctx context.Context) error {
 			fn(runCtx)
 		}()
 	}
-	launchBG(a.speedMeterLoop)
 	launchBG(a.heartbeatLoop)
 	launchBG(a.ackFlushLoop)
 	launchBG(a.sseLoop)
@@ -430,20 +417,6 @@ func (a *Agent) triggerAckFlush() {
 	select {
 	case a.ackWakeCh <- struct{}{}:
 	default:
-	}
-}
-
-func (a *Agent) speedMeterLoop(ctx context.Context) {
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			delta := a.inBytes.Swap(0)
-			a.lastSpeedBps.Store(delta)
-		}
 	}
 }
 
@@ -909,25 +882,8 @@ func (a *Agent) runDownload(ctx context.Context, dl ActiveDownload) {
 	startTime := time.Now()
 	a.logger.Info("starting download", "file_id", dl.FileID, "project", dl.ProjectID, "a_node", dl.ANodeID, "filename", dl.Filename, "size", dl.Size)
 
-	prog := &activeProgress{
-		info: protocol.BActiveTransfer{
-			ProjectID: dl.ProjectID,
-			ANodeID:   dl.ANodeID,
-			FileID:    dl.FileID,
-			Filename:  dl.Filename,
-			TotalBytes: dl.Size,
-			StartedAt: dl.StartedAt,
-		},
-		windowStart: time.Now(),
-	}
-	a.mu.Lock()
-	a.progress[dl.FileID] = prog
-	a.mu.Unlock()
-	defer func() {
-		a.mu.Lock()
-		delete(a.progress, dl.FileID)
-		a.mu.Unlock()
-	}()
+	a.activeCount.Add(1)
+	defer a.activeCount.Add(-1)
 
 	// Background lease renewer so even slow SHA256 hashing or brief reconnects never lose the lease.
 	renewCtx, stopRenew := context.WithCancel(ctx)
@@ -960,7 +916,7 @@ func (a *Agent) runDownload(ctx context.Context, dl ActiveDownload) {
 	}
 
 	if useChunked {
-		pipelinedSHA, statusCode, chunkErr := a.downloadChunked(ctx, dl, prog)
+		pipelinedSHA, statusCode, chunkErr := a.downloadChunked(ctx, dl)
 		if chunkErr != nil {
 			if ctx.Err() != nil {
 				// Preserve .part and .part.bitmap so restart resumes only unfinished chunks!
@@ -1002,8 +958,6 @@ func (a *Agent) runDownload(ctx context.Context, dl ActiveDownload) {
 				offset = 0
 			}
 		}
-		prog.setTransferred(offset)
-
 		if partExists && offset == dl.Size {
 			break
 		}
@@ -1011,7 +965,7 @@ func (a *Agent) runDownload(ctx context.Context, dl ActiveDownload) {
 			resumed = true
 		}
 
-		writtenNow, shaIfZero, statusCode, streamErr := a.streamOnce(ctx, dl, offset, prog)
+		writtenNow, shaIfZero, statusCode, streamErr := a.streamOnce(ctx, dl, offset)
 		if streamErr == nil {
 			if offset == 0 && !resumed && shaIfZero != "" {
 				continuousSHA = shaIfZero
@@ -1243,7 +1197,7 @@ func (cb *chunkBitmap) close() {
 	}
 }
 
-func (a *Agent) downloadChunked(ctx context.Context, dl ActiveDownload, prog *activeProgress) (string, int, error) {
+func (a *Agent) downloadChunked(ctx context.Context, dl ActiveDownload) (string, int, error) {
 	chunkSize := effectiveChunkSize(dl.Size, a.cfg.ChunkSizeMB)
 	numChunks := int((dl.Size + chunkSize - 1) / chunkSize)
 	bitmapPath := dl.PartPath + ".bitmap"
@@ -1261,7 +1215,7 @@ func (a *Agent) downloadChunked(ctx context.Context, dl ActiveDownload, prog *ac
 	}
 
 	var (
-		completedBytes atomic.Int64
+		completedBytes int64
 		pendingCount   int
 	)
 	for i := 0; i < numChunks; i++ {
@@ -1271,15 +1225,14 @@ func (a *Agent) downloadChunked(ctx context.Context, dl ActiveDownload, prog *ac
 			end = dl.Size - 1
 		}
 		if bm.isDone(i) {
-			completedBytes.Add(end - start + 1)
+			completedBytes += end - start + 1
 		} else {
 			pendingCount++
 		}
 	}
-	if resumed && completedBytes.Load() > 0 {
-		prog.setTransferred(completedBytes.Load())
+	if resumed && completedBytes > 0 {
 		a.ResumeCount.Add(1)
-		a.logger.Info("resuming chunked download from bitmap", "file_id", dl.FileID, "done_bytes", completedBytes.Load(), "total_bytes", dl.Size, "pending_chunks", pendingCount)
+		a.logger.Info("resuming chunked download from bitmap", "file_id", dl.FileID, "done_bytes", completedBytes, "total_bytes", dl.Size, "pending_chunks", pendingCount)
 	}
 	if pendingCount == 0 {
 		if err := f.Sync(); err != nil {
@@ -1424,7 +1377,7 @@ func (a *Agent) downloadChunked(ctx context.Context, dl ActiveDownload, prog *ac
 				} else if hashCh != nil && cLen <= 16<<20 {
 					a.hashRAMBytes.Add(-cLen)
 				}
-				status, err := a.fetchRangeWithRetry(chunkCtx, dl, f, rg.start, rg.end, memBuf, prog, &completedBytes)
+				status, err := a.fetchRangeWithRetry(chunkCtx, dl, f, rg.start, rg.end, memBuf)
 				if err != nil {
 					if memBuf != nil {
 						a.hashRAMBytes.Add(-int64(len(memBuf)))
@@ -1480,7 +1433,7 @@ func (a *Agent) downloadChunked(ctx context.Context, dl ActiveDownload, prog *ac
 	return pipelinedSHA, http.StatusOK, nil
 }
 
-func (a *Agent) fetchRangeWithRetry(ctx context.Context, dl ActiveDownload, f *os.File, start, end int64, memBuf []byte, prog *activeProgress, completedBytes *atomic.Int64) (int, error) {
+func (a *Agent) fetchRangeWithRetry(ctx context.Context, dl ActiveDownload, f *os.File, start, end int64, memBuf []byte) (int, error) {
 	u := strings.TrimRight(dl.PublicAddr, "/") + "/api/v1/files/" + url.PathEscape(dl.FileID) + "/stream"
 	cur := start
 	backoff := 200 * time.Millisecond
@@ -1534,7 +1487,7 @@ func (a *Agent) fetchRangeWithRetry(ctx context.Context, dl ActiveDownload, f *o
 		if memBuf != nil {
 			subMem = memBuf[cur-start:]
 		}
-		written, status, streamErr := a.streamRangeOnce(reqCtx, u, dl.LeaseToken, f, cur, end, subMem, prog, completedBytes, &lastActivity, &attemptBytes)
+		written, status, streamErr := a.streamRangeOnce(reqCtx, u, dl.LeaseToken, f, cur, end, subMem, &lastActivity, &attemptBytes)
 		close(watchDone)
 		reqCancel()
 		<-a.streamSem
@@ -1567,7 +1520,7 @@ func (a *Agent) fetchRangeWithRetry(ctx context.Context, dl ActiveDownload, f *o
 	return 0, fmt.Errorf("range %d-%d exhausted retries at offset %d", start, end, cur)
 }
 
-func (a *Agent) streamRangeOnce(ctx context.Context, streamURL, leaseToken string, f *os.File, start, end int64, memBuf []byte, prog *activeProgress, completedBytes *atomic.Int64, lastActivity *atomic.Int64, attemptBytes *atomic.Int64) (int64, int, error) {
+func (a *Agent) streamRangeOnce(ctx context.Context, streamURL, leaseToken string, f *os.File, start, end int64, memBuf []byte, lastActivity *atomic.Int64, attemptBytes *atomic.Int64) (int64, int, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, streamURL, nil)
 	if err != nil {
 		return 0, 0, err
@@ -1614,9 +1567,6 @@ func (a *Agent) streamRangeOnce(ctx context.Context, streamURL, leaseToken strin
 				}
 				written += int64(nw)
 				attemptBytes.Add(int64(nw))
-				a.inBytes.Add(int64(nw))
-				tot := completedBytes.Add(int64(nw))
-				prog.addBytes(tot, int64(nw))
 			}
 			if wErr != nil {
 				return written, resp.StatusCode, wErr
@@ -1638,7 +1588,7 @@ func (a *Agent) streamRangeOnce(ctx context.Context, streamURL, leaseToken strin
 	return written, resp.StatusCode, nil
 }
 
-func (a *Agent) streamOnce(ctx context.Context, dl ActiveDownload, offset int64, prog *activeProgress) (written int64, shaFromZero string, statusCode int, err error) {
+func (a *Agent) streamOnce(ctx context.Context, dl ActiveDownload, offset int64) (written int64, shaFromZero string, statusCode int, err error) {
 	select {
 	case a.streamSem <- struct{}{}:
 		defer func() { <-a.streamSem }()
@@ -1737,8 +1687,6 @@ func (a *Agent) streamOnce(ctx context.Context, dl ActiveDownload, offset int64,
 					_, _ = hasher.Write(buf[:nw])
 				}
 				written += int64(nw)
-				a.inBytes.Add(int64(nw))
-				prog.addBytes(offset+written, int64(nw))
 			}
 			if wErr != nil {
 				_ = f.Sync()
@@ -2036,13 +1984,6 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 		usedPct = (float64(totalDisk-freeDisk) / float64(totalDisk)) * 100.0
 	}
 
-	a.mu.RLock()
-	active := make([]protocol.BActiveTransfer, 0, len(a.progress))
-	for _, p := range a.progress {
-		active = append(active, p.snapshot())
-	}
-	a.mu.RUnlock()
-
 	upgAttempt, upgStatus, upgErr := "", "", ""
 	if a.updater != nil {
 		upgAttempt, upgStatus, upgErr = a.updater.Status()
@@ -2061,8 +2002,7 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 		DiskTotalBytes:   totalDisk,
 		DiskFreeBytes:    freeDisk,
 		DiskUsedPct:      usedPct,
-		ActiveTransfers:  active,
-		InSpeedBps:       a.lastSpeedBps.Load(),
+		ActiveCount:      int(a.activeCount.Load()),
 	}
 	body, _ := json.Marshal(payload)
 	u := strings.TrimRight(a.cfg.CenterURL, "/") + "/api/v1/b/heartbeat"
@@ -2086,31 +2026,6 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 64*1024)).Decode(&hbResp); err == nil && hbResp.Upgrade != nil && a.updater != nil {
 		a.updater.HandleDirective(ctx, hbResp.Upgrade)
 	}
-}
-
-func (p *activeProgress) setTransferred(total int64) {
-	p.mu.Lock()
-	p.info.TransferredBytes = total
-	p.mu.Unlock()
-}
-
-func (p *activeProgress) addBytes(total, delta int64) {
-	p.mu.Lock()
-	p.info.TransferredBytes = total
-	p.windowBytes += delta
-	elapsed := time.Since(p.windowStart).Seconds()
-	if elapsed >= 1.0 {
-		p.info.SpeedBps = int64(float64(p.windowBytes) / elapsed)
-		p.windowBytes = 0
-		p.windowStart = time.Now()
-	}
-	p.mu.Unlock()
-}
-
-func (p *activeProgress) snapshot() protocol.BActiveTransfer {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.info
 }
 
 func resolveTargetPath(destDir, relFilename, conflictPolicy, fileID string) (string, bool, error) {

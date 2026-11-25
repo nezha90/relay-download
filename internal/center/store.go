@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -15,6 +16,27 @@ import (
 	"relay-download/internal/auth"
 	"relay-download/internal/protocol"
 )
+
+const BaseIntervalSec int64 = 300 // 5-minute persisted summary buckets
+
+type WindowSummary struct {
+	Completed         int64
+	Failed            int64
+	Bytes             int64
+	WindowAvgSpeedBps int64
+	ActiveAvgSpeedBps int64
+}
+
+type IntervalQuery struct {
+	Now           time.Time
+	Start         time.Time
+	End           time.Time
+	Hours         int
+	BucketMinutes int
+	ProjectID     string
+	ANodeID       string
+	BNodeID       string
+}
 
 var (
 	ErrNotFound = errors.New("not found")
@@ -93,6 +115,20 @@ CREATE TABLE IF NOT EXISTS stats_daily (
 	total_duration_ms INTEGER NOT NULL DEFAULT 0,
 	PRIMARY KEY (date, project_id, a_node_id)
 );
+
+CREATE TABLE IF NOT EXISTS stats_intervals (
+	bucket_ts INTEGER NOT NULL,
+	project_id TEXT NOT NULL,
+	a_node_id TEXT NOT NULL,
+	b_node_id TEXT NOT NULL DEFAULT '',
+	files_uploaded INTEGER NOT NULL DEFAULT 0,
+	files_completed INTEGER NOT NULL DEFAULT 0,
+	files_failed INTEGER NOT NULL DEFAULT 0,
+	bytes_transferred INTEGER NOT NULL DEFAULT 0,
+	total_duration_ms INTEGER NOT NULL DEFAULT 0,
+	PRIMARY KEY (bucket_ts, project_id, a_node_id, b_node_id)
+);
+CREATE INDEX IF NOT EXISTS idx_stats_intervals_ts ON stats_intervals(bucket_ts);
 
 CREATE TABLE IF NOT EXISTS stats_project_total (
 	project_id TEXT PRIMARY KEY,
@@ -357,6 +393,21 @@ ON CONFLICT(date, project_id, a_node_id) DO UPDATE SET
 			return 0, err
 		}
 
+		bucketTs := (ts.UTC().Unix() / BaseIntervalSec) * BaseIntervalSec
+		_, err = tx.ExecContext(ctx, `
+INSERT INTO stats_intervals (bucket_ts, project_id, a_node_id, b_node_id, files_uploaded, files_completed, files_failed, bytes_transferred, total_duration_ms)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(bucket_ts, project_id, a_node_id, b_node_id) DO UPDATE SET
+	files_uploaded = files_uploaded + excluded.files_uploaded,
+	files_completed = files_completed + excluded.files_completed,
+	files_failed = files_failed + excluded.files_failed,
+	bytes_transferred = bytes_transferred + excluded.bytes_transferred,
+	total_duration_ms = total_duration_ms + excluded.total_duration_ms
+`, bucketTs, ev.ProjectID, ev.ANodeID, ev.BNodeID, up, cmp, fail, bytes, dur)
+		if err != nil {
+			return 0, err
+		}
+
 		_, err = tx.ExecContext(ctx, `
 INSERT INTO stats_project_total (project_id, total_uploaded, total_completed, total_failed, total_bytes, total_duration_ms)
 VALUES (?, ?, ?, ?, ?, ?)
@@ -445,6 +496,333 @@ func (s *Store) CleanupOldDedup(ctx context.Context, retention time.Duration) er
 	cutoff := time.Now().UTC().Add(-retention)
 	_, err := s.db.ExecContext(ctx, `DELETE FROM event_dedup WHERE created_at < ?`, cutoff)
 	return err
+}
+
+func (s *Store) CleanupOldIntervals(ctx context.Context, retention time.Duration) error {
+	cutoff := time.Now().UTC().Add(-retention).Unix()
+	_, err := s.db.ExecContext(ctx, `DELETE FROM stats_intervals WHERE bucket_ts < ?`, cutoff)
+	return err
+}
+
+func normalizeBucketMinutes(hours, requested int) int {
+	if requested <= 0 {
+		switch {
+		case hours <= 6:
+			return 10
+		case hours <= 24:
+			return 30
+		case hours <= 72:
+			return 120
+		case hours <= 168:
+			return 360
+		default:
+			return 1440
+		}
+	}
+	if requested < 5 {
+		requested = 5
+	}
+	if requested > 1440 {
+		requested = 1440
+	}
+	// Snap to a multiple of 5 minutes (base storage bucket).
+	snapped := ((requested + 2) / 5) * 5
+	if snapped < 5 {
+		snapped = 5
+	}
+	return snapped
+}
+
+func effectiveBucketSec(bucketStart, bucketSec, nowUnix int64) int64 {
+	bucketEnd := bucketStart + bucketSec
+	if nowUnix >= bucketEnd {
+		return bucketSec
+	}
+	elapsed := nowUnix - bucketStart
+	if elapsed < 15 {
+		elapsed = 15
+	}
+	if elapsed > bucketSec {
+		elapsed = bucketSec
+	}
+	return elapsed
+}
+
+func (s *Store) QueryIntervalStats(ctx context.Context, q IntervalQuery) (*protocol.IntervalStatsResp, error) {
+	now := q.Now.UTC()
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+
+	var (
+		startTime    time.Time
+		endTime      time.Time
+		hours        int
+		customWindow bool
+	)
+	if !q.Start.IsZero() && !q.End.IsZero() && q.End.After(q.Start) {
+		customWindow = true
+		startTime = q.Start.UTC()
+		endTime = q.End.UTC()
+		if endTime.Sub(startTime) > 31*24*time.Hour {
+			startTime = endTime.Add(-31 * 24 * time.Hour)
+		}
+		hours = int((endTime.Sub(startTime) + time.Hour - 1) / time.Hour)
+		if hours < 1 {
+			hours = 1
+		}
+	} else {
+		hours = q.Hours
+		if hours <= 0 {
+			hours = 24
+		}
+		if hours > 720 {
+			hours = 720
+		}
+		endTime = now
+		startTime = endTime.Add(-time.Duration(hours) * time.Hour)
+	}
+
+	bucketMin := normalizeBucketMinutes(hours, q.BucketMinutes)
+	bucketSec := int64(bucketMin) * 60
+
+	lastSlot := (endTime.Unix() / bucketSec) * bucketSec
+	var firstSlot int64
+	if customWindow {
+		firstSlot = (startTime.Unix() / bucketSec) * bucketSec
+	} else {
+		nSlots := int((int64(hours) * 3600) / bucketSec)
+		if nSlots < 1 {
+			nSlots = 1
+		}
+		firstSlot = lastSlot - int64(nSlots-1)*bucketSec
+	}
+	if firstSlot > lastSlot {
+		firstSlot = lastSlot
+	}
+	nSlots := int((lastSlot-firstSlot)/bucketSec) + 1
+	if nSlots > 1000 {
+		firstSlot = lastSlot - int64(999)*bucketSec
+		nSlots = 1000
+	}
+
+	where := []string{"bucket_ts >= ?", "bucket_ts < ?"}
+	args := []any{bucketSec, bucketSec, firstSlot, lastSlot + bucketSec}
+	if q.ProjectID != "" {
+		where = append(where, "project_id = ?")
+		args = append(args, q.ProjectID)
+	}
+	if q.ANodeID != "" {
+		where = append(where, "a_node_id = ?")
+		args = append(args, q.ANodeID)
+	}
+	if q.BNodeID != "" {
+		where = append(where, "b_node_id = ?")
+		args = append(args, q.BNodeID)
+	}
+
+	query := fmt.Sprintf(`
+SELECT (bucket_ts / ?) * ? AS coarse_ts,
+       SUM(files_uploaded), SUM(files_completed), SUM(files_failed), SUM(bytes_transferred)
+FROM stats_intervals
+WHERE %s
+GROUP BY coarse_ts
+ORDER BY coarse_ts ASC
+`, strings.Join(where, " AND "))
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	type rawAgg struct {
+		up, cmp, fail, bytes int64
+	}
+	bySlot := make(map[int64]rawAgg, nSlots)
+	for rows.Next() {
+		var slot int64
+		var a rawAgg
+		if err := rows.Scan(&slot, &a.up, &a.cmp, &a.fail, &a.bytes); err != nil {
+			return nil, err
+		}
+		bySlot[slot] = a
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	nowUnix := now.Unix()
+	refEndUnix := endTime.Unix()
+	if refEndUnix > nowUnix {
+		refEndUnix = nowUnix
+	}
+
+	buckets := make([]protocol.IntervalStat, 0, nSlots)
+	var (
+		totalUp, totalCmp, totalFail, totalBytes int64
+		activeBytes, activeSec                   int64
+		peakSpeed                                int64
+		totalElapsedSec                          int64
+	)
+	for i := 0; i < nSlots; i++ {
+		slot := firstSlot + int64(i)*bucketSec
+		slotEnd := slot + bucketSec
+		agg := bySlot[slot]
+		effSec := effectiveBucketSec(slot, bucketSec, refEndUnix)
+		var avgSpeed int64
+		if agg.bytes > 0 && effSec > 0 {
+			avgSpeed = agg.bytes / effSec
+		}
+		if avgSpeed > peakSpeed {
+			peakSpeed = avgSpeed
+		}
+		totalUp += agg.up
+		totalCmp += agg.cmp
+		totalFail += agg.fail
+		totalBytes += agg.bytes
+		if agg.bytes > 0 {
+			activeBytes += agg.bytes
+			activeSec += effSec
+		}
+		if refEndUnix >= slotEnd {
+			totalElapsedSec += bucketSec
+		} else if refEndUnix > slot {
+			totalElapsedSec += refEndUnix - slot
+		}
+		buckets = append(buckets, protocol.IntervalStat{
+			BucketStart:      time.Unix(slot, 0).UTC(),
+			BucketEnd:        time.Unix(slotEnd, 0).UTC(),
+			BucketSec:        bucketSec,
+			EffectiveSec:     effSec,
+			FilesUploaded:    agg.up,
+			FilesCompleted:   agg.cmp,
+			FilesFailed:      agg.fail,
+			BytesTransferred: agg.bytes,
+			AvgSpeedBps:      avgSpeed,
+		})
+	}
+	if totalElapsedSec < activeSec {
+		totalElapsedSec = activeSec
+	}
+	if totalElapsedSec <= 0 {
+		totalElapsedSec = bucketSec
+	}
+
+	resp := &protocol.IntervalStatsResp{
+		GeneratedAt:       now,
+		WindowStart:       time.Unix(firstSlot, 0).UTC(),
+		WindowEnd:         endTime,
+		WindowHours:       hours,
+		BucketMinutes:     bucketMin,
+		ProjectID:         q.ProjectID,
+		ANodeID:           q.ANodeID,
+		BNodeID:           q.BNodeID,
+		TotalUploaded:     totalUp,
+		TotalCompleted:    totalCmp,
+		TotalFailed:       totalFail,
+		TotalBytes:        totalBytes,
+		WindowAvgSpeedBps: totalBytes / totalElapsedSec,
+		PeakSpeedBps:      peakSpeed,
+		Buckets:           buckets,
+	}
+	if activeSec > 0 {
+		resp.ActiveAvgSpeedBps = activeBytes / activeSec
+	}
+	return resp, nil
+}
+
+func (s *Store) GetWindowEntityStats(ctx context.Context, now time.Time, hours int) (
+	aStats map[string]WindowSummary,
+	bStats map[string]WindowSummary,
+	projStats map[string]WindowSummary,
+	err error,
+) {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	if hours <= 0 {
+		hours = 24
+	}
+	if hours > 720 {
+		hours = 720
+	}
+	windowSec := int64(hours) * 3600
+	nowUnix := now.Unix()
+	startSlot := ((nowUnix - windowSec) / BaseIntervalSec) * BaseIntervalSec
+
+	rows, err := s.db.QueryContext(ctx, `
+SELECT bucket_ts, project_id, a_node_id, b_node_id,
+       SUM(files_completed), SUM(files_failed), SUM(bytes_transferred)
+FROM stats_intervals
+WHERE bucket_ts >= ?
+GROUP BY bucket_ts, project_id, a_node_id, b_node_id
+`, startSlot)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	defer rows.Close()
+
+	type accum struct {
+		cmp, fail, bytes int64
+		activeSlots      map[int64]struct{}
+	}
+	add := func(m map[string]*accum, key string, slot, cmp, fail, bytes int64) {
+		if key == "" {
+			return
+		}
+		ac, ok := m[key]
+		if !ok {
+			ac = &accum{activeSlots: make(map[int64]struct{})}
+			m[key] = ac
+		}
+		ac.cmp += cmp
+		ac.fail += fail
+		ac.bytes += bytes
+		if bytes > 0 {
+			ac.activeSlots[slot] = struct{}{}
+		}
+	}
+
+	aAcc := make(map[string]*accum)
+	bAcc := make(map[string]*accum)
+	pAcc := make(map[string]*accum)
+	for rows.Next() {
+		var slot, cmp, fail, bytes int64
+		var projID, aID, bID string
+		if err := rows.Scan(&slot, &projID, &aID, &bID, &cmp, &fail, &bytes); err != nil {
+			return nil, nil, nil, err
+		}
+		add(pAcc, projID, slot, cmp, fail, bytes)
+		add(aAcc, aID, slot, cmp, fail, bytes)
+		add(bAcc, bID, slot, cmp, fail, bytes)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, nil, err
+	}
+
+	finalize := func(src map[string]*accum) map[string]WindowSummary {
+		out := make(map[string]WindowSummary, len(src))
+		for k, ac := range src {
+			var activeSec int64
+			for slot := range ac.activeSlots {
+				activeSec += effectiveBucketSec(slot, BaseIntervalSec, nowUnix)
+			}
+			ws := WindowSummary{
+				Completed:         ac.cmp,
+				Failed:            ac.fail,
+				Bytes:             ac.bytes,
+				WindowAvgSpeedBps: ac.bytes / windowSec,
+			}
+			if activeSec > 0 {
+				ws.ActiveAvgSpeedBps = ac.bytes / activeSec
+			}
+			out[k] = ws
+		}
+		return out
+	}
+
+	return finalize(aAcc), finalize(bAcc), finalize(pAcc), nil
 }
 
 func (s *Store) TableNames(ctx context.Context) ([]string, error) {

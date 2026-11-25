@@ -11,7 +11,7 @@
   <div id="login-overlay" class="overlay hidden">
     <div class="modal-card">
       <h2>Relay Center 登录</h2>
-      <p class="muted">请输入中心服务器配置的 Admin Token</p>
+      <p class="muted">请输入中心服务器配置的 Admin Token（校验通过后将自动缓存至本地浏览器，后续免输）</p>
       <form id="login-form" class="form-stack">
         <input id="login-token" type="password" placeholder="Admin Token" autocomplete="current-password" />
         <div id="login-err" class="err-msg"></div>
@@ -22,9 +22,9 @@
 
   <header class="topbar">
     <div class="brand">
-      <span class="dot-live"></span>
+      <span class="dot-brand"></span>
       <span>Relay Center</span>
-      <span class="badge">去中心化直传 · 汇总模式</span>
+      <span class="badge">去中心化直传 · 阶段区间汇总</span>
     </div>
     <nav class="tabs">
       <button class="tab active" data-tab="dashboard">总览看板</button>
@@ -34,12 +34,17 @@
       <button class="tab" data-tab="deploy">部署与版本</button>
     </nav>
     <div class="actions">
-      <label class="toggle">
-        <input id="auto-refresh" type="checkbox" checked />
-        <span>自动刷新 (3s)</span>
-      </label>
-      <button id="refresh-now" class="btn">刷新</button>
-      <button id="logout-btn" class="btn ghost">退出</button>
+      <select id="window-select" class="window-select" title="选择阶段统计时间窗口与区间粒度">
+        <option value="6:10">近 6 小时 · 10分钟区间</option>
+        <option value="24:30" selected>近 24 小时 · 30分钟区间</option>
+        <option value="24:60">近 24 小时 · 1小时区间</option>
+        <option value="72:120">近 3 天 · 2小时区间</option>
+        <option value="168:360">近 7 天 · 6小时区间</option>
+      </select>
+      <span id="snapshot-time" class="muted snapshot-time"></span>
+      <button id="refresh-now" class="btn">刷新统计</button>
+      <span id="trusted-badge" class="badge online hidden" title="当前主机已配置为受信任免密访问">免密主机</span>
+      <button id="logout-btn" class="btn ghost hidden">退出</button>
     </div>
   </header>
 
@@ -47,21 +52,35 @@
     <!-- Dashboard Tab -->
     <section id="tab-dashboard" class="tab-panel active">
       <div class="kpi-grid" id="kpi-grid"></div>
-      <div class="two-col">
-        <div class="card">
-          <div class="card-head">
-            <h3>实时传输中 (B ◄── A 直连)</h3>
-            <span id="active-count-badge" class="badge">0</span>
+
+      <div class="card curve-card">
+        <div class="card-head curve-head">
+          <div>
+            <h3 id="curve-title">近 24 小时平均速度曲线</h3>
+            <div class="muted" id="curve-subtitle">按阶段时间区间统计已落盘校验完成的平均吞吐速率</div>
           </div>
-          <div id="active-transfers-list"></div>
-        </div>
-        <div class="card">
-          <div class="card-head">
-            <h3>近 14 日传输汇总趋势</h3>
-            <span class="muted">按日完成文件数与流量</span>
+          <div class="curve-controls">
+            <select id="curve-project-filter" class="window-select" title="按项目筛选速度曲线">
+              <option value="">全部项目</option>
+            </select>
           </div>
-          <div id="trend-chart"></div>
         </div>
+        <div class="metric-strip" id="curve-metrics"></div>
+        <div class="chart-stage" id="speed-curve-wrap">
+          <div id="speed-curve-chart"></div>
+          <div id="speed-tooltip" class="chart-tooltip hidden"></div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:18px">
+        <div class="card-head">
+          <div>
+            <h3>近 14 日阶段汇总趋势</h3>
+            <div class="muted">按日完成文件数、传输总量与日均吞吐速率</div>
+          </div>
+          <span id="daily-total-badge" class="badge"></span>
+        </div>
+        <div id="trend-chart"></div>
       </div>
     </section>
 
@@ -98,8 +117,8 @@
               <th>状态 / 版本</th>
               <th>公网地址</th>
               <th>磁盘水位</th>
-              <th>待下载 / 传输中</th>
-              <th>出站速率</th>
+              <th>待分发积压汇总</th>
+              <th id="th-a-window">阶段出站统计</th>
               <th>操作</th>
             </tr>
           </thead>
@@ -129,8 +148,8 @@
               <th>状态 / 版本</th>
               <th>订阅项目</th>
               <th>本地磁盘可用</th>
-              <th>当前并发拉取</th>
-              <th>入站速率</th>
+              <th id="th-b-completed">阶段完成汇总</th>
+              <th id="th-b-speed">阶段平均速率</th>
               <th>操作</th>
             </tr>
           </thead>
@@ -161,7 +180,7 @@
                 </select>
               </label>
               <label>版本号
-                <input name="version" required placeholder="e.g. v1.1.0" autocomplete="off" />
+                <input name="version" required placeholder="e.g. v1.6.0" autocomplete="off" />
               </label>
             </div>
             <div class="form-grid-2">
@@ -221,17 +240,20 @@
     </section>
   </main>
 
-  <!-- Live Proxy Files Drawer Modal -->
-  <div id="live-modal" class="overlay hidden">
+  <!-- Deploy Task Log Modal -->
+  <div id="deploy-log-modal" class="overlay hidden">
     <div class="modal-card wide">
       <div class="modal-head">
         <div>
-          <h3 id="live-modal-title">实时穿透队列</h3>
-          <p class="muted">直接实时向 A 节点查询，中心服务器不存储文件清单</p>
+          <h3 id="deploy-log-title">部署任务日志</h3>
+          <p class="muted">按需查询部署任务执行状态与输出日志</p>
         </div>
-        <button class="btn ghost" onclick="closeModal('live-modal')">关闭</button>
+        <div class="btn-row">
+          <button id="btn-refresh-log-modal" class="btn sm">刷新日志</button>
+          <button class="btn ghost" onclick="closeModal('deploy-log-modal')">关闭</button>
+        </div>
       </div>
-      <div id="live-modal-body"></div>
+      <div id="deploy-log-body"></div>
     </div>
   </div>
 
@@ -360,6 +382,7 @@
             <span>确认覆盖已有目录 / 已有服务</span>
           </label>
           <button type="submit" id="btn-confirm-deploy-a" class="btn success" disabled>2. 确认一键部署</button>
+          <button type="button" id="btn-refresh-deploy-status" class="btn hidden">刷新部署状态</button>
         </div>
       </form>
 

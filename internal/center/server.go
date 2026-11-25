@@ -4,13 +4,13 @@ import (
 	"context"
 	"crypto/tls"
 	"embed"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"regexp"
 	"sort"
@@ -39,23 +39,27 @@ func validateHTTPSAddr(raw string) error {
 var embeddedWeb embed.FS
 
 type Server struct {
-	cfg         *Config
-	store       *Store
-	hub         *Hub
-	deployer    *deployer.Deployer
-	logger      *slog.Logger
-	proxyHTTP   *http.Client
-	httpServer  *http.Server
-	ln          net.Listener
-	deployMu    sync.RWMutex
-	deployTasks map[string]*protocol.DeployTask
-	deployOrder []string
-	closeOnce   sync.Once
+	cfg          *Config
+	store        *Store
+	hub          *Hub
+	deployer     *deployer.Deployer
+	logger       *slog.Logger
+	trustedAdmin []netip.Prefix
+	httpServer   *http.Server
+	ln           net.Listener
+	deployMu     sync.RWMutex
+	deployTasks  map[string]*protocol.DeployTask
+	deployOrder  []string
+	closeOnce    sync.Once
 }
 
 func New(cfg *Config, logger *slog.Logger) (*Server, error) {
 	cfg.ApplyDefaults()
 	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	trustedPrefixes, err := cfg.ParseAdminTrustedPrefixes()
+	if err != nil {
 		return nil, err
 	}
 	if logger == nil {
@@ -65,15 +69,11 @@ func New(cfg *Config, logger *slog.Logger) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	clientTLS, err := pki.ClientTLSConfig(cfg.CACert)
-	if err != nil {
-		_ = store.Close()
-		return nil, err
-	}
 	return &Server{
-		cfg:   cfg,
-		store: store,
-		hub:   NewHub(cfg.NodeOfflineTimeout()),
+		cfg:          cfg,
+		store:        store,
+		hub:          NewHub(cfg.NodeOfflineTimeout()),
+		trustedAdmin: trustedPrefixes,
 		deployer: deployer.New(deployer.Config{
 			DefaultSSHKeyPath: cfg.SSHKeyPath,
 			CACertPath:        cfg.CACert,
@@ -84,16 +84,6 @@ func New(cfg *Config, logger *slog.Logger) (*Server, error) {
 		}),
 		logger:      logger.With("component", "center"),
 		deployTasks: make(map[string]*protocol.DeployTask),
-		proxyHTTP: &http.Client{
-			Timeout: 2 * time.Second, // Strict 2s timeout for live proxy queries to A nodes
-			Transport: &http.Transport{
-				TLSClientConfig:     clientTLS,
-				ForceAttemptHTTP2:   true,
-				MaxIdleConns:        32,
-				IdleConnTimeout:     30 * time.Second,
-				TLSHandshakeTimeout: 2 * time.Second,
-			},
-		},
 	}, nil
 }
 
@@ -171,6 +161,9 @@ func (s *Server) dedupCleanupLoop(ctx context.Context) {
 			if err := s.store.CleanupOldDedup(ctx, 24*time.Hour); err != nil {
 				s.logger.Warn("cleanup dedup failed", "err", err)
 			}
+			if err := s.store.CleanupOldIntervals(ctx, 31*24*time.Hour); err != nil {
+				s.logger.Warn("cleanup interval stats failed", "err", err)
+			}
 		}
 	}
 }
@@ -190,7 +183,7 @@ func (s *Server) routes() http.Handler {
 	// Shared node release download (Agent A or B pulls its own role's binary over TLS 1.3)
 	mux.HandleFunc("GET /api/v1/releases/{id}/download", s.requireNode("", s.handleNodeDownloadRelease))
 
-	// Admin & Web UI API
+	// Admin & Web UI API (interval/stage summary only; no real-time per-file proxy endpoints)
 	mux.HandleFunc("GET /api/v1/admin/overview", s.requireAdmin(s.handleAdminOverview))
 	mux.HandleFunc("GET /api/v1/admin/projects", s.requireAdmin(s.handleAdminListProjects))
 	mux.HandleFunc("POST /api/v1/admin/projects", s.requireAdmin(s.handleAdminUpsertProject))
@@ -198,8 +191,7 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("GET /api/v1/admin/nodes", s.requireAdmin(s.handleAdminListNodes))
 	mux.HandleFunc("POST /api/v1/admin/nodes", s.requireAdmin(s.handleAdminCreateNode))
 	mux.HandleFunc("DELETE /api/v1/admin/nodes/{id}", s.requireAdmin(s.handleAdminDeleteNode))
-	mux.HandleFunc("GET /api/v1/admin/nodes/{id}/live-files", s.requireAdmin(s.handleAdminNodeLiveFiles))
-	mux.HandleFunc("GET /api/v1/admin/projects/{id}/live-files", s.requireAdmin(s.handleAdminProjectLiveFiles))
+	mux.HandleFunc("GET /api/v1/admin/stats/intervals", s.requireAdmin(s.handleAdminIntervalStats))
 	mux.HandleFunc("GET /api/v1/admin/stats/daily", s.requireAdmin(s.handleAdminDailyStats))
 
 	// Releases, Batch Upgrades & One-Click Deployment API
@@ -241,8 +233,33 @@ func (s *Server) requireNode(role string, next nodeHandler) http.HandlerFunc {
 	}
 }
 
+func (s *Server) isTrustedAdminRequest(r *http.Request) bool {
+	if len(s.trustedAdmin) == 0 {
+		return false
+	}
+	host := strings.TrimSpace(r.RemoteAddr)
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
+		return false
+	}
+	addr = addr.Unmap()
+	for _, pfx := range s.trustedAdmin {
+		if pfx.Contains(addr) {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Server) requireAdmin(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if s.isTrustedAdminRequest(r) {
+			next(w, r)
+			return
+		}
 		tok := strings.TrimSpace(r.Header.Get(protocol.HeaderAdminToken))
 		if tok == "" {
 			tok = auth.ExtractBearer(r.Header.Get("Authorization"))
@@ -436,8 +453,46 @@ func (s *Server) handleBDiscover(w http.ResponseWriter, r *http.Request, node *S
 	})
 }
 
+func parseIntervalQuery(r *http.Request) IntervalQuery {
+	q := IntervalQuery{
+		Now:       time.Now().UTC(),
+		Hours:     24,
+		ProjectID: strings.TrimSpace(r.URL.Query().Get("project")),
+		ANodeID:   strings.TrimSpace(r.URL.Query().Get("a_node")),
+		BNodeID:   strings.TrimSpace(r.URL.Query().Get("b_node")),
+	}
+	if hStr := strings.TrimSpace(r.URL.Query().Get("hours")); hStr != "" {
+		if parsed, err := strconv.Atoi(hStr); err == nil && parsed > 0 {
+			q.Hours = parsed
+		}
+	}
+	if bStr := strings.TrimSpace(r.URL.Query().Get("bucket_min")); bStr != "" {
+		if parsed, err := strconv.Atoi(bStr); err == nil && parsed > 0 {
+			q.BucketMinutes = parsed
+		}
+	}
+	parseTimeParam := func(raw string) time.Time {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			return time.Time{}
+		}
+		if sec, err := strconv.ParseInt(raw, 10, 64); err == nil && sec > 0 {
+			return time.Unix(sec, 0).UTC()
+		}
+		if t, err := time.Parse(time.RFC3339, raw); err == nil {
+			return t.UTC()
+		}
+		return time.Time{}
+	}
+	q.Start = parseTimeParam(r.URL.Query().Get("start"))
+	q.End = parseTimeParam(r.URL.Query().Get("end"))
+	return q
+}
+
 func (s *Server) handleAdminOverview(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	iq := parseIntervalQuery(r)
+
 	projects, err := s.store.ListProjects(ctx)
 	if err != nil {
 		protocol.WriteError(w, http.StatusInternalServerError, err.Error())
@@ -453,7 +508,17 @@ func (s *Server) handleAdminOverview(w http.ResponseWriter, r *http.Request) {
 		protocol.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	dailyTrend, err := s.store.GetDailyStats(ctx, "", 14)
+	dailyTrend, err := s.store.GetDailyStats(ctx, iq.ProjectID, 14)
+	if err != nil {
+		protocol.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	intervalResp, err := s.store.QueryIntervalStats(ctx, iq)
+	if err != nil {
+		protocol.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	_, _, projWindowMap, err := s.store.GetWindowEntityStats(ctx, iq.Now, intervalResp.WindowHours)
 	if err != nil {
 		protocol.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -461,8 +526,22 @@ func (s *Server) handleAdminOverview(w http.ResponseWriter, r *http.Request) {
 
 	aSnap, bSnap := s.hub.Snapshot()
 	overview := protocol.OverviewResp{
-		TotalProjects: len(projects),
-		DailyTrend:    dailyTrend,
+		GeneratedAt:        intervalResp.GeneratedAt,
+		AuthTrustedIP:      s.isTrustedAdminRequest(r),
+		WindowStart:        intervalResp.WindowStart,
+		WindowEnd:          intervalResp.WindowEnd,
+		WindowHours:        intervalResp.WindowHours,
+		BucketMinutes:      intervalResp.BucketMinutes,
+		ProjectFilter:      iq.ProjectID,
+		TotalProjects:      len(projects),
+		WindowCompleted:    intervalResp.TotalCompleted,
+		WindowBytes:        intervalResp.TotalBytes,
+		WindowFailed:       intervalResp.TotalFailed,
+		WindowAvgSpeedBps:  intervalResp.WindowAvgSpeedBps,
+		ActiveAvgSpeedBps:  intervalResp.ActiveAvgSpeedBps,
+		WindowPeakSpeedBps: intervalResp.PeakSpeedBps,
+		IntervalCurve:      intervalResp.Buckets,
+		DailyTrend:         dailyTrend,
 	}
 
 	today := time.Now().UTC().Format("2006-01-02")
@@ -493,49 +572,22 @@ func (s *Server) handleAdminOverview(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Build active transfers list from online B nodes.
-	allActive := make([]protocol.BActiveTransferView, 0)
-	activeByProj := make(map[string][]protocol.BActiveTransferView)
-	for _, st := range bSnap {
-		if !s.hub.IsOnline(st.LastSeen) {
-			continue
-		}
-		overview.LiveTotalSpeedBps += st.InSpeedBps
-		for _, tr := range st.ActiveTransfers {
-			v := protocol.BActiveTransferView{
-				BNodeID:          st.NodeID,
-				BName:            st.Name,
-				ProjectID:        tr.ProjectID,
-				ANodeID:          tr.ANodeID,
-				FileID:           tr.FileID,
-				Filename:         tr.Filename,
-				TransferredBytes: tr.TransferredBytes,
-				TotalBytes:       tr.TotalBytes,
-				SpeedBps:         tr.SpeedBps,
-				StartedAt:        tr.StartedAt,
-			}
-			allActive = append(allActive, v)
-			activeByProj[tr.ProjectID] = append(activeByProj[tr.ProjectID], v)
-		}
-	}
-	overview.LiveActiveFiles = len(allActive)
-	overview.ActiveTransfers = allActive
-
 	projSummaries := make([]protocol.ProjectSummary, 0, len(projects))
 	for _, p := range projects {
 		t := totalsMap[p.ID]
-		act := activeByProj[p.ID]
-		if act == nil {
-			act = make([]protocol.BActiveTransferView, 0)
-		}
+		pw := projWindowMap[p.ID]
 		ps := protocol.ProjectSummary{
 			Project:           p,
 			TotalUploaded:     t.TotalUploaded,
 			TotalCompleted:    t.TotalCompleted,
 			TotalFailed:       t.TotalFailed,
 			TotalBytes:        t.TotalBytes,
+			WindowCompleted:   pw.Completed,
+			WindowFailed:      pw.Failed,
+			WindowBytes:       pw.Bytes,
+			WindowAvgSpeedBps: pw.WindowAvgSpeedBps,
+			ActiveAvgSpeedBps: pw.ActiveAvgSpeedBps,
 			ANodeAvailability: make([]protocol.ANodeAvailSummary, 0),
-			ActiveTransfers:   act,
 		}
 		for _, aSt := range aSnap {
 			if !s.hub.IsOnline(aSt.LastSeen) {
@@ -545,9 +597,8 @@ func (s *Server) handleAdminOverview(w http.ResponseWriter, r *http.Request) {
 				ps.OnlineANodes++
 			}
 			if av, ok := aSt.Availability[p.ID]; ok && (av.ReadyCount > 0 || av.ClaimedCount > 0) {
-				ps.LiveReadyCount += av.ReadyCount
-				ps.LiveClaimedCount += av.ClaimedCount
-				ps.LiveReadyBytes += av.ReadyBytes
+				ps.QueuedFiles += av.ReadyCount + av.ClaimedCount
+				ps.QueuedBytes += av.ReadyBytes
 				ps.ANodeAvailability = append(ps.ANodeAvailability, protocol.ANodeAvailSummary{
 					ANodeID:      aSt.NodeID,
 					AName:        aSt.Name,
@@ -567,8 +618,8 @@ func (s *Server) handleAdminOverview(w http.ResponseWriter, r *http.Request) {
 				ps.OnlineBNodes++
 			}
 		}
-		overview.LiveReadyFiles += ps.LiveReadyCount
-		overview.LiveReadyBytes += ps.LiveReadyBytes
+		overview.QueuedFiles += ps.QueuedFiles
+		overview.QueuedBytes += ps.QueuedBytes
 		projSummaries = append(projSummaries, ps)
 	}
 	overview.Projects = projSummaries
@@ -645,21 +696,34 @@ func (s *Server) handleAdminDeleteProject(w http.ResponseWriter, r *http.Request
 }
 
 func (s *Server) handleAdminListNodes(w http.ResponseWriter, r *http.Request) {
-	nodes, err := s.store.ListNodes(r.Context())
+	ctx := r.Context()
+	hours := 24
+	if hStr := strings.TrimSpace(r.URL.Query().Get("hours")); hStr != "" {
+		if parsed, err := strconv.Atoi(hStr); err == nil && parsed > 0 && parsed <= 720 {
+			hours = parsed
+		}
+	}
+	nodes, err := s.store.ListNodes(ctx)
+	if err != nil {
+		protocol.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	aWinStats, bWinStats, _, err := s.store.GetWindowEntityStats(ctx, time.Now().UTC(), hours)
 	if err != nil {
 		protocol.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	aSnap, bSnap := s.hub.Snapshot()
-	upgrades, _ := s.store.ListNodeUpgrades(r.Context())
+	upgrades, _ := s.store.ListNodeUpgrades(ctx)
 	views := make([]protocol.LiveNodeView, 0, len(nodes))
 	for _, n := range nodes {
 		v := protocol.LiveNodeView{
-			ID:         n.ID,
-			Name:       n.Name,
-			Role:       n.Role,
-			Projects:   n.Projects,
-			PublicAddr: n.PublicAddr,
+			ID:          n.ID,
+			Name:        n.Name,
+			Role:        n.Role,
+			Projects:    n.Projects,
+			PublicAddr:  n.PublicAddr,
+			WindowHours: hours,
 		}
 		if upg, ok := upgrades[n.ID]; ok {
 			v.TargetVersion = upg.TargetVersion
@@ -667,6 +731,13 @@ func (s *Server) handleAdminListNodes(w http.ResponseWriter, r *http.Request) {
 			v.UpgradeMessage = upg.Message
 		}
 		if n.Role == protocol.RoleAgentA {
+			if ws, ok := aWinStats[n.ID]; ok {
+				v.WindowCompleted = ws.Completed
+				v.WindowFailed = ws.Failed
+				v.WindowBytes = ws.Bytes
+				v.WindowAvgSpeedBps = ws.WindowAvgSpeedBps
+				v.ActiveAvgSpeedBps = ws.ActiveAvgSpeedBps
+			}
 			if st, ok := aSnap[n.ID]; ok {
 				ls := st.LastSeen
 				v.LastSeenAt = &ls
@@ -681,8 +752,6 @@ func (s *Server) handleAdminListNodes(w http.ResponseWriter, r *http.Request) {
 				v.DiskFreeBytes = st.DiskFreeBytes
 				v.DiskUsedPct = st.DiskUsedPct
 				v.DiskAlarm = st.DiskAlarm
-				v.ActiveStreams = st.ActiveStreams
-				v.SpeedBps = st.OutSpeedBps
 				for _, av := range st.Availability {
 					v.Availability = append(v.Availability, av)
 				}
@@ -691,6 +760,13 @@ func (s *Server) handleAdminListNodes(w http.ResponseWriter, r *http.Request) {
 				})
 			}
 		} else if n.Role == protocol.RoleAgentB {
+			if ws, ok := bWinStats[n.ID]; ok {
+				v.WindowCompleted = ws.Completed
+				v.WindowFailed = ws.Failed
+				v.WindowBytes = ws.Bytes
+				v.WindowAvgSpeedBps = ws.WindowAvgSpeedBps
+				v.ActiveAvgSpeedBps = ws.ActiveAvgSpeedBps
+			}
 			if st, ok := bSnap[n.ID]; ok {
 				ls := st.LastSeen
 				v.LastSeenAt = &ls
@@ -701,9 +777,6 @@ func (s *Server) handleAdminListNodes(w http.ResponseWriter, r *http.Request) {
 				v.DiskTotalBytes = st.DiskTotalBytes
 				v.DiskFreeBytes = st.DiskFreeBytes
 				v.DiskUsedPct = st.DiskUsedPct
-				v.ActiveStreams = len(st.ActiveTransfers)
-				v.SpeedBps = st.InSpeedBps
-				v.ActiveTransfers = st.ActiveTransfers
 			}
 		}
 		views = append(views, v)
@@ -789,95 +862,14 @@ func (s *Server) handleAdminDeleteNode(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// handleAdminNodeLiveFiles performs a live proxy query directly to an A node (2s timeout)
-// without persisting any file list in Center.
-func (s *Server) handleAdminNodeLiveFiles(w http.ResponseWriter, r *http.Request) {
-	nodeID := r.PathValue("id")
-	projectFilter := strings.TrimSpace(r.URL.Query().Get("project"))
-
-	publicAddr := ""
-	nodeName := nodeID
-	if live, ok := s.hub.GetLiveA(nodeID); ok && live.PublicAddr != "" {
-		publicAddr = live.PublicAddr
-		nodeName = live.Name
-	} else if rec, err := s.store.GetNode(r.Context(), nodeID); err == nil && rec.Role == protocol.RoleAgentA {
-		publicAddr = rec.PublicAddr
-		nodeName = rec.Name
-	} else {
-		protocol.WriteError(w, http.StatusNotFound, "agent-a node not found")
+func (s *Server) handleAdminIntervalStats(w http.ResponseWriter, r *http.Request) {
+	iq := parseIntervalQuery(r)
+	resp, err := s.store.QueryIntervalStats(r.Context(), iq)
+	if err != nil {
+		protocol.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-
-	resp := s.fetchALiveFiles(r.Context(), nodeID, nodeName, publicAddr, projectFilter)
 	protocol.WriteJSON(w, http.StatusOK, resp)
-}
-
-// handleAdminProjectLiveFiles fans out live proxy queries ONLY to online A nodes
-// that currently report files for this project, with graceful partial results.
-func (s *Server) handleAdminProjectLiveFiles(w http.ResponseWriter, r *http.Request) {
-	projectID := r.PathValue("id")
-	activeAs := s.hub.ActiveANodesForProject(projectID)
-	results := make([]protocol.LiveFilesResp, len(activeAs))
-	var wg sync.WaitGroup
-	for i, aNode := range activeAs {
-		wg.Add(1)
-		go func(idx int, st *LiveAState) {
-			defer wg.Done()
-			results[idx] = s.fetchALiveFiles(r.Context(), st.NodeID, st.Name, st.PublicAddr, projectID)
-		}(i, aNode)
-	}
-	wg.Wait()
-	sort.Slice(results, func(i, j int) bool {
-		return results[i].ANodeID < results[j].ANodeID
-	})
-	protocol.WriteJSON(w, http.StatusOK, results)
-}
-
-func (s *Server) fetchALiveFiles(ctx context.Context, nodeID, nodeName, publicAddr, projectFilter string) protocol.LiveFilesResp {
-	fallback := protocol.LiveFilesResp{
-		ANodeID:    nodeID,
-		AName:      nodeName,
-		PublicAddr: publicAddr,
-		Files:      make([]protocol.LiveFileItem, 0),
-	}
-	if publicAddr == "" {
-		fallback.Error = "node has no public_addr"
-		return fallback
-	}
-	if err := validateHTTPSAddr(publicAddr); err != nil {
-		fallback.Error = err.Error()
-		return fallback
-	}
-	u := strings.TrimRight(publicAddr, "/") + "/internal/v1/files"
-	if projectFilter != "" {
-		u += "?project=" + url.QueryEscape(projectFilter)
-	}
-	qCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(qCtx, http.MethodGet, u, nil)
-	if err != nil {
-		fallback.Error = err.Error()
-		return fallback
-	}
-	if s.cfg.CenterSecret != "" {
-		req.Header.Set(protocol.HeaderCenterSecret, s.cfg.CenterSecret)
-	}
-	resp, err := s.proxyHTTP.Do(req)
-	if err != nil {
-		fallback.Error = "unreachable: " + err.Error()
-		return fallback
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		fallback.Error = fmt.Sprintf("agent-a returned HTTP %d", resp.StatusCode)
-		return fallback
-	}
-	var live protocol.LiveFilesResp
-	if err := json.NewDecoder(resp.Body).Decode(&live); err != nil {
-		fallback.Error = "decode error: " + err.Error()
-		return fallback
-	}
-	return live
 }
 
 func (s *Server) handleAdminDailyStats(w http.ResponseWriter, r *http.Request) {

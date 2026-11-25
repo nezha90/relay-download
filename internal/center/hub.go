@@ -22,25 +22,22 @@ type LiveAState struct {
 	DiskFreeBytes  uint64
 	DiskUsedPct    float64
 	DiskAlarm      bool
-	ActiveStreams  int
-	OutSpeedBps    int64
 	Availability   map[string]protocol.ProjectAvailability // project_id -> availability
 	LastSeen       time.Time
 }
 
 type LiveBState struct {
-	NodeID          string
-	Name            string
-	Projects        []string
-	Version         string
-	OS              string
-	Arch            string
-	DiskTotalBytes  uint64
-	DiskFreeBytes   uint64
-	DiskUsedPct     float64
-	ActiveTransfers []protocol.BActiveTransfer
-	InSpeedBps      int64
-	LastSeen        time.Time
+	NodeID         string
+	Name           string
+	Projects       []string
+	Version        string
+	OS             string
+	Arch           string
+	DiskTotalBytes uint64
+	DiskFreeBytes  uint64
+	DiskUsedPct    float64
+	ActiveCount    int
+	LastSeen       time.Time
 }
 
 type bSub struct {
@@ -92,8 +89,6 @@ func (h *Hub) UpdateA(hb protocol.AgentAHeartbeatReq) {
 		DiskFreeBytes:  hb.DiskFreeBytes,
 		DiskUsedPct:    hb.DiskUsedPct,
 		DiskAlarm:      hb.DiskAlarm,
-		ActiveStreams:  hb.ActiveStreams,
-		OutSpeedBps:    hb.OutSpeedBps,
 		Availability:   availMap,
 		LastSeen:       now,
 	}
@@ -106,20 +101,23 @@ func (h *Hub) UpdateA(hb protocol.AgentAHeartbeatReq) {
 
 func (h *Hub) UpdateB(hb protocol.AgentBHeartbeatReq) {
 	now := time.Now().UTC()
+	activeCnt := hb.ActiveCount
+	if activeCnt == 0 && len(hb.LegacyActiveTransfers) > 0 {
+		activeCnt = len(hb.LegacyActiveTransfers)
+	}
 	h.mu.Lock()
 	h.bNodes[hb.NodeID] = &LiveBState{
-		NodeID:          hb.NodeID,
-		Name:            hb.Name,
-		Projects:        append([]string(nil), hb.Projects...),
-		Version:         hb.Version,
-		OS:              hb.OS,
-		Arch:            hb.Arch,
-		DiskTotalBytes:  hb.DiskTotalBytes,
-		DiskFreeBytes:   hb.DiskFreeBytes,
-		DiskUsedPct:     hb.DiskUsedPct,
-		ActiveTransfers: append([]protocol.BActiveTransfer(nil), hb.ActiveTransfers...),
-		InSpeedBps:      hb.InSpeedBps,
-		LastSeen:        now,
+		NodeID:         hb.NodeID,
+		Name:           hb.Name,
+		Projects:       append([]string(nil), hb.Projects...),
+		Version:        hb.Version,
+		OS:             hb.OS,
+		Arch:           hb.Arch,
+		DiskTotalBytes: hb.DiskTotalBytes,
+		DiskFreeBytes:  hb.DiskFreeBytes,
+		DiskUsedPct:    hb.DiskUsedPct,
+		ActiveCount:    activeCnt,
+		LastSeen:       now,
 	}
 	h.mu.Unlock()
 }
@@ -206,7 +204,7 @@ func (h *Hub) WakeupB(projectID string, readyCount int) {
 	for bID, sub := range subsMap {
 		active := 0
 		if st, ok := h.bNodes[bID]; ok {
-			active = len(st.ActiveTransfers)
+			active = st.ActiveCount
 		}
 		subs = append(subs, subInfo{bNodeID: bID, active: active, ch: sub.ch})
 	}
@@ -291,25 +289,7 @@ func (h *Hub) Snapshot() (map[string]*LiveAState, map[string]*LiveBState) {
 	bOut := make(map[string]*LiveBState, len(h.bNodes))
 	for k, st := range h.bNodes {
 		cp := *st
-		cp.ActiveTransfers = append([]protocol.BActiveTransfer(nil), st.ActiveTransfers...)
 		bOut[k] = &cp
 	}
 	return aOut, bOut
-}
-
-func (h *Hub) ActiveANodesForProject(projectID string) []*LiveAState {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	var list []*LiveAState
-	for _, st := range h.aNodes {
-		if !h.IsOnline(st.LastSeen) {
-			continue
-		}
-		av, ok := st.Availability[projectID]
-		if ok && (av.ReadyCount > 0 || av.ClaimedCount > 0) {
-			cp := *st
-			list = append(list, &cp)
-		}
-	}
-	return list
 }
