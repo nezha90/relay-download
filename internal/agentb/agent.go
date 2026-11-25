@@ -74,6 +74,7 @@ type Agent struct {
 	inBytes         atomic.Int64
 	lastSpeedBps    atomic.Int64
 	pendingAckCount atomic.Int64
+	hashRAMBytes    atomic.Int64
 
 	// Optional metrics & test hooks.
 	ResumeCount        atomic.Int64
@@ -1237,7 +1238,7 @@ func (cb *chunkBitmap) markDone(idx int) {
 
 func (cb *chunkBitmap) close() {
 	if cb != nil && cb.f != nil {
-		_ = cb.f.Sync()
+		// Temp resume bitmap is deleted right after commit; avoid extra HDD fsync barriers here.
 		_ = cb.f.Close()
 	}
 }
@@ -1302,13 +1303,12 @@ func (a *Agent) downloadChunked(ctx context.Context, dl ActiveDownload, prog *ac
 		data []byte // nil if omitted to stay within RAM budget
 	}
 	var (
-		hashCh        chan hashedChunk
-		hashDone      chan struct{}
-		pipelinedSHA  string
-		hashErr       error
-		hashRAMBudget atomic.Int64
+		hashCh       chan hashedChunk
+		hashDone     chan struct{}
+		pipelinedSHA string
+		hashErr      error
 	)
-	const maxHashRAMPerFile = 16 << 20
+	const maxGlobalHashRAM = 512 << 20
 	if !resumed {
 		chCap := numChunks
 		if chCap > 256 {
@@ -1320,6 +1320,15 @@ func (a *Agent) downloadChunked(ctx context.Context, dl ActiveDownload, prog *ac
 			defer close(hashDone)
 			ready := make([]bool, numChunks)
 			cached := make([][]byte, numChunks)
+			defer func() {
+				// Release any remaining budgeted RAM on early exit/cancel.
+				for i, mem := range cached {
+					if mem != nil {
+						a.hashRAMBytes.Add(-int64(len(mem)))
+						cached[i] = nil
+					}
+				}
+			}()
 			nextIdx := 0
 			h := sha256.New()
 			bufPtr := transfer.GetBuf()
@@ -1336,7 +1345,7 @@ func (a *Agent) downloadChunked(ctx context.Context, dl ActiveDownload, prog *ac
 					if mem := cached[nextIdx]; mem != nil {
 						_, _ = h.Write(mem)
 						cached[nextIdx] = nil
-						hashRAMBudget.Add(-int64(len(mem)))
+						a.hashRAMBytes.Add(-int64(len(mem)))
 					} else {
 						st := int64(nextIdx) * chunkSize
 						ln := chunkSize
@@ -1410,15 +1419,15 @@ func (a *Agent) downloadChunked(ctx context.Context, dl ActiveDownload, prog *ac
 				}
 				var memBuf []byte
 				cLen := rg.end - rg.start + 1
-				if hashCh != nil && cLen <= 8<<20 && hashRAMBudget.Add(cLen) <= maxHashRAMPerFile {
+				if hashCh != nil && cLen <= 16<<20 && a.hashRAMBytes.Add(cLen) <= maxGlobalHashRAM {
 					memBuf = make([]byte, cLen)
-				} else if hashCh != nil && cLen <= 8<<20 {
-					hashRAMBudget.Add(-cLen)
+				} else if hashCh != nil && cLen <= 16<<20 {
+					a.hashRAMBytes.Add(-cLen)
 				}
 				status, err := a.fetchRangeWithRetry(chunkCtx, dl, f, rg.start, rg.end, memBuf, prog, &completedBytes)
 				if err != nil {
 					if memBuf != nil {
-						hashRAMBudget.Add(-int64(len(memBuf)))
+						a.hashRAMBytes.Add(-int64(len(memBuf)))
 					}
 					recordErr(status, err)
 					return
@@ -1429,11 +1438,11 @@ func (a *Agent) downloadChunked(ctx context.Context, dl ActiveDownload, prog *ac
 					case hashCh <- hashedChunk{idx: rg.idx, data: memBuf}:
 					case <-chunkCtx.Done():
 						if memBuf != nil {
-							hashRAMBudget.Add(-int64(len(memBuf)))
+							a.hashRAMBytes.Add(-int64(len(memBuf)))
 						}
 					case <-hashDone:
 						if memBuf != nil {
-							hashRAMBudget.Add(-int64(len(memBuf)))
+							a.hashRAMBytes.Add(-int64(len(memBuf)))
 						}
 					}
 				}
