@@ -43,7 +43,9 @@ type Agent struct {
 	cfg           *Config
 	store         *Store
 	logger        *slog.Logger
+	apiMu         sync.RWMutex
 	apiClient     *http.Client
+	makeAPICli    func() *http.Client
 	sseClient     *http.Client
 	streamMu      sync.RWMutex
 	streamClients []*http.Client
@@ -105,15 +107,25 @@ func New(cfg *Config, logger *slog.Logger) (*Agent, error) {
 		return nil, err
 	}
 
-	makeAPITransport := func() *http.Transport {
-		return &http.Transport{
-			TLSClientConfig:       clientTLS.Clone(),
-			ForceAttemptHTTP2:     true,
-			MaxIdleConns:          32,
-			MaxIdleConnsPerHost:   16,
-			IdleConnTimeout:       60 * time.Second,
-			TLSHandshakeTimeout:   10 * time.Second,
-			ResponseHeaderTimeout: 30 * time.Second,
+	apiIdleTimeout := 60 * time.Second
+	if cfg.StreamConnMaxAgeSec > 0 {
+		apiIdleTimeout = time.Duration(cfg.StreamConnMaxAgeSec) * time.Second
+		if apiIdleTimeout < 5*time.Second {
+			apiIdleTimeout = 5 * time.Second
+		}
+	}
+	makeAPIClient := func() *http.Client {
+		return &http.Client{
+			Timeout: 15 * time.Second,
+			Transport: &http.Transport{
+				TLSClientConfig:       clientTLS.Clone(),
+				ForceAttemptHTTP2:     true,
+				MaxIdleConns:          32,
+				MaxIdleConnsPerHost:   16,
+				IdleConnTimeout:       apiIdleTimeout,
+				TLSHandshakeTimeout:   8 * time.Second,
+				ResponseHeaderTimeout: 10 * time.Second,
+			},
 		}
 	}
 
@@ -121,19 +133,34 @@ func New(cfg *Config, logger *slog.Logger) (*Agent, error) {
 		return &http.Client{
 			// No overall Timeout on streaming/SSE client; bounded by ctx cancellation.
 			Transport: &http.Transport{
-				TLSClientConfig:     clientTLS.Clone(),
-				ForceAttemptHTTP2:   true,
-				MaxIdleConns:        8,
-				MaxIdleConnsPerHost: 4,
-				IdleConnTimeout:     90 * time.Second,
-				TLSHandshakeTimeout: 10 * time.Second,
-				ReadBufferSize:      256 << 10,
-				WriteBufferSize:     64 << 10,
+				TLSClientConfig:       clientTLS.Clone(),
+				ForceAttemptHTTP2:     true,
+				MaxIdleConns:          8,
+				MaxIdleConnsPerHost:   4,
+				IdleConnTimeout:       90 * time.Second,
+				TLSHandshakeTimeout:   10 * time.Second,
+				ResponseHeaderTimeout: 10 * time.Second,
+				ReadBufferSize:        256 << 10,
+				WriteBufferSize:       64 << 10,
 				HTTP2: &http.HTTP2Config{
 					MaxReadFrameSize:              512 << 10,
 					MaxReceiveBufferPerConnection: 2 << 20,
 					MaxReceiveBufferPerStream:     2 << 20,
 				},
+			},
+		}
+	}
+
+	makeSSEClient := func() *http.Client {
+		return &http.Client{
+			// SSE stays open indefinitely waiting for wakeup events; no ResponseHeaderTimeout.
+			Transport: &http.Transport{
+				TLSClientConfig:     clientTLS.Clone(),
+				ForceAttemptHTTP2:   true,
+				MaxIdleConns:        4,
+				MaxIdleConnsPerHost: 2,
+				IdleConnTimeout:     90 * time.Second,
+				TLSHandshakeTimeout: 10 * time.Second,
 			},
 		}
 	}
@@ -172,15 +199,16 @@ func New(cfg *Config, logger *slog.Logger) (*Agent, error) {
 			h1TLS.NextProtos = []string{"http/1.1"}
 			return &http.Client{
 				Transport: &http.Transport{
-					TLSClientConfig:     h1TLS,
-					ForceAttemptHTTP2:   false,
-					TLSNextProto:        make(map[string]func(authority string, c *tls.Conn) http.RoundTripper),
-					MaxIdleConns:        perShardPool,
-					MaxIdleConnsPerHost: perShardPool,
-					IdleConnTimeout:     idleTimeout,
-					TLSHandshakeTimeout: 10 * time.Second,
-					ReadBufferSize:      1 << 20,
-					WriteBufferSize:     256 << 10,
+					TLSClientConfig:       h1TLS,
+					ForceAttemptHTTP2:     false,
+					TLSNextProto:          make(map[string]func(authority string, c *tls.Conn) http.RoundTripper),
+					MaxIdleConns:          perShardPool,
+					MaxIdleConnsPerHost:   perShardPool,
+					IdleConnTimeout:       idleTimeout,
+					TLSHandshakeTimeout:   8 * time.Second,
+					ResponseHeaderTimeout: 8 * time.Second,
+					ReadBufferSize:        1 << 20,
+					WriteBufferSize:       256 << 10,
 				},
 			}
 		}
@@ -202,15 +230,13 @@ func New(cfg *Config, logger *slog.Logger) (*Agent, error) {
 	}
 
 	ag := &Agent{
-		cfg:     cfg,
-		store:   store,
-		logger:  logger.With("component", "agent-b", "node_id", cfg.NodeID),
-		limiter: limiter,
-		apiClient: &http.Client{
-			Timeout:   20 * time.Second,
-			Transport: makeAPITransport(),
-		},
-		sseClient:     makeH2StreamClient(),
+		cfg:           cfg,
+		store:         store,
+		logger:        logger.With("component", "agent-b", "node_id", cfg.NodeID),
+		limiter:       limiter,
+		apiClient:     makeAPIClient(),
+		makeAPICli:    makeAPIClient,
+		sseClient:     makeSSEClient(),
 		streamClients: streamClients,
 		makeStreamCli: makeStreamCli,
 		workSem:       make(chan struct{}, cfg.MaxConcurrent),
@@ -252,6 +278,48 @@ func New(cfg *Config, logger *slog.Logger) (*Agent, error) {
 	return ag, nil
 }
 
+func (a *Agent) getAPIClient() *http.Client {
+	a.apiMu.RLock()
+	cli := a.apiClient
+	a.apiMu.RUnlock()
+	return cli
+}
+
+// rotateAPIClient swaps the control-plane HTTP client to a fresh transport so an ISP-policed
+// or half-open TCP socket can never stall claim-batch / batch-ack / renew / heartbeat calls.
+// If expected != nil, rotation only happens if a.apiClient is still expected (prevents stampedes).
+func (a *Agent) rotateAPIClient(expected *http.Client) {
+	if a.makeAPICli == nil {
+		return
+	}
+	a.apiMu.Lock()
+	if expected != nil && a.apiClient != expected {
+		a.apiMu.Unlock()
+		return
+	}
+	old := a.apiClient
+	a.apiClient = a.makeAPICli()
+	a.apiMu.Unlock()
+
+	if old != nil {
+		if tr, ok := old.Transport.(*http.Transport); ok {
+			tr.CloseIdleConnections()
+			for _, delay := range []time.Duration{3 * time.Second, 10 * time.Second, 20 * time.Second} {
+				time.AfterFunc(delay, tr.CloseIdleConnections)
+			}
+		}
+	}
+}
+
+func (a *Agent) doAPI(req *http.Request) (*http.Response, error) {
+	cli := a.getAPIClient()
+	resp, err := cli.Do(req)
+	if err != nil && req.Context().Err() == nil {
+		a.rotateAPIClient(cli)
+	}
+	return resp, err
+}
+
 func (a *Agent) nextStreamClient() *http.Client {
 	a.streamMu.RLock()
 	n := uint64(len(a.streamClients))
@@ -265,8 +333,8 @@ func (a *Agent) nextStreamClient() *http.Client {
 	return cli
 }
 
-// streamRotateLoop staggered-rotates data-plane HTTP transports so no single TCP socket
-// stays alive long enough to trigger cross-border ISP per-flow QoS policing, without
+// streamRotateLoop staggered-rotates data-plane and control-plane HTTP transports so no single
+// TCP socket stays alive long enough to trigger cross-border ISP per-flow QoS policing, without
 // ever interrupting in-flight downloads (retired transports drain via CloseIdleConnections).
 func (a *Agent) streamRotateLoop(ctx context.Context) {
 	a.streamMu.RLock()
@@ -296,6 +364,11 @@ func (a *Agent) streamRotateLoop(ctx context.Context) {
 			a.streamClients[idx] = fresh
 			a.streamMu.Unlock()
 			nextShard++
+			if nextShard%shards == 0 {
+				// Proactively rotate control-plane client once per maxAge cycle too so
+				// claim-batch / batch-ack never ride an aged ISP-policed TCP connection.
+				a.rotateAPIClient(nil)
+			}
 
 			if old != nil {
 				if tr, ok := old.Transport.(*http.Transport); ok {
@@ -682,6 +755,15 @@ func (a *Agent) scanProject(ctx context.Context, projectID string) {
 				releaseSlots(reserved)
 				a.invalidateDiscover(projectID)
 				a.logger.Warn("claim from agent-a failed", "a_node", cand.ANodeID, "err", err)
+				// Brief backoff after a transport/timeout failure prevents hammering claim-batch
+				// into an unreachable or slow link and locking out A's entire ready queue.
+				timer := time.NewTimer(1 * time.Second)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return
+				case <-timer.C:
+				}
 				break
 			}
 			if status == http.StatusNoContent || len(claimed) == 0 {
@@ -780,7 +862,7 @@ func (a *Agent) discover(ctx context.Context, projectID string) (*protocol.Disco
 	req.Header.Set(protocol.HeaderNodeID, a.cfg.NodeID)
 	req.Header.Set(protocol.HeaderNodeToken, a.cfg.CenterToken)
 
-	resp, err := a.apiClient.Do(req)
+	resp, err := a.doAPI(req)
 	if err != nil {
 		return nil, err
 	}
@@ -818,7 +900,7 @@ func (a *Agent) claimBatchFromA(ctx context.Context, cand protocol.DiscoverCandi
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+cand.AccessJWT)
 
-	resp, err := a.apiClient.Do(req)
+	resp, err := a.doAPI(req)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -860,7 +942,7 @@ func (a *Agent) claimFromA(ctx context.Context, cand protocol.DiscoverCandidate,
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+cand.AccessJWT)
 
-	resp, err := a.apiClient.Do(req)
+	resp, err := a.doAPI(req)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -1598,12 +1680,14 @@ func (a *Agent) streamOnce(ctx context.Context, dl ActiveDownload, offset int64)
 
 	reqCtx, reqCancel := context.WithCancel(ctx)
 	defer reqCancel()
+	attemptStart := time.Now()
 	var lastActivity atomic.Int64
-	lastActivity.Store(time.Now().UnixNano())
+	var attemptBytes atomic.Int64
+	lastActivity.Store(attemptStart.UnixNano())
 	watchDone := make(chan struct{})
 	defer close(watchDone)
 	go func() {
-		t := time.NewTicker(5 * time.Second)
+		t := time.NewTicker(2 * time.Second)
 		defer t.Stop()
 		for {
 			select {
@@ -1612,9 +1696,17 @@ func (a *Agent) streamOnce(ctx context.Context, dl ActiveDownload, offset int64)
 			case <-reqCtx.Done():
 				return
 			case <-t.C:
-				if time.Since(time.Unix(0, lastActivity.Load())) > 20*time.Second {
+				if time.Since(time.Unix(0, lastActivity.Load())) > 8*time.Second {
 					reqCancel()
 					return
+				}
+				if a.limiter == nil {
+					if elapsed := time.Since(attemptStart); elapsed > 8*time.Second {
+						if float64(attemptBytes.Load())/elapsed.Seconds() < 150*1024 {
+							reqCancel()
+							return
+						}
+					}
 				}
 			}
 		}
@@ -1667,9 +1759,15 @@ func (a *Agent) streamOnce(ctx context.Context, dl ActiveDownload, offset int64)
 		hasher = h
 	}
 
+	syncPartOnErr := func() {
+		if a.cfg.AckBatchIntervalMs <= 0 {
+			_ = f.Sync()
+		}
+	}
+
 	for {
 		if err := reqCtx.Err(); err != nil {
-			_ = f.Sync()
+			syncPartOnErr()
 			return written, "", resp.StatusCode, err
 		}
 		nr, rErr := resp.Body.Read(buf)
@@ -1677,7 +1775,7 @@ func (a *Agent) streamOnce(ctx context.Context, dl ActiveDownload, offset int64)
 			lastActivity.Store(time.Now().UnixNano())
 			if a.limiter != nil {
 				if err := a.limiter.Wait(reqCtx, nr); err != nil {
-					_ = f.Sync()
+					syncPartOnErr()
 					return written, "", resp.StatusCode, err
 				}
 			}
@@ -1687,13 +1785,14 @@ func (a *Agent) streamOnce(ctx context.Context, dl ActiveDownload, offset int64)
 					_, _ = hasher.Write(buf[:nw])
 				}
 				written += int64(nw)
+				attemptBytes.Add(int64(nw))
 			}
 			if wErr != nil {
-				_ = f.Sync()
+				syncPartOnErr()
 				return written, "", resp.StatusCode, wErr
 			}
 			if nw != nr {
-				_ = f.Sync()
+				syncPartOnErr()
 				return written, "", resp.StatusCode, io.ErrShortWrite
 			}
 		}
@@ -1745,7 +1844,7 @@ func (a *Agent) leaseRenewLoop(ctx context.Context, dl *ActiveDownload) {
 			}
 			req.Header.Set("Content-Type", "application/json")
 			req.Header.Set(protocol.HeaderLeaseToken, dl.LeaseToken)
-			resp, err := a.apiClient.Do(req)
+			resp, err := a.doAPI(req)
 			if err == nil {
 				_ = resp.Body.Close()
 			}
@@ -1768,7 +1867,7 @@ func (a *Agent) sendAck(ctx context.Context, ack PendingAck) error {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set(protocol.HeaderLeaseToken, ack.LeaseToken)
 
-	resp, err := a.apiClient.Do(req)
+	resp, err := a.doAPI(req)
 	if err != nil {
 		return err
 	}
@@ -1793,7 +1892,7 @@ func (a *Agent) sendNack(ctx context.Context, dl ActiveDownload, reason string) 
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set(protocol.HeaderLeaseToken, dl.LeaseToken)
-	resp, err := a.apiClient.Do(req)
+	resp, err := a.doAPI(req)
 	if err != nil {
 		return err
 	}
@@ -1845,7 +1944,7 @@ func (a *Agent) sendBatchAck(ctx context.Context, publicAddr string, acks []Pend
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := a.apiClient.Do(req)
+	resp, err := a.doAPI(req)
 	if err != nil {
 		return nil, false, err
 	}
@@ -1881,20 +1980,38 @@ func (a *Agent) flushPendingAcks(ctx context.Context) {
 	}
 
 	// Ensure every destination filesystem containing newly landed files is durably flushed
-	// (SyncFS flushes ALL dirty data, inodes, and atomic renames on the mount in one barrier)
-	// BEFORE confirming batch-ack to Agent A ("没落盘的不准删").
-	syncedDirs := make(map[string]bool)
-	failedDirs := make(map[string]bool)
+	// in parallel across mounts (SyncFS flushes ALL dirty data, inodes, and atomic renames
+	// on each mount in one barrier) BEFORE confirming batch-ack to Agent A ("没落盘的不准删").
+	uniqueDirs := make([]string, 0, 4)
+	seenDirs := make(map[string]struct{}, 4)
 	for _, ak := range acks {
-		if ak.DestDir == "" || syncedDirs[ak.DestDir] || failedDirs[ak.DestDir] {
+		if ak.DestDir == "" {
 			continue
 		}
-		if err := transfer.SyncFS(ak.DestDir); err != nil {
-			a.logger.Warn("syncfs dest dir failed, deferring ACK", "dir", ak.DestDir, "err", err)
-			failedDirs[ak.DestDir] = true
-		} else {
-			syncedDirs[ak.DestDir] = true
+		if _, ok := seenDirs[ak.DestDir]; !ok {
+			seenDirs[ak.DestDir] = struct{}{}
+			uniqueDirs = append(uniqueDirs, ak.DestDir)
 		}
+	}
+	failedDirs := make(map[string]bool)
+	if len(uniqueDirs) > 0 {
+		var (
+			syncWG sync.WaitGroup
+			failMu sync.Mutex
+		)
+		for _, dir := range uniqueDirs {
+			syncWG.Add(1)
+			go func(d string) {
+				defer syncWG.Done()
+				if err := transfer.SyncFS(d); err != nil {
+					a.logger.Warn("syncfs dest dir failed, deferring ACK", "dir", d, "err", err)
+					failMu.Lock()
+					failedDirs[d] = true
+					failMu.Unlock()
+				}
+			}(dir)
+		}
+		syncWG.Wait()
 	}
 
 	// Group durable ACKs by Agent A address.
@@ -2014,7 +2131,7 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 	req.Header.Set(protocol.HeaderNodeID, a.cfg.NodeID)
 	req.Header.Set(protocol.HeaderNodeToken, a.cfg.CenterToken)
 
-	resp, err := a.apiClient.Do(req)
+	resp, err := a.doAPI(req)
 	if err != nil {
 		return
 	}
