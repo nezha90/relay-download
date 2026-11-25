@@ -17,7 +17,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const BufSize = 512 * 1024 // 512 KiB fixed streaming buffer tuned for 1 Gbps WAN streams
+const BufSize = 1024 * 1024 // 1 MiB fixed streaming buffer tuned for 10 Gbps WAN streams
 
 var bufPool = sync.Pool{
 	New: func() any {

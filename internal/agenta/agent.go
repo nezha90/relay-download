@@ -191,7 +191,7 @@ func (a *Agent) Start(ctx context.Context) error {
 		TLSConfig:         serverTLS,
 		ReadHeaderTimeout: 30 * time.Second,
 		HTTP2: &http.HTTP2Config{
-			MaxConcurrentStreams:          256,
+			MaxConcurrentStreams:          1024,
 			MaxReadFrameSize:              1 << 20,
 			MaxReceiveBufferPerConnection: 3 << 20,
 			MaxReceiveBufferPerStream:     3 << 20,
@@ -1237,8 +1237,8 @@ func (a *Agent) handleClaimBatch(w http.ResponseWriter, r *http.Request) {
 	if maxCount <= 0 {
 		maxCount = 16
 	}
-	if maxCount > 128 {
-		maxCount = 128
+	if maxCount > 256 {
+		maxCount = 256
 	}
 	recs, err := a.store.ClaimBatch(req.ProjectID, req.BNodeID, req.AvailableDiskBytes, leaseTTL, maxCount)
 	if errors.Is(err, ErrNoReadyFile) {
@@ -1522,8 +1522,8 @@ func (a *Agent) handleBatchAck(w http.ResponseWriter, r *http.Request) {
 		protocol.WriteError(w, http.StatusBadRequest, "b_node_id and non-empty items are required")
 		return
 	}
-	if len(req.Items) > 256 {
-		protocol.WriteError(w, http.StatusBadRequest, "batch-ack accepts at most 256 items")
+	if len(req.Items) > 512 {
+		protocol.WriteError(w, http.StatusBadRequest, "batch-ack accepts at most 512 items")
 		return
 	}
 

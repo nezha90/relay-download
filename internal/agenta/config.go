@@ -79,7 +79,7 @@ func (c *Config) ApplyDefaults() {
 		c.HeartbeatIntervalSec = 5
 	}
 	if c.DeleteBatchSize <= 0 {
-		c.DeleteBatchSize = 200
+		c.DeleteBatchSize = 500
 	}
 }
 

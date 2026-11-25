@@ -403,3 +403,90 @@ func TestHTTPPutBatchClaimBatchAckDelayedDeleteAndMultiDiskAffinity(t *testing.T
 		}
 	}
 }
+
+func Test10GbpsH1StreamProtocolAndPipelinedChunkedHash(t *testing.T) {
+	env := newTestEnv(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	const proj = "ten-gbps-proj"
+	env.createProject(proj, protocol.ConflictOverwrite, 60)
+
+	agA, aLocalURL, aLocalTok := env.startAgentA(ctx, "a-10g", []string{proj}, 60, 0)
+	_ = agA
+
+	bTok := auth.GenerateRandomToken(16)
+	if err := env.centerSrv.Store().UpsertNode(ctx, protocol.NodeRecord{
+		ID:       "b-10g",
+		Name:     "10G B",
+		Role:     protocol.RoleAgentB,
+		Projects: []string{proj},
+	}, bTok); err != nil {
+		t.Fatalf("UpsertNode b-10g: %v", err)
+	}
+	destDir := filepath.Join(env.dir, "dest-10g")
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	agB, err := agentb.New(&agentb.Config{
+		NodeID:               "b-10g",
+		NodeName:             "10G B",
+		CenterURL:            env.centerURL,
+		CenterToken:          bTok,
+		CACert:               env.caCert,
+		Projects:             map[string]string{proj: destDir},
+		StateDir:             filepath.Join(env.dir, "state-10g"),
+		MaxConcurrent:        4,
+		StreamProtocol:       "h1",
+		StreamConns:          16,
+		MaxTotalStreams:      32,
+		ChunkConcurrency:     6,
+		ChunkSizeMB:          1,
+		ChunkThresholdMB:     2,
+		ClaimBatchSize:       8,
+		AckBatchIntervalMs:   150,
+		PollIntervalSec:      1,
+		HeartbeatIntervalSec: 1,
+	}, logger)
+	if err != nil {
+		t.Fatalf("new agent-b h1: %v", err)
+	}
+	bDone := make(chan error, 1)
+	go func() { bDone <- agB.Start(ctx) }()
+	defer func() {
+		cancel()
+		<-bDone
+	}()
+
+	// Upload a 6.5 MiB file via HTTP PUT (triggers 7 parallel 1 MiB range chunks + pipelined prefix SHA256 over TLS 1.3 H1!).
+	payload, wantSHA := randBytes(t, (6<<20)+(512<<10))
+	req, err := http.NewRequest(http.MethodPut, aLocalURL+"/local/v1/files/"+proj+"/large_asset.opus", bytes.NewReader(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set(protocol.HeaderLocalToken, aLocalTok)
+	req.Header.Set(protocol.HeaderExpectedSHA256, wantSHA)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("PUT large_asset.opus failed: err=%v resp=%v", err, resp)
+	}
+	_ = resp.Body.Close()
+
+	target := filepath.Join(destDir, "large_asset.opus")
+	waitUntil(t, 15*time.Second, func() bool {
+		st, err := os.Stat(target)
+		return err == nil && st.Size() == int64(len(payload))
+	}, "6.5MiB chunked TLS 1.3 H1 file landed")
+
+	gotBytes, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("read target: %v", err)
+	}
+	gotSum := sha256.Sum256(gotBytes)
+	if hex.EncodeToString(gotSum[:]) != wantSHA {
+		t.Fatalf("SHA256 mismatch on pipelined H1 chunked download")
+	}
+	// Verify Agent A drained its ready dir cleanly after batch ACK.
+	waitUntil(t, 10*time.Second, func() bool {
+		entries, _ := os.ReadDir(filepath.Join(env.dir, "data-a-10g", "ready"))
+		return len(entries) == 0
+	}, "a-10g drained spool after H1 chunked ACK")
+}

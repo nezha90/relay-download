@@ -45,6 +45,19 @@ type FileRecord struct {
 	RetryCount     int        `json:"retry_count"`
 }
 
+func cloneFileRecord(r FileRecord) FileRecord {
+	cp := r
+	if r.LeaseExpiresAt != nil {
+		t := *r.LeaseExpiresAt
+		cp.LeaseExpiresAt = &t
+	}
+	if r.NextRetryAt != nil {
+		t := *r.NextRetryAt
+		cp.NextRetryAt = &t
+	}
+	return cp
+}
+
 type deletedEntry struct {
 	leaseID        string
 	leaseTokenHash string
@@ -53,7 +66,12 @@ type deletedEntry struct {
 }
 
 type Store struct {
-	db          *bolt.DB
+	db      *bolt.DB
+	claimMu sync.Mutex
+
+	idxMu   sync.RWMutex
+	records map[string]FileRecord
+
 	mu          sync.Mutex
 	deleted     map[string]deletedEntry
 	deletedList []string
@@ -67,12 +85,24 @@ func OpenStore(dbPath string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open agent-a boltdb: %w", err)
 	}
+	records := make(map[string]FileRecord)
 	err = db.Update(func(tx *bolt.Tx) error {
-		if _, err := tx.CreateBucketIfNotExists(bucketFiles); err != nil {
+		b, err := tx.CreateBucketIfNotExists(bucketFiles)
+		if err != nil {
 			return err
 		}
-		_, err := tx.CreateBucketIfNotExists(bucketPendingEvents)
-		return err
+		if _, err := tx.CreateBucketIfNotExists(bucketPendingEvents); err != nil {
+			return err
+		}
+		// Hydrate synchronized in-memory index once at startup for O(1) 10Gbps hot-path reads.
+		c := b.Cursor()
+		for k, v := c.First(); k != nil; k, v = c.Next() {
+			var rec FileRecord
+			if err := json.Unmarshal(v, &rec); err == nil && rec.FileID != "" {
+				records[rec.FileID] = rec
+			}
+		}
+		return nil
 	})
 	if err != nil {
 		_ = db.Close()
@@ -80,6 +110,7 @@ func OpenStore(dbPath string) (*Store, error) {
 	}
 	return &Store{
 		db:      db,
+		records: records,
 		deleted: make(map[string]deletedEntry),
 	}, nil
 }
@@ -112,13 +143,19 @@ func (s *Store) PutReady(rec FileRecord, ev *protocol.SummaryEvent) error {
 	if err != nil {
 		return err
 	}
-	// Use db.Batch so concurrent PUT uploads coalesce into a single BoltDB fsync while preserving full durability.
-	return s.db.Batch(func(tx *bolt.Tx) error {
+	// Use db.Batch so concurrent PUT uploads coalesce into a single BoltDB fsync while preserving ACID durability.
+	if err := s.db.Batch(func(tx *bolt.Tx) error {
 		if err := tx.Bucket(bucketFiles).Put([]byte(rec.FileID), raw); err != nil {
 			return err
 		}
 		return putPendingEventTx(tx, ev)
-	})
+	}); err != nil {
+		return err
+	}
+	s.idxMu.Lock()
+	s.records[rec.FileID] = cloneFileRecord(rec)
+	s.idxMu.Unlock()
+	return nil
 }
 
 func (s *Store) PutReadyBatch(recs []FileRecord, evs []*protocol.SummaryEvent) error {
@@ -126,7 +163,8 @@ func (s *Store) PutReadyBatch(recs []FileRecord, evs []*protocol.SummaryEvent) e
 		return nil
 	}
 	now := time.Now().UTC()
-	return s.db.Update(func(tx *bolt.Tx) error {
+	prepared := make([]FileRecord, len(recs))
+	err := s.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketFiles)
 		for i := range recs {
 			rec := recs[i]
@@ -145,6 +183,7 @@ func (s *Store) PutReadyBatch(recs []FileRecord, evs []*protocol.SummaryEvent) e
 			if err := b.Put([]byte(rec.FileID), raw); err != nil {
 				return err
 			}
+			prepared[i] = rec
 		}
 		for _, ev := range evs {
 			if err := putPendingEventTx(tx, ev); err != nil {
@@ -153,102 +192,103 @@ func (s *Store) PutReadyBatch(recs []FileRecord, evs []*protocol.SummaryEvent) e
 		}
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	s.idxMu.Lock()
+	for _, rec := range prepared {
+		s.records[rec.FileID] = cloneFileRecord(rec)
+	}
+	s.idxMu.Unlock()
+	return nil
 }
 
+// Get returns a file record in O(1) directly from the synchronized in-memory index.
 func (s *Store) Get(fileID string) (*FileRecord, error) {
-	var rec FileRecord
-	err := s.db.View(func(tx *bolt.Tx) error {
-		raw := tx.Bucket(bucketFiles).Get([]byte(fileID))
-		if raw == nil {
-			return ErrFileNotFound
-		}
-		return json.Unmarshal(raw, &rec)
-	})
-	if err != nil {
-		return nil, err
+	s.idxMu.RLock()
+	rec, ok := s.records[fileID]
+	s.idxMu.RUnlock()
+	if !ok {
+		return nil, ErrFileNotFound
 	}
-	return &rec, nil
+	cp := cloneFileRecord(rec)
+	return &cp, nil
 }
 
 // ClaimNext atomically picks the oldest READY file for projectID that fits availDiskBytes
 // and transitions it to CLAIMED with a fresh lease.
 func (s *Store) ClaimNext(projectID, bNodeID string, availDiskBytes uint64, leaseTTL time.Duration) (*FileRecord, error) {
-	var chosen *FileRecord
-	now := time.Now().UTC()
-	err := s.db.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket(bucketFiles)
-		c := b.Cursor()
-		for k, v := c.First(); k != nil; k, v = c.Next() {
-			var rec FileRecord
-			if err := json.Unmarshal(v, &rec); err != nil {
-				continue
-			}
-			if rec.ProjectID != projectID {
-				continue
-			}
-			// Also allow reclaiming an already-expired lease atomically.
-			isReady := rec.Status == protocol.FileStatusReady && (rec.NextRetryAt == nil || !rec.NextRetryAt.After(now))
-			if !isReady && rec.Status == protocol.FileStatusClaimed && rec.LeaseExpiresAt != nil && !rec.LeaseExpiresAt.After(now) {
-				isReady = true
-				rec.RetryCount++
-			}
-			if !isReady {
-				continue
-			}
-			if availDiskBytes > 0 && uint64(rec.Size) > availDiskBytes {
-				continue
-			}
-			if chosen == nil || rec.UploadedAt.Before(chosen.UploadedAt) {
-				cp := rec
-				chosen = &cp
-			}
-		}
-		if chosen == nil {
-			return ErrNoReadyFile
-		}
-		exp := now.Add(leaseTTL)
-		chosen.Status = protocol.FileStatusClaimed
-		chosen.ClaimedBy = bNodeID
-		chosen.LeaseID = uuid.NewString()
-		chosen.LeaseToken = auth.GenerateRandomToken(24)
-		chosen.LeaseTTLSec = int(leaseTTL / time.Second)
-		chosen.LeaseExpiresAt = &exp
-		chosen.NextRetryAt = nil
-
-		raw, err := json.Marshal(chosen)
-		if err != nil {
-			return err
-		}
-		return b.Put([]byte(chosen.FileID), raw)
-	})
+	recs, err := s.ClaimBatch(projectID, bNodeID, availDiskBytes, leaseTTL, 1)
 	if err != nil {
 		return nil, err
 	}
-	return chosen, nil
+	cp := cloneFileRecord(recs[0])
+	return &cp, nil
 }
 
-// ClaimBatch atomically picks up to maxCount oldest READY (or expired-lease) files for projectID
-// whose cumulative size fits within availDiskBytes (when > 0) and transitions them to CLAIMED
-// in a single BoltDB write transaction.
+// ClaimBatch selects up to maxCount oldest eligible files from the in-memory index in microseconds
+// and persists ONLY the claimed records in a single BoltDB write transaction.
 func (s *Store) ClaimBatch(projectID, bNodeID string, availDiskBytes uint64, leaseTTL time.Duration, maxCount int) ([]FileRecord, error) {
 	if maxCount <= 0 {
 		maxCount = 1
 	}
-	if maxCount > 128 {
-		maxCount = 128
+	if maxCount > 256 {
+		maxCount = 256
 	}
-	var chosen []FileRecord
+
+	s.claimMu.Lock()
+	defer s.claimMu.Unlock()
+
 	now := time.Now().UTC()
+	// Snapshot eligible candidates from RAM without touching BoltDB.
+	s.idxMu.RLock()
+	var candidates []FileRecord
+	for _, rec := range s.records {
+		if rec.ProjectID != projectID {
+			continue
+		}
+		isReady := rec.Status == protocol.FileStatusReady && (rec.NextRetryAt == nil || !rec.NextRetryAt.After(now))
+		if !isReady && rec.Status == protocol.FileStatusClaimed && rec.LeaseExpiresAt != nil && !rec.LeaseExpiresAt.After(now) {
+			isReady = true
+		}
+		if !isReady {
+			continue
+		}
+		if availDiskBytes > 0 && uint64(rec.Size) > availDiskBytes {
+			continue
+		}
+		candidates = append(candidates, cloneFileRecord(rec))
+	}
+	s.idxMu.RUnlock()
+
+	if len(candidates) == 0 {
+		return nil, ErrNoReadyFile
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].UploadedAt.Equal(candidates[j].UploadedAt) {
+			return candidates[i].FileID < candidates[j].FileID
+		}
+		return candidates[i].UploadedAt.Before(candidates[j].UploadedAt)
+	})
+
+	var chosen []FileRecord
+	exp := now.Add(leaseTTL)
+	ttlSec := int(leaseTTL / time.Second)
+	remainingBudget := availDiskBytes
+
 	err := s.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketFiles)
-		c := b.Cursor()
-		var candidates []FileRecord
-		for k, v := c.First(); k != nil; k, v = c.Next() {
-			var rec FileRecord
-			if err := json.Unmarshal(v, &rec); err != nil {
+		for _, cand := range candidates {
+			if len(chosen) >= maxCount {
+				break
+			}
+			// Re-verify latest durable state inside tx in case Ack/Delete raced before claimMu.
+			raw := b.Get([]byte(cand.FileID))
+			if raw == nil {
 				continue
 			}
-			if rec.ProjectID != projectID {
+			var rec FileRecord
+			if err := json.Unmarshal(raw, &rec); err != nil {
 				continue
 			}
 			isReady := rec.Status == protocol.FileStatusReady && (rec.NextRetryAt == nil || !rec.NextRetryAt.After(now))
@@ -259,48 +299,27 @@ func (s *Store) ClaimBatch(projectID, bNodeID string, availDiskBytes uint64, lea
 			if !isReady {
 				continue
 			}
-			if availDiskBytes > 0 && uint64(rec.Size) > availDiskBytes {
-				continue
-			}
-			candidates = append(candidates, rec)
-		}
-		if len(candidates) == 0 {
-			return ErrNoReadyFile
-		}
-		sort.Slice(candidates, func(i, j int) bool {
-			if candidates[i].UploadedAt.Equal(candidates[j].UploadedAt) {
-				return candidates[i].FileID < candidates[j].FileID
-			}
-			return candidates[i].UploadedAt.Before(candidates[j].UploadedAt)
-		})
-
-		remainingBudget := availDiskBytes
-		exp := now.Add(leaseTTL)
-		ttlSec := int(leaseTTL / time.Second)
-		for i := range candidates {
-			if len(chosen) >= maxCount {
-				break
-			}
-			rec := candidates[i]
 			if availDiskBytes > 0 {
 				if uint64(rec.Size) > remainingBudget {
 					continue
 				}
 				remainingBudget -= uint64(rec.Size)
 			}
+
 			rec.Status = protocol.FileStatusClaimed
 			rec.ClaimedBy = bNodeID
 			rec.LeaseID = uuid.NewString()
 			rec.LeaseToken = auth.GenerateRandomToken(24)
 			rec.LeaseTTLSec = ttlSec
-			rec.LeaseExpiresAt = &exp
+			e := exp
+			rec.LeaseExpiresAt = &e
 			rec.NextRetryAt = nil
 
-			raw, err := json.Marshal(&rec)
+			out, err := json.Marshal(&rec)
 			if err != nil {
 				return err
 			}
-			if err := b.Put([]byte(rec.FileID), raw); err != nil {
+			if err := b.Put([]byte(rec.FileID), out); err != nil {
 				return err
 			}
 			chosen = append(chosen, rec)
@@ -313,9 +332,16 @@ func (s *Store) ClaimBatch(projectID, bNodeID string, availDiskBytes uint64, lea
 	if err != nil {
 		return nil, err
 	}
+
+	s.idxMu.Lock()
+	for _, rec := range chosen {
+		s.records[rec.FileID] = cloneFileRecord(rec)
+	}
+	s.idxMu.Unlock()
 	return chosen, nil
 }
 
+// VerifyActiveLease checks the lease in O(1) from RAM — zero BoltDB reads on 10Gbps range streams.
 func (s *Store) VerifyActiveLease(fileID, leaseToken string) (*FileRecord, error) {
 	rec, err := s.Get(fileID)
 	if err != nil {
@@ -332,9 +358,25 @@ func (s *Store) VerifyActiveLease(fileID, leaseToken string) (*FileRecord, error
 }
 
 func (s *Store) RenewLease(fileID, leaseID, leaseToken, bNodeID string, leaseTTL time.Duration) (time.Time, error) {
-	var newExp time.Time
 	now := time.Now().UTC()
-	err := s.db.Update(func(tx *bolt.Tx) error {
+	// Fast O(1) RAM rejection for invalid/expired leases before hitting BoltDB.
+	s.idxMu.RLock()
+	cur, ok := s.records[fileID]
+	s.idxMu.RUnlock()
+	if !ok {
+		return time.Time{}, ErrFileNotFound
+	}
+	if cur.Status != protocol.FileStatusClaimed || cur.LeaseExpiresAt == nil || !cur.LeaseExpiresAt.After(now) ||
+		!auth.EqualConstantTime(leaseToken, cur.LeaseToken) ||
+		(leaseID != "" && cur.LeaseID != leaseID) ||
+		(bNodeID != "" && cur.ClaimedBy != bNodeID) {
+		return time.Time{}, ErrLeaseInvalid
+	}
+
+	var newExp time.Time
+	var updated FileRecord
+	// Coalesce concurrent 10Gbps lease renewals via db.Batch.
+	err := s.db.Batch(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketFiles)
 		raw := b.Get([]byte(fileID))
 		if raw == nil {
@@ -357,14 +399,28 @@ func (s *Store) RenewLease(fileID, leaseID, leaseToken, bNodeID string, leaseTTL
 			return ErrLeaseInvalid
 		}
 		newExp = now.Add(leaseTTL)
-		rec.LeaseExpiresAt = &newExp
+		e := newExp
+		rec.LeaseExpiresAt = &e
 		out, err := json.Marshal(rec)
 		if err != nil {
 			return err
 		}
-		return b.Put([]byte(fileID), out)
+		if err := b.Put([]byte(fileID), out); err != nil {
+			return err
+		}
+		updated = rec
+		return nil
 	})
-	return newExp, err
+	if err != nil {
+		return time.Time{}, err
+	}
+
+	s.idxMu.Lock()
+	if existing, ok := s.records[fileID]; ok && existing.LeaseID == updated.LeaseID {
+		s.records[fileID] = cloneFileRecord(updated)
+	}
+	s.idxMu.Unlock()
+	return newExp, nil
 }
 
 func (s *Store) IsRecentlyDeletedFor(fileID, leaseID, leaseToken, bNodeID string) bool {
@@ -418,7 +474,6 @@ func (s *Store) BatchAckAndRemove(
 	}
 	var verified []verifiedItem
 
-	// Pre-populate already_deleted hits before acquiring BoltDB write lock.
 	needTx := false
 	for i, it := range items {
 		results[i].FileID = it.FileID
@@ -500,9 +555,16 @@ func (s *Store) BatchAckAndRemove(
 	}
 
 	deletedRecs := make([]FileRecord, 0, len(verified))
-	for _, v := range verified {
-		s.markDeleted(v.rec.FileID, v.leaseID, v.leaseToken, bNodeID)
-		deletedRecs = append(deletedRecs, v.rec)
+	if len(verified) > 0 {
+		s.idxMu.Lock()
+		for _, v := range verified {
+			delete(s.records, v.rec.FileID)
+		}
+		s.idxMu.Unlock()
+		for _, v := range verified {
+			s.markDeleted(v.rec.FileID, v.leaseID, v.leaseToken, bNodeID)
+			deletedRecs = append(deletedRecs, v.rec)
+		}
 	}
 	return results, deletedRecs, nil
 }
@@ -552,6 +614,9 @@ func (s *Store) AckAndRemove(fileID, leaseID, leaseToken, bNodeID, sha256Hex str
 		}
 		return nil, false, err
 	}
+	s.idxMu.Lock()
+	delete(s.records, fileID)
+	s.idxMu.Unlock()
 	s.markDeleted(fileID, leaseID, leaseToken, bNodeID)
 	return &deletedRec, false, nil
 }
@@ -606,17 +671,41 @@ func (s *Store) Nack(fileID, leaseID, leaseToken, bNodeID string, buildEvent fun
 	if err != nil {
 		return nil, err
 	}
+	s.idxMu.Lock()
+	s.records[fileID] = cloneFileRecord(rec)
+	s.idxMu.Unlock()
 	return &rec, nil
 }
 
+// ReapExpiredLeases checks the in-memory index first and skips BoltDB entirely when nothing expired.
 func (s *Store) ReapExpiredLeases(now time.Time) (int, error) {
+	s.idxMu.RLock()
+	var expiredIDs []string
+	for id, rec := range s.records {
+		if (rec.Status == protocol.FileStatusClaimed && rec.LeaseExpiresAt != nil && !rec.LeaseExpiresAt.After(now)) ||
+			(rec.Status == protocol.FileStatusReady && rec.NextRetryAt != nil && !rec.NextRetryAt.After(now)) {
+			expiredIDs = append(expiredIDs, id)
+		}
+	}
+	s.idxMu.RUnlock()
+	if len(expiredIDs) == 0 {
+		return 0, nil
+	}
+
+	s.claimMu.Lock()
+	defer s.claimMu.Unlock()
+
 	reaped := 0
+	updated := make([]FileRecord, 0, len(expiredIDs))
 	err := s.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketFiles)
-		c := b.Cursor()
-		for k, v := c.First(); k != nil; k, v = c.Next() {
+		for _, id := range expiredIDs {
+			raw := b.Get([]byte(id))
+			if raw == nil {
+				continue
+			}
 			var rec FileRecord
-			if err := json.Unmarshal(v, &rec); err != nil {
+			if err := json.Unmarshal(raw, &rec); err != nil {
 				continue
 			}
 			changed := false
@@ -639,15 +728,28 @@ func (s *Store) ReapExpiredLeases(now time.Time) (int, error) {
 				if err != nil {
 					return err
 				}
-				if err := b.Put(k, out); err != nil {
+				if err := b.Put([]byte(id), out); err != nil {
 					return err
 				}
+				updated = append(updated, rec)
 				reaped++
 			}
 		}
 		return nil
 	})
-	return reaped, err
+	if err != nil {
+		return 0, err
+	}
+	if len(updated) > 0 {
+		s.idxMu.Lock()
+		for _, rec := range updated {
+			if _, ok := s.records[rec.FileID]; ok {
+				s.records[rec.FileID] = cloneFileRecord(rec)
+			}
+		}
+		s.idxMu.Unlock()
+	}
+	return reaped, nil
 }
 
 func (s *Store) ListLive(projectFilter string) ([]protocol.LiveFileItem, error) {
@@ -656,35 +758,28 @@ func (s *Store) ListLive(projectFilter string) ([]protocol.LiveFileItem, error) 
 }
 
 func (s *Store) ListLiveLimit(projectFilter string, limit int) ([]protocol.LiveFileItem, int, bool, error) {
-	items := make([]protocol.LiveFileItem, 0)
-	err := s.db.View(func(tx *bolt.Tx) error {
-		c := tx.Bucket(bucketFiles).Cursor()
-		for k, v := c.First(); k != nil; k, v = c.Next() {
-			var rec FileRecord
-			if err := json.Unmarshal(v, &rec); err != nil {
-				continue
-			}
-			if projectFilter != "" && rec.ProjectID != projectFilter {
-				continue
-			}
-			items = append(items, protocol.LiveFileItem{
-				FileID:         rec.FileID,
-				ProjectID:      rec.ProjectID,
-				Filename:       rec.Filename,
-				Size:           rec.Size,
-				SHA256:         rec.SHA256,
-				Status:         rec.Status,
-				ClaimedBy:      rec.ClaimedBy,
-				LeaseExpiresAt: rec.LeaseExpiresAt,
-				UploadedAt:     rec.UploadedAt,
-				RetryCount:     rec.RetryCount,
-			})
+	s.idxMu.RLock()
+	items := make([]protocol.LiveFileItem, 0, len(s.records))
+	for _, rec := range s.records {
+		if projectFilter != "" && rec.ProjectID != projectFilter {
+			continue
 		}
-		return nil
-	})
-	if err != nil {
-		return nil, 0, false, err
+		cp := cloneFileRecord(rec)
+		items = append(items, protocol.LiveFileItem{
+			FileID:         cp.FileID,
+			ProjectID:      cp.ProjectID,
+			Filename:       cp.Filename,
+			Size:           cp.Size,
+			SHA256:         cp.SHA256,
+			Status:         cp.Status,
+			ClaimedBy:      cp.ClaimedBy,
+			LeaseExpiresAt: cp.LeaseExpiresAt,
+			UploadedAt:     cp.UploadedAt,
+			RetryCount:     cp.RetryCount,
+		})
 	}
+	s.idxMu.RUnlock()
+
 	sort.Slice(items, func(i, j int) bool {
 		return items[i].UploadedAt.Before(items[j].UploadedAt)
 	})
@@ -698,60 +793,46 @@ func (s *Store) ListLiveLimit(projectFilter string, limit int) ([]protocol.LiveF
 }
 
 func (s *Store) ComputeStats(projectFilter string) (readyCount, claimedCount int, readyBytes, claimedBytes int64, err error) {
-	err = s.db.View(func(tx *bolt.Tx) error {
-		c := tx.Bucket(bucketFiles).Cursor()
-		for k, v := c.First(); k != nil; k, v = c.Next() {
-			var rec FileRecord
-			if err := json.Unmarshal(v, &rec); err != nil {
-				continue
-			}
-			if projectFilter != "" && rec.ProjectID != projectFilter {
-				continue
-			}
-			switch rec.Status {
-			case protocol.FileStatusReady:
-				readyCount++
-				readyBytes += rec.Size
-			case protocol.FileStatusClaimed:
-				claimedCount++
-				claimedBytes += rec.Size
-			}
+	s.idxMu.RLock()
+	for _, rec := range s.records {
+		if projectFilter != "" && rec.ProjectID != projectFilter {
+			continue
 		}
-		return nil
-	})
-	return readyCount, claimedCount, readyBytes, claimedBytes, err
+		switch rec.Status {
+		case protocol.FileStatusReady:
+			readyCount++
+			readyBytes += rec.Size
+		case protocol.FileStatusClaimed:
+			claimedCount++
+			claimedBytes += rec.Size
+		}
+	}
+	s.idxMu.RUnlock()
+	return readyCount, claimedCount, readyBytes, claimedBytes, nil
 }
 
 func (s *Store) ComputeAvailability() ([]protocol.ProjectAvailability, error) {
 	byProj := make(map[string]*protocol.ProjectAvailability)
 	now := time.Now().UTC()
-	err := s.db.View(func(tx *bolt.Tx) error {
-		c := tx.Bucket(bucketFiles).Cursor()
-		for k, v := c.First(); k != nil; k, v = c.Next() {
-			var rec FileRecord
-			if err := json.Unmarshal(v, &rec); err != nil {
-				continue
-			}
-			av, ok := byProj[rec.ProjectID]
-			if !ok {
-				av = &protocol.ProjectAvailability{ProjectID: rec.ProjectID}
-				byProj[rec.ProjectID] = av
-			}
-			switch rec.Status {
-			case protocol.FileStatusReady:
-				if rec.NextRetryAt == nil || !rec.NextRetryAt.After(now) {
-					av.ReadyCount++
-					av.ReadyBytes += rec.Size
-				}
-			case protocol.FileStatusClaimed:
-				av.ClaimedCount++
-			}
+	s.idxMu.RLock()
+	for _, rec := range s.records {
+		av, ok := byProj[rec.ProjectID]
+		if !ok {
+			av = &protocol.ProjectAvailability{ProjectID: rec.ProjectID}
+			byProj[rec.ProjectID] = av
 		}
-		return nil
-	})
-	if err != nil {
-		return nil, err
+		switch rec.Status {
+		case protocol.FileStatusReady:
+			if rec.NextRetryAt == nil || !rec.NextRetryAt.After(now) {
+				av.ReadyCount++
+				av.ReadyBytes += rec.Size
+			}
+		case protocol.FileStatusClaimed:
+			av.ClaimedCount++
+		}
 	}
+	s.idxMu.RUnlock()
+
 	res := make([]protocol.ProjectAvailability, 0, len(byProj))
 	for _, v := range byProj {
 		res = append(res, *v)
@@ -763,21 +844,25 @@ func (s *Store) ComputeAvailability() ([]protocol.ProjectAvailability, error) {
 }
 
 func (s *Store) DeleteRecord(fileID string) error {
-	return s.db.Update(func(tx *bolt.Tx) error {
+	if err := s.db.Update(func(tx *bolt.Tx) error {
 		return tx.Bucket(bucketFiles).Delete([]byte(fileID))
-	})
+	}); err != nil {
+		return err
+	}
+	s.idxMu.Lock()
+	delete(s.records, fileID)
+	s.idxMu.Unlock()
+	return nil
 }
 
 func (s *Store) AllFileIDs() (map[string]struct{}, error) {
-	ids := make(map[string]struct{})
-	err := s.db.View(func(tx *bolt.Tx) error {
-		c := tx.Bucket(bucketFiles).Cursor()
-		for k, _ := c.First(); k != nil; k, _ = c.Next() {
-			ids[string(k)] = struct{}{}
-		}
-		return nil
-	})
-	return ids, err
+	s.idxMu.RLock()
+	ids := make(map[string]struct{}, len(s.records))
+	for id := range s.records {
+		ids[id] = struct{}{}
+	}
+	s.idxMu.RUnlock()
+	return ids, nil
 }
 
 func (s *Store) EnqueueEvent(ev protocol.SummaryEvent) error {

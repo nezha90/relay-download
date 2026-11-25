@@ -21,10 +21,11 @@ type Config struct {
 	ProjectDirs          map[string][]string `yaml:"project_dirs,omitempty"` // project_id -> multiple local dest directories for balanced multi-disk placement
 	StateDir             string              `yaml:"state_dir"`
 	MaxConcurrent        int                 `yaml:"max_concurrent"`
-	StreamConns          int                 `yaml:"stream_conns,omitempty"`          // independent TLS 1.3 + HTTP/2 TCP sockets to saturate 1Gbps WAN links
+	StreamProtocol       string              `yaml:"stream_protocol,omitempty"`       // "h2" (default, TLS 1.3 HTTP/2) or "h1" (TLS 1.3 HTTP/1.1, removes 4MiB H2 flow-control cap for 10Gbps)
+	StreamConns          int                 `yaml:"stream_conns,omitempty"`          // independent TLS 1.3 TCP sockets for h2 pool (or idle pool floor for h1)
 	MaxTotalStreams      int                 `yaml:"max_total_streams,omitempty"`     // global cap on simultaneous active HTTP range streams across all workers
 	ChunkConcurrency     int                 `yaml:"chunk_concurrency,omitempty"`     // parallel range streams per large file (<=1 disables chunking)
-	ChunkSizeMB          int                 `yaml:"chunk_size_mb,omitempty"`         // range chunk size in MiB (default 4)
+	ChunkSizeMB          int                 `yaml:"chunk_size_mb,omitempty"`         // range chunk size in MiB (default 4; auto-scales to 16/32MiB for large files)
 	ChunkThresholdMB     int                 `yaml:"chunk_threshold_mb,omitempty"`    // minimum file size in MiB to activate parallel range chunking (default 4)
 	ClaimBatchSize       int                 `yaml:"claim_batch_size,omitempty"`      // max files claimed per RPC
 	AckBatchIntervalMs   int                 `yaml:"ack_batch_interval_ms,omitempty"` // ms to buffer verified on-disk ACKs before batch-ack (<=0 = immediate)
@@ -61,6 +62,10 @@ func (c *Config) ApplyDefaults() {
 	if c.MaxConcurrent <= 0 {
 		c.MaxConcurrent = 3
 	}
+	c.StreamProtocol = strings.ToLower(strings.TrimSpace(c.StreamProtocol))
+	if c.StreamProtocol == "" {
+		c.StreamProtocol = "h2"
+	}
 	if c.StreamConns <= 0 {
 		c.StreamConns = c.MaxConcurrent
 		if c.StreamConns > 8 {
@@ -70,14 +75,14 @@ func (c *Config) ApplyDefaults() {
 			c.StreamConns = 1
 		}
 	}
-	if c.StreamConns > 256 {
-		c.StreamConns = 256
+	if c.StreamConns > 512 {
+		c.StreamConns = 512
 	}
 	if c.ChunkConcurrency < 1 {
 		c.ChunkConcurrency = 1
 	}
-	if c.ChunkConcurrency > 64 {
-		c.ChunkConcurrency = 64
+	if c.ChunkConcurrency > 128 {
+		c.ChunkConcurrency = 128
 	}
 	if c.ChunkSizeMB <= 0 {
 		c.ChunkSizeMB = 4
@@ -87,18 +92,21 @@ func (c *Config) ApplyDefaults() {
 	}
 	if c.MaxTotalStreams <= 0 {
 		c.MaxTotalStreams = c.MaxConcurrent * c.ChunkConcurrency
-		if c.MaxTotalStreams > 256 {
-			c.MaxTotalStreams = 256
+		if c.MaxTotalStreams > 1024 {
+			c.MaxTotalStreams = 1024
 		}
 		if c.MaxTotalStreams < c.MaxConcurrent {
 			c.MaxTotalStreams = c.MaxConcurrent
 		}
 	}
+	if c.MaxTotalStreams > 1024 {
+		c.MaxTotalStreams = 1024
+	}
 	if c.ClaimBatchSize <= 0 {
 		c.ClaimBatchSize = 16
 	}
-	if c.ClaimBatchSize > 128 {
-		c.ClaimBatchSize = 128
+	if c.ClaimBatchSize > 256 {
+		c.ClaimBatchSize = 256
 	}
 	if c.AckBatchSize <= 0 {
 		c.AckBatchSize = 50
@@ -120,6 +128,9 @@ func (c *Config) Validate() error {
 	}
 	if c.CenterToken == "" {
 		return errors.New("center_token is required")
+	}
+	if c.StreamProtocol != "h2" && c.StreamProtocol != "h1" {
+		return fmt.Errorf("stream_protocol must be 'h2' or 'h1' (got %q)", c.StreamProtocol)
 	}
 	if len(c.ProjectIDs()) == 0 {
 		return errors.New("at least one project destination mapping is required")

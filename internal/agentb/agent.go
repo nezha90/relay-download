@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -124,7 +125,7 @@ func New(cfg *Config, logger *slog.Logger) (*Agent, error) {
 		}
 	}
 
-	makeStreamClient := func() *http.Client {
+	makeH2StreamClient := func() *http.Client {
 		return &http.Client{
 			// No overall Timeout on streaming/SSE client; bounded by ctx cancellation.
 			Transport: &http.Transport{
@@ -145,9 +146,37 @@ func New(cfg *Config, logger *slog.Logger) (*Agent, error) {
 		}
 	}
 
-	streamClients := make([]*http.Client, cfg.StreamConns)
-	for i := range streamClients {
-		streamClients[i] = makeStreamClient()
+	var streamClients []*http.Client
+	if cfg.StreamProtocol == "h1" {
+		// Strict TLS 1.3 + HTTP/1.1 data-plane transport: eliminates HTTP/2's 4MiB flow-control cap
+		// and frame-copy overhead so each TCP socket rides the full 64MiB kernel TCP/BBR window for 10Gbps.
+		h1TLS := clientTLS.Clone()
+		h1TLS.NextProtos = []string{"http/1.1"}
+		poolSize := cfg.MaxTotalStreams
+		if cfg.StreamConns > poolSize {
+			poolSize = cfg.StreamConns
+		}
+		if poolSize < 64 {
+			poolSize = 64
+		}
+		streamClients = []*http.Client{{
+			Transport: &http.Transport{
+				TLSClientConfig:     h1TLS,
+				ForceAttemptHTTP2:   false,
+				TLSNextProto:        make(map[string]func(authority string, c *tls.Conn) http.RoundTripper),
+				MaxIdleConns:        poolSize,
+				MaxIdleConnsPerHost: poolSize,
+				IdleConnTimeout:     90 * time.Second,
+				TLSHandshakeTimeout: 10 * time.Second,
+				ReadBufferSize:      1 << 20,
+				WriteBufferSize:     256 << 10,
+			},
+		}}
+	} else {
+		streamClients = make([]*http.Client, cfg.StreamConns)
+		for i := range streamClients {
+			streamClients[i] = makeH2StreamClient()
+		}
 	}
 
 	var limiter *transfer.RateLimiter
@@ -164,11 +193,11 @@ func New(cfg *Config, logger *slog.Logger) (*Agent, error) {
 			Timeout:   20 * time.Second,
 			Transport: makeAPITransport(),
 		},
-		sseClient:     makeStreamClient(),
+		sseClient:     makeH2StreamClient(),
 		streamClients: streamClients,
 		workSem:       make(chan struct{}, cfg.MaxConcurrent),
 		streamSem:     make(chan struct{}, cfg.MaxTotalStreams),
-		wakeupCh:      make(chan string, 128),
+		wakeupCh:      make(chan string, 256),
 		ackWakeCh:     make(chan struct{}, 1),
 		hbWakeCh:      make(chan struct{}, 1),
 		discCache:     make(map[string]cachedDiscover),
@@ -841,7 +870,7 @@ func (a *Agent) runDownload(ctx context.Context, dl ActiveDownload) {
 	}
 
 	if useChunked {
-		statusCode, chunkErr := a.downloadChunked(ctx, dl, prog)
+		pipelinedSHA, statusCode, chunkErr := a.downloadChunked(ctx, dl, prog)
 		if chunkErr != nil {
 			if ctx.Err() != nil {
 				// Preserve .part and .part.bitmap so restart resumes only unfinished chunks!
@@ -859,6 +888,9 @@ func (a *Agent) runDownload(ctx context.Context, dl ActiveDownload) {
 			_ = os.Remove(bitmapPath)
 			useChunked = false
 		} else {
+			if pipelinedSHA != "" {
+				continuousSHA = pipelinedSHA
+			}
 			_ = os.Remove(bitmapPath)
 		}
 	}
@@ -1099,7 +1131,10 @@ func openOrInitChunkBitmap(partPath, bitmapPath string, fileSize, chunkSize int6
 }
 
 func (cb *chunkBitmap) isDone(idx int) bool {
-	return (cb.bits[idx/8] & (1 << uint(idx%8))) != 0
+	cb.mu.Lock()
+	done := (cb.bits[idx/8] & (1 << uint(idx%8))) != 0
+	cb.mu.Unlock()
+	return done
 }
 
 func (cb *chunkBitmap) markDone(idx int) {
@@ -1118,14 +1153,14 @@ func (cb *chunkBitmap) close() {
 	}
 }
 
-func (a *Agent) downloadChunked(ctx context.Context, dl ActiveDownload, prog *activeProgress) (int, error) {
+func (a *Agent) downloadChunked(ctx context.Context, dl ActiveDownload, prog *activeProgress) (string, int, error) {
 	chunkSize := effectiveChunkSize(dl.Size, a.cfg.ChunkSizeMB)
 	numChunks := int((dl.Size + chunkSize - 1) / chunkSize)
 	bitmapPath := dl.PartPath + ".bitmap"
 
 	f, bm, resumed, err := openOrInitChunkBitmap(dl.PartPath, bitmapPath, dl.Size, chunkSize, numChunks)
 	if err != nil {
-		return 0, err
+		return "", 0, err
 	}
 	defer bm.close()
 
@@ -1159,16 +1194,65 @@ func (a *Agent) downloadChunked(ctx context.Context, dl ActiveDownload, prog *ac
 	if pendingCount == 0 {
 		if err := f.Sync(); err != nil {
 			_ = f.Close()
-			return 0, err
+			return "", 0, err
 		}
 		if err := f.Close(); err != nil {
-			return 0, err
+			return "", 0, err
 		}
-		return http.StatusOK, nil
+		return "", http.StatusOK, nil
 	}
 
 	chunkCtx, cancelChunks := context.WithCancel(ctx)
 	defer cancelChunks()
+
+	// Pipelined prefix SHA256 hasher (for fresh downloads): hashes completed sequential prefix chunks
+	// while they are still hot in Linux page cache, avoiding a full 2x disk re-read on 100s-of-GB files!
+	var (
+		hashCh       chan int
+		hashDone     chan struct{}
+		pipelinedSHA string
+		hashErr      error
+	)
+	if !resumed {
+		chCap := numChunks
+		if chCap > 256 {
+			chCap = 256
+		}
+		hashCh = make(chan int, chCap)
+		hashDone = make(chan struct{})
+		go func() {
+			defer close(hashDone)
+			ready := make([]bool, numChunks)
+			nextIdx := 0
+			h := sha256.New()
+			bufPtr := transfer.GetBuf()
+			defer transfer.PutBuf(bufPtr)
+			buf := *bufPtr
+
+			for idx := range hashCh {
+				ready[idx] = true
+				for nextIdx < numChunks && ready[nextIdx] {
+					if chunkCtx.Err() != nil {
+						return
+					}
+					st := int64(nextIdx) * chunkSize
+					ln := chunkSize
+					if st+ln > dl.Size {
+						ln = dl.Size - st
+					}
+					sr := io.NewSectionReader(f, st, ln)
+					if _, err := io.CopyBuffer(h, sr, buf); err != nil {
+						hashErr = err
+						return
+					}
+					nextIdx++
+				}
+			}
+			if nextIdx == numChunks && hashErr == nil {
+				pipelinedSHA = hex.EncodeToString(h.Sum(nil))
+			}
+		}()
+	}
 
 	workers := a.cfg.ChunkConcurrency
 	if workers > pendingCount {
@@ -1226,24 +1310,39 @@ func (a *Agent) downloadChunked(ctx context.Context, dl ActiveDownload, prog *ac
 					return
 				}
 				bm.markDone(rg.idx)
+				if hashCh != nil {
+					select {
+					case hashCh <- rg.idx:
+					case <-chunkCtx.Done():
+					case <-hashDone:
+					}
+				}
 			}
 		}()
 	}
 	wg.Wait()
+	if hashCh != nil {
+		close(hashCh)
+		<-hashDone
+	}
 
 	if firstErr != nil {
 		_ = f.Sync()
 		_ = f.Close()
-		return firstStatus, firstErr
+		return "", firstStatus, firstErr
 	}
 	if err := f.Sync(); err != nil {
 		_ = f.Close()
-		return 0, err
+		return "", 0, err
 	}
 	if err := f.Close(); err != nil {
-		return 0, err
+		return "", 0, err
 	}
-	return http.StatusOK, nil
+	if hashErr != nil {
+		// Fall back safely to post-download full-file HashFile in runDownload.
+		pipelinedSHA = ""
+	}
+	return pipelinedSHA, http.StatusOK, nil
 }
 
 func (a *Agent) fetchRangeWithRetry(ctx context.Context, dl ActiveDownload, f *os.File, start, end int64, prog *activeProgress, completedBytes *atomic.Int64) (int, error) {
