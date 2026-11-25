@@ -9,18 +9,21 @@ build:
 	CGO_ENABLED=0 go build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/relay-center ./cmd/relay-center
 	CGO_ENABLED=0 go build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/relay-agent-a ./cmd/relay-agent-a
 	CGO_ENABLED=0 go build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/relay-agent-b ./cmd/relay-agent-b
+	CGO_ENABLED=0 go build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/relay-s3-feeder ./cmd/relay-s3-feeder
 
 build-linux:
 	@mkdir -p $(BIN_DIR)/linux-amd64
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/linux-amd64/relay-center ./cmd/relay-center
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/linux-amd64/relay-agent-a ./cmd/relay-agent-a
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/linux-amd64/relay-agent-b ./cmd/relay-agent-b
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/linux-amd64/relay-s3-feeder ./cmd/relay-s3-feeder
 
 build-linux-arm64:
 	@mkdir -p $(BIN_DIR)/linux-arm64
 	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/linux-arm64/relay-center ./cmd/relay-center
 	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/linux-arm64/relay-agent-a ./cmd/relay-agent-a
 	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/linux-arm64/relay-agent-b ./cmd/relay-agent-b
+	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/linux-arm64/relay-s3-feeder ./cmd/relay-s3-feeder
 
 test:
 	go test -v -race ./...

@@ -108,16 +108,50 @@ func (s *Store) PutReady(rec FileRecord, ev *protocol.SummaryEvent) error {
 	if rec.UploadedAt.IsZero() {
 		rec.UploadedAt = time.Now().UTC()
 	}
-	return s.db.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket(bucketFiles)
-		raw, err := json.Marshal(rec)
-		if err != nil {
-			return err
-		}
-		if err := b.Put([]byte(rec.FileID), raw); err != nil {
+	raw, err := json.Marshal(rec)
+	if err != nil {
+		return err
+	}
+	// Use db.Batch so concurrent PUT uploads coalesce into a single BoltDB fsync while preserving full durability.
+	return s.db.Batch(func(tx *bolt.Tx) error {
+		if err := tx.Bucket(bucketFiles).Put([]byte(rec.FileID), raw); err != nil {
 			return err
 		}
 		return putPendingEventTx(tx, ev)
+	})
+}
+
+func (s *Store) PutReadyBatch(recs []FileRecord, evs []*protocol.SummaryEvent) error {
+	if len(recs) == 0 {
+		return nil
+	}
+	now := time.Now().UTC()
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketFiles)
+		for i := range recs {
+			rec := recs[i]
+			rec.Status = protocol.FileStatusReady
+			rec.ClaimedBy = ""
+			rec.LeaseID = ""
+			rec.LeaseToken = ""
+			rec.LeaseExpiresAt = nil
+			if rec.UploadedAt.IsZero() {
+				rec.UploadedAt = now
+			}
+			raw, err := json.Marshal(rec)
+			if err != nil {
+				return err
+			}
+			if err := b.Put([]byte(rec.FileID), raw); err != nil {
+				return err
+			}
+		}
+		for _, ev := range evs {
+			if err := putPendingEventTx(tx, ev); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 }
 
@@ -186,6 +220,95 @@ func (s *Store) ClaimNext(projectID, bNodeID string, availDiskBytes uint64, leas
 			return err
 		}
 		return b.Put([]byte(chosen.FileID), raw)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return chosen, nil
+}
+
+// ClaimBatch atomically picks up to maxCount oldest READY (or expired-lease) files for projectID
+// whose cumulative size fits within availDiskBytes (when > 0) and transitions them to CLAIMED
+// in a single BoltDB write transaction.
+func (s *Store) ClaimBatch(projectID, bNodeID string, availDiskBytes uint64, leaseTTL time.Duration, maxCount int) ([]FileRecord, error) {
+	if maxCount <= 0 {
+		maxCount = 1
+	}
+	if maxCount > 64 {
+		maxCount = 64
+	}
+	var chosen []FileRecord
+	now := time.Now().UTC()
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketFiles)
+		c := b.Cursor()
+		var candidates []FileRecord
+		for k, v := c.First(); k != nil; k, v = c.Next() {
+			var rec FileRecord
+			if err := json.Unmarshal(v, &rec); err != nil {
+				continue
+			}
+			if rec.ProjectID != projectID {
+				continue
+			}
+			isReady := rec.Status == protocol.FileStatusReady && (rec.NextRetryAt == nil || !rec.NextRetryAt.After(now))
+			if !isReady && rec.Status == protocol.FileStatusClaimed && rec.LeaseExpiresAt != nil && !rec.LeaseExpiresAt.After(now) {
+				isReady = true
+				rec.RetryCount++
+			}
+			if !isReady {
+				continue
+			}
+			if availDiskBytes > 0 && uint64(rec.Size) > availDiskBytes {
+				continue
+			}
+			candidates = append(candidates, rec)
+		}
+		if len(candidates) == 0 {
+			return ErrNoReadyFile
+		}
+		sort.Slice(candidates, func(i, j int) bool {
+			if candidates[i].UploadedAt.Equal(candidates[j].UploadedAt) {
+				return candidates[i].FileID < candidates[j].FileID
+			}
+			return candidates[i].UploadedAt.Before(candidates[j].UploadedAt)
+		})
+
+		remainingBudget := availDiskBytes
+		exp := now.Add(leaseTTL)
+		ttlSec := int(leaseTTL / time.Second)
+		for i := range candidates {
+			if len(chosen) >= maxCount {
+				break
+			}
+			rec := candidates[i]
+			if availDiskBytes > 0 {
+				if uint64(rec.Size) > remainingBudget {
+					continue
+				}
+				remainingBudget -= uint64(rec.Size)
+			}
+			rec.Status = protocol.FileStatusClaimed
+			rec.ClaimedBy = bNodeID
+			rec.LeaseID = uuid.NewString()
+			rec.LeaseToken = auth.GenerateRandomToken(24)
+			rec.LeaseTTLSec = ttlSec
+			rec.LeaseExpiresAt = &exp
+			rec.NextRetryAt = nil
+
+			raw, err := json.Marshal(&rec)
+			if err != nil {
+				return err
+			}
+			if err := b.Put([]byte(rec.FileID), raw); err != nil {
+				return err
+			}
+			chosen = append(chosen, rec)
+		}
+		if len(chosen) == 0 {
+			return ErrNoReadyFile
+		}
+		return nil
 	})
 	if err != nil {
 		return nil, err
@@ -270,12 +393,118 @@ func (s *Store) markDeleted(fileID, leaseID, leaseToken, bNodeID string) {
 		bNodeID:        bNodeID,
 		deletedAt:      time.Now(),
 	}
-	const maxLRU = 10000
+	const maxLRU = 100000
 	for len(s.deletedList) > maxLRU {
 		oldest := s.deletedList[0]
 		s.deletedList = s.deletedList[1:]
 		delete(s.deleted, oldest)
 	}
+}
+
+// BatchAckAndRemove validates a batch of ACK items in a single BoltDB write transaction.
+// Only items whose lease_id, lease_token, b_node_id, and sha256 ALL match the active record
+// are removed from BoltDB and returned in deletedRecs for spool cleanup.
+func (s *Store) BatchAckAndRemove(
+	bNodeID string,
+	items []protocol.BatchAckItem,
+	removeFile func(fileID string) error,
+	buildEvent func(rec FileRecord, durationMs int64) *protocol.SummaryEvent,
+) ([]protocol.BatchAckItemResult, []FileRecord, error) {
+	results := make([]protocol.BatchAckItemResult, len(items))
+	type verifiedItem struct {
+		rec        FileRecord
+		leaseID    string
+		leaseToken string
+	}
+	var verified []verifiedItem
+
+	// Pre-populate already_deleted hits before acquiring BoltDB write lock.
+	needTx := false
+	for i, it := range items {
+		results[i].FileID = it.FileID
+		if it.FileID == "" || it.LeaseID == "" || it.LeaseToken == "" {
+			results[i].Status = "lease_invalid"
+			results[i].Error = "file_id, lease_id, and lease_token are required"
+			continue
+		}
+		if s.IsRecentlyDeletedFor(it.FileID, it.LeaseID, it.LeaseToken, bNodeID) {
+			results[i].Status = "already_deleted"
+			continue
+		}
+		needTx = true
+	}
+
+	if needTx {
+		err := s.db.Update(func(tx *bolt.Tx) error {
+			b := tx.Bucket(bucketFiles)
+			for i, it := range items {
+				if results[i].Status != "" {
+					continue
+				}
+				raw := b.Get([]byte(it.FileID))
+				if raw == nil {
+					if s.IsRecentlyDeletedFor(it.FileID, it.LeaseID, it.LeaseToken, bNodeID) {
+						results[i].Status = "already_deleted"
+					} else {
+						results[i].Status = "not_found"
+						results[i].Error = "file not found"
+					}
+					continue
+				}
+				var rec FileRecord
+				if err := json.Unmarshal(raw, &rec); err != nil {
+					results[i].Status = "error"
+					results[i].Error = err.Error()
+					continue
+				}
+				if rec.Status != protocol.FileStatusClaimed ||
+					!auth.EqualConstantTime(it.LeaseToken, rec.LeaseToken) ||
+					rec.LeaseID != it.LeaseID ||
+					rec.ClaimedBy != bNodeID {
+					results[i].Status = "lease_invalid"
+					results[i].Error = "lease invalid or expired"
+					continue
+				}
+				if !strings.EqualFold(strings.TrimSpace(it.SHA256), rec.SHA256) {
+					results[i].Status = "checksum_failed"
+					results[i].Error = "sha256 mismatch"
+					continue
+				}
+				if removeFile != nil {
+					if err := removeFile(it.FileID); err != nil {
+						results[i].Status = "error"
+						results[i].Error = err.Error()
+						continue
+					}
+				}
+				if err := b.Delete([]byte(it.FileID)); err != nil {
+					return err
+				}
+				if buildEvent != nil {
+					if err := putPendingEventTx(tx, buildEvent(rec, it.DurationMs)); err != nil {
+						return err
+					}
+				}
+				results[i].Status = "deleted"
+				verified = append(verified, verifiedItem{
+					rec:        rec,
+					leaseID:    it.LeaseID,
+					leaseToken: it.LeaseToken,
+				})
+			}
+			return nil
+		})
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+
+	deletedRecs := make([]FileRecord, 0, len(verified))
+	for _, v := range verified {
+		s.markDeleted(v.rec.FileID, v.leaseID, v.leaseToken, bNodeID)
+		deletedRecs = append(deletedRecs, v.rec)
+	}
+	return results, deletedRecs, nil
 }
 
 // AckAndRemove validates the lease & SHA256, invokes removeFile to unlink the backing file,
@@ -422,6 +651,11 @@ func (s *Store) ReapExpiredLeases(now time.Time) (int, error) {
 }
 
 func (s *Store) ListLive(projectFilter string) ([]protocol.LiveFileItem, error) {
+	items, _, _, err := s.ListLiveLimit(projectFilter, 0)
+	return items, err
+}
+
+func (s *Store) ListLiveLimit(projectFilter string, limit int) ([]protocol.LiveFileItem, int, bool, error) {
 	items := make([]protocol.LiveFileItem, 0)
 	err := s.db.View(func(tx *bolt.Tx) error {
 		c := tx.Bucket(bucketFiles).Cursor()
@@ -449,12 +683,43 @@ func (s *Store) ListLive(projectFilter string) ([]protocol.LiveFileItem, error) 
 		return nil
 	})
 	if err != nil {
-		return nil, err
+		return nil, 0, false, err
 	}
 	sort.Slice(items, func(i, j int) bool {
 		return items[i].UploadedAt.Before(items[j].UploadedAt)
 	})
-	return items, nil
+	total := len(items)
+	truncated := false
+	if limit > 0 && len(items) > limit {
+		items = items[:limit]
+		truncated = true
+	}
+	return items, total, truncated, nil
+}
+
+func (s *Store) ComputeStats(projectFilter string) (readyCount, claimedCount int, readyBytes, claimedBytes int64, err error) {
+	err = s.db.View(func(tx *bolt.Tx) error {
+		c := tx.Bucket(bucketFiles).Cursor()
+		for k, v := c.First(); k != nil; k, v = c.Next() {
+			var rec FileRecord
+			if err := json.Unmarshal(v, &rec); err != nil {
+				continue
+			}
+			if projectFilter != "" && rec.ProjectID != projectFilter {
+				continue
+			}
+			switch rec.Status {
+			case protocol.FileStatusReady:
+				readyCount++
+				readyBytes += rec.Size
+			case protocol.FileStatusClaimed:
+				claimedCount++
+				claimedBytes += rec.Size
+			}
+		}
+		return nil
+	})
+	return readyCount, claimedCount, readyBytes, claimedBytes, err
 }
 
 func (s *Store) ComputeAvailability() ([]protocol.ProjectAvailability, error) {

@@ -30,9 +30,11 @@ type Config struct {
 	MaxDiskUsagePct      float64  `yaml:"max_disk_usage_pct"`
 	MinFreeDiskBytes     uint64   `yaml:"min_free_disk_bytes"`
 	LeaseTTLSec          int      `yaml:"lease_ttl_sec"`
-	MaxConcurrentStreams int      `yaml:"max_concurrent_streams"`
-	RateLimitMBps        float64  `yaml:"rate_limit_mbps"`
-	HeartbeatIntervalSec int      `yaml:"heartbeat_interval_sec"`
+	MaxConcurrentStreams   int      `yaml:"max_concurrent_streams"`
+	RateLimitMBps          float64  `yaml:"rate_limit_mbps"`
+	HeartbeatIntervalSec   int      `yaml:"heartbeat_interval_sec"`
+	DeleteBatchIntervalSec int      `yaml:"delete_batch_interval_sec"` // 0 = immediate unlink on ACK; >0 = batch unlink ACK-verified spool files every N seconds
+	DeleteBatchSize        int      `yaml:"delete_batch_size"`         // flush early once this many ACK-verified files are queued
 }
 
 func LoadConfig(path string) (*Config, error) {
@@ -75,6 +77,9 @@ func (c *Config) ApplyDefaults() {
 	}
 	if c.HeartbeatIntervalSec <= 0 {
 		c.HeartbeatIntervalSec = 5
+	}
+	if c.DeleteBatchSize <= 0 {
+		c.DeleteBatchSize = 200
 	}
 }
 

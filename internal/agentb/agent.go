@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log/slog"
 	"math/rand/v2"
@@ -21,6 +22,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"relay-download/internal/pki"
 	"relay-download/internal/protocol"
@@ -36,13 +39,20 @@ type activeProgress struct {
 	windowStart time.Time
 }
 
+type cachedDiscover struct {
+	resp      *protocol.DiscoverResp
+	expiresAt time.Time
+}
+
 type Agent struct {
-	cfg          *Config
-	store        *Store
-	logger       *slog.Logger
-	apiClient    *http.Client
-	streamClient *http.Client
-	limiter      *transfer.RateLimiter
+	cfg           *Config
+	store         *Store
+	logger        *slog.Logger
+	apiClient     *http.Client
+	sseClient     *http.Client
+	streamClients []*http.Client
+	streamIdx     atomic.Uint64
+	limiter       *transfer.RateLimiter
 
 	workSem   chan struct{}
 	wakeupCh  chan string
@@ -50,11 +60,15 @@ type Agent struct {
 	hbWakeCh  chan struct{}
 	updater   *updater.Updater
 
+	discMu    sync.Mutex
+	discCache map[string]cachedDiscover
+
 	mu       sync.RWMutex
 	progress map[string]*activeProgress
 
-	inBytes      atomic.Int64
-	lastSpeedBps atomic.Int64
+	inBytes         atomic.Int64
+	lastSpeedBps    atomic.Int64
+	pendingAckCount atomic.Int64
 
 	// Optional metrics & test hooks.
 	ResumeCount        atomic.Int64
@@ -77,9 +91,11 @@ func New(cfg *Config, logger *slog.Logger) (*Agent, error) {
 		logger = slog.Default()
 	}
 
-	for proj, dir := range cfg.Projects {
-		if err := os.MkdirAll(filepath.Join(dir, ".relay_tmp"), 0o755); err != nil {
-			return nil, fmt.Errorf("init dest dir for project %s (%s): %w", proj, dir, err)
+	for _, proj := range cfg.ProjectIDs() {
+		for _, dir := range cfg.DestDirsFor(proj) {
+			if err := os.MkdirAll(filepath.Join(dir, ".relay_tmp"), 0o755); err != nil {
+				return nil, fmt.Errorf("init dest dir for project %s (%s): %w", proj, dir, err)
+			}
 		}
 	}
 
@@ -94,7 +110,7 @@ func New(cfg *Config, logger *slog.Logger) (*Agent, error) {
 		return nil, err
 	}
 
-	makeTransport := func() *http.Transport {
+	makeAPITransport := func() *http.Transport {
 		return &http.Transport{
 			TLSClientConfig:       clientTLS.Clone(),
 			ForceAttemptHTTP2:     true,
@@ -104,6 +120,32 @@ func New(cfg *Config, logger *slog.Logger) (*Agent, error) {
 			TLSHandshakeTimeout:   10 * time.Second,
 			ResponseHeaderTimeout: 30 * time.Second,
 		}
+	}
+
+	makeStreamClient := func() *http.Client {
+		return &http.Client{
+			// No overall Timeout on streaming/SSE client; bounded by ctx cancellation.
+			Transport: &http.Transport{
+				TLSClientConfig:     clientTLS.Clone(),
+				ForceAttemptHTTP2:   true,
+				MaxIdleConns:        16,
+				MaxIdleConnsPerHost: 8,
+				IdleConnTimeout:     90 * time.Second,
+				TLSHandshakeTimeout: 10 * time.Second,
+				ReadBufferSize:      1 << 20,
+				WriteBufferSize:     1 << 20,
+				HTTP2: &http.HTTP2Config{
+					MaxReadFrameSize:              1 << 20,
+					MaxReceiveBufferPerConnection: 3 << 20,
+					MaxReceiveBufferPerStream:     3 << 20,
+				},
+			},
+		}
+	}
+
+	streamClients := make([]*http.Client, cfg.StreamConns)
+	for i := range streamClients {
+		streamClients[i] = makeStreamClient()
 	}
 
 	var limiter *transfer.RateLimiter
@@ -118,31 +160,23 @@ func New(cfg *Config, logger *slog.Logger) (*Agent, error) {
 		limiter: limiter,
 		apiClient: &http.Client{
 			Timeout:   20 * time.Second,
-			Transport: makeTransport(),
+			Transport: makeAPITransport(),
 		},
-		// No overall Timeout on streaming/SSE client; bounded by ctx cancellation.
-		streamClient: &http.Client{
-			Transport: &http.Transport{
-				TLSClientConfig:     clientTLS.Clone(),
-				ForceAttemptHTTP2:   true,
-				MaxIdleConns:        32,
-				MaxIdleConnsPerHost: 16,
-				IdleConnTimeout:     90 * time.Second,
-				TLSHandshakeTimeout: 10 * time.Second,
-			},
-		},
-		workSem:   make(chan struct{}, cfg.MaxConcurrent),
-		wakeupCh:  make(chan string, 64),
-		ackWakeCh: make(chan struct{}, 1),
-		hbWakeCh:  make(chan struct{}, 1),
-		progress:  make(map[string]*activeProgress),
+		sseClient:     makeStreamClient(),
+		streamClients: streamClients,
+		workSem:       make(chan struct{}, cfg.MaxConcurrent),
+		wakeupCh:      make(chan string, 128),
+		ackWakeCh:     make(chan struct{}, 1),
+		hbWakeCh:      make(chan struct{}, 1),
+		discCache:     make(map[string]cachedDiscover),
+		progress:      make(map[string]*activeProgress),
 	}
 	ag.updater = updater.New(updater.Options{
 		Component:    "relay-agent-b",
 		NodeID:       cfg.NodeID,
 		CenterURL:    cfg.CenterURL,
 		CenterToken:  cfg.CenterToken,
-		HTTPClient:   ag.streamClient,
+		HTTPClient:   ag.sseClient,
 		Logger:       ag.logger,
 		OnStatusSync: ag.triggerHeartbeat,
 		OnRestart: func(targetVer string) {
@@ -161,6 +195,15 @@ func New(cfg *Config, logger *slog.Logger) (*Agent, error) {
 	return ag, nil
 }
 
+func (a *Agent) nextStreamClient() *http.Client {
+	n := uint64(len(a.streamClients))
+	if n == 0 {
+		return a.sseClient
+	}
+	idx := a.streamIdx.Add(1) - 1
+	return a.streamClients[idx%n]
+}
+
 func (a *Agent) Start(ctx context.Context) error {
 	if a.UpgradeExePath != "" {
 		a.updater = updater.New(updater.Options{
@@ -168,7 +211,7 @@ func (a *Agent) Start(ctx context.Context) error {
 			NodeID:       a.cfg.NodeID,
 			CenterURL:    a.cfg.CenterURL,
 			CenterToken:  a.cfg.CenterToken,
-			HTTPClient:   a.streamClient,
+			HTTPClient:   a.sseClient,
 			Logger:       a.logger,
 			ExePath:      a.UpgradeExePath,
 			OnStatusSync: a.triggerHeartbeat,
@@ -196,6 +239,10 @@ func (a *Agent) Start(ctx context.Context) error {
 		runCancel()
 		a.bgWG.Wait()
 		a.wg.Wait()
+		// Best-effort final flush of already-landed ACKs on graceful shutdown.
+		flCtx, flCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		a.flushPendingAcks(flCtx)
+		flCancel()
 		_ = a.store.Close()
 	}()
 
@@ -320,7 +367,7 @@ func (a *Agent) consumeSSE(ctx context.Context, sseURL string) (bool, error) {
 	req.Header.Set(protocol.HeaderNodeID, a.cfg.NodeID)
 	req.Header.Set(protocol.HeaderNodeToken, a.cfg.CenterToken)
 
-	resp, err := a.streamClient.Do(req)
+	resp, err := a.sseClient.Do(req)
 	if err != nil {
 		return false, err
 	}
@@ -369,7 +416,7 @@ func (a *Agent) dispatchLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case proj := <-a.wakeupCh:
-			if _, ok := a.cfg.Projects[proj]; ok {
+			if len(a.cfg.DestDirsFor(proj)) > 0 {
 				a.scanProject(ctx, proj)
 			} else {
 				a.scanAllProjects(ctx)
@@ -394,16 +441,106 @@ func (a *Agent) scanAllProjects(ctx context.Context) {
 	}
 }
 
+func (a *Agent) invalidateDiscover(projectID string) {
+	a.discMu.Lock()
+	delete(a.discCache, projectID)
+	a.discMu.Unlock()
+}
+
+func (a *Agent) discoverCached(ctx context.Context, projectID string) (*protocol.DiscoverResp, error) {
+	a.discMu.Lock()
+	if ent, ok := a.discCache[projectID]; ok && time.Now().Before(ent.expiresAt) && ent.resp != nil && len(ent.resp.Candidates) > 0 {
+		resp := ent.resp
+		a.discMu.Unlock()
+		return resp, nil
+	}
+	a.discMu.Unlock()
+
+	disc, err := a.discover(ctx, projectID)
+	if err != nil {
+		return nil, err
+	}
+	if len(disc.Candidates) > 0 {
+		a.discMu.Lock()
+		a.discCache[projectID] = cachedDiscover{
+			resp:      disc,
+			expiresAt: time.Now().Add(10 * time.Second),
+		}
+		a.discMu.Unlock()
+	}
+	return disc, nil
+}
+
+// mediaAffinityKey strips compound metadata suffixes (like .info.json) or the last extension
+// so paired files for the same asset (e.g. <video_id>.opus and <video_id>.info.json) hash
+// to the same destination disk when multi-disk placement is enabled.
+func mediaAffinityKey(filename string) string {
+	base := filepath.Base(filename)
+	lower := strings.ToLower(base)
+	for _, suffix := range []string{".info.json", ".meta.json", ".tar.gz", ".tar.zst"} {
+		if strings.HasSuffix(lower, suffix) && len(base) > len(suffix) {
+			return base[:len(base)-len(suffix)]
+		}
+	}
+	ext := filepath.Ext(base)
+	if ext != "" && len(base) > len(ext) {
+		return base[:len(base)-len(ext)]
+	}
+	return base
+}
+
+func (a *Agent) chooseDestDir(projectID, filename string, fileSize int64) string {
+	dirs := a.cfg.DestDirsFor(projectID)
+	if len(dirs) == 0 {
+		return ""
+	}
+	if len(dirs) == 1 {
+		return dirs[0]
+	}
+
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(mediaAffinityKey(filename)))
+	primaryIdx := int(h.Sum32() % uint32(len(dirs)))
+	need := uint64(0)
+	if fileSize > 0 {
+		need = uint64(fileSize)
+	}
+	if a.availableDiskFor(dirs[primaryIdx]) >= need && (a.cfg.MinFreeDiskBytes == 0 || a.availableDiskFor(dirs[primaryIdx]) > 0) {
+		return dirs[primaryIdx]
+	}
+	// Spill over to whichever configured disk currently has the most free space.
+	bestDir := dirs[primaryIdx]
+	var bestFree uint64
+	for _, d := range dirs {
+		free := a.availableDiskFor(d)
+		if free > bestFree {
+			bestFree = free
+			bestDir = d
+		}
+	}
+	return bestDir
+}
+
+func (a *Agent) availableDiskForProject(projectID string) uint64 {
+	var best uint64
+	for _, dir := range a.cfg.DestDirsFor(projectID) {
+		if free := a.availableDiskFor(dir); free > best {
+			best = free
+		}
+	}
+	return best
+}
+
 func (a *Agent) scanProject(ctx context.Context, projectID string) {
-	destDir, ok := a.cfg.Projects[projectID]
-	if !ok {
+	dirs := a.cfg.DestDirsFor(projectID)
+	if len(dirs) == 0 {
 		return
 	}
 	if len(a.workSem) >= cap(a.workSem) {
 		return
 	}
 
-	disc, err := a.discover(ctx, projectID)
+	disc, err := a.discoverCached(ctx, projectID)
 	if err != nil {
 		a.logger.Warn("discover failed", "project", projectID, "err", err)
 		return
@@ -412,76 +549,116 @@ func (a *Agent) scanProject(ctx context.Context, projectID string) {
 		return
 	}
 
+	claimedAny := false
 	for _, cand := range disc.Candidates {
 		for {
 			if ctx.Err() != nil {
 				return
 			}
-			// Reserve a worker slot before claiming so we never hold a lease without capacity.
-			select {
-			case a.workSem <- struct{}{}:
-			default:
+			// Reserve up to ClaimBatchSize worker slots upfront without blocking.
+			reserved := 0
+			for reserved < a.cfg.ClaimBatchSize {
+				select {
+				case a.workSem <- struct{}{}:
+					reserved++
+				default:
+					goto reservedDone
+				}
+			}
+		reservedDone:
+			if reserved == 0 {
 				return
 			}
+			releaseSlots := func(n int) {
+				for i := 0; i < n; i++ {
+					<-a.workSem
+				}
+			}
 
-			availDisk := a.availableDiskFor(destDir)
+			availDisk := a.availableDiskForProject(projectID)
 			if availDisk == 0 && a.cfg.MinFreeDiskBytes > 0 {
-				<-a.workSem
-				a.logger.Warn("insufficient local disk space, skipping claim", "project", projectID, "dest", destDir)
+				releaseSlots(reserved)
+				a.logger.Warn("insufficient local disk space, skipping claim", "project", projectID, "dest_dirs", dirs)
 				return
 			}
 
-			claimResp, status, err := a.claimFromA(ctx, cand, projectID, availDisk, disc.LeaseTTLSec)
+			claimed, status, err := a.claimBatchFromA(ctx, cand, projectID, availDisk, disc.LeaseTTLSec, reserved)
 			if err != nil {
-				<-a.workSem
+				releaseSlots(reserved)
+				a.invalidateDiscover(projectID)
 				a.logger.Warn("claim from agent-a failed", "a_node", cand.ANodeID, "err", err)
 				break
 			}
-			if status == http.StatusNoContent {
-				<-a.workSem
+			if status == http.StatusNoContent || len(claimed) == 0 {
+				releaseSlots(reserved)
 				break // No more ready files on this A node; try next candidate.
 			}
 			if status == http.StatusUnauthorized {
-				<-a.workSem
+				releaseSlots(reserved)
+				a.invalidateDiscover(projectID)
 				break // JWT expired; next scan will refresh.
 			}
 
-			partPath := filepath.Join(destDir, ".relay_tmp", claimResp.FileID+".part")
-			dl := ActiveDownload{
-				FileID:         claimResp.FileID,
-				ProjectID:      projectID,
-				ANodeID:        cand.ANodeID,
-				PublicAddr:     cand.PublicAddr,
-				Filename:       claimResp.Filename,
-				Size:           claimResp.Size,
-				SHA256:         claimResp.SHA256,
-				LeaseID:        claimResp.LeaseID,
-				LeaseToken:     claimResp.LeaseToken,
-				LeaseExpiresAt: claimResp.LeaseExpiresAt,
-				LeaseTTLSec:    disc.LeaseTTLSec,
-				ConflictPolicy: disc.ConflictPolicy,
-				DestDir:        destDir,
-				PartPath:       partPath,
-				StartedAt:      time.Now().UTC(),
+			// Return any unused pre-reserved slots immediately.
+			if len(claimed) < reserved {
+				releaseSlots(reserved - len(claimed))
 			}
-			if err := a.store.PutActive(dl); err != nil {
-				<-a.workSem
-				a.logger.Error("persist active download failed", "file_id", dl.FileID, "err", err)
-				_ = a.sendNack(ctx, dl, "local state persist failed")
+
+			claimedAny = true
+			dls := make([]ActiveDownload, 0, len(claimed))
+			for _, cr := range claimed {
+				destDir := a.chooseDestDir(projectID, cr.Filename, cr.Size)
+				partPath := filepath.Join(destDir, ".relay_tmp", cr.FileID+".part")
+				dls = append(dls, ActiveDownload{
+					FileID:         cr.FileID,
+					ProjectID:      projectID,
+					ANodeID:        cand.ANodeID,
+					PublicAddr:     cand.PublicAddr,
+					Filename:       cr.Filename,
+					Size:           cr.Size,
+					SHA256:         cr.SHA256,
+					LeaseID:        cr.LeaseID,
+					LeaseToken:     cr.LeaseToken,
+					LeaseExpiresAt: cr.LeaseExpiresAt,
+					LeaseTTLSec:    disc.LeaseTTLSec,
+					ConflictPolicy: disc.ConflictPolicy,
+					DestDir:        destDir,
+					PartPath:       partPath,
+					StartedAt:      time.Now().UTC(),
+				})
+			}
+
+			if err := a.store.PutActiveBatch(dls); err != nil {
+				releaseSlots(len(dls))
+				a.logger.Error("persist active batch failed", "count", len(dls), "err", err)
+				for _, dl := range dls {
+					_ = a.sendNack(ctx, dl, "local state persist failed")
+				}
 				return
 			}
 
-			a.wg.Add(1)
-			go func(item ActiveDownload) {
-				defer func() {
-					<-a.workSem
-					a.wg.Done()
-					// Immediately check for more queued files on completion.
-					a.triggerWakeup(item.ProjectID)
-				}()
-				a.runDownload(ctx, item)
-			}(dl)
+			for _, dl := range dls {
+				a.wg.Add(1)
+				go func(item ActiveDownload) {
+					defer func() {
+						<-a.workSem
+						a.wg.Done()
+						// Immediately check for more queued files on completion.
+						a.triggerWakeup(item.ProjectID)
+					}()
+					a.runDownload(ctx, item)
+				}(dl)
+			}
+
+			if len(claimed) < reserved {
+				// This candidate has no more immediately claimable files.
+				break
+			}
 		}
+	}
+	if !claimedAny {
+		// All cached candidates were empty -> clear cache so next poll/wakeup sees fresh A nodes.
+		a.invalidateDiscover(projectID)
 	}
 }
 
@@ -521,6 +698,56 @@ func (a *Agent) discover(ctx context.Context, projectID string) (*protocol.Disco
 		return nil, err
 	}
 	return &out, nil
+}
+
+func (a *Agent) claimBatchFromA(ctx context.Context, cand protocol.DiscoverCandidate, projectID string, availDisk uint64, leaseTTLSec, maxCount int) ([]protocol.ClaimResp, int, error) {
+	if maxCount <= 1 {
+		cr, status, err := a.claimFromA(ctx, cand, projectID, availDisk, leaseTTLSec)
+		if err != nil || cr == nil {
+			return nil, status, err
+		}
+		return []protocol.ClaimResp{*cr}, status, nil
+	}
+	body, _ := json.Marshal(protocol.ClaimBatchReq{
+		ProjectID:          projectID,
+		BNodeID:            a.cfg.NodeID,
+		AvailableDiskBytes: availDisk,
+		LeaseTTLSec:        leaseTTLSec,
+		MaxCount:           maxCount,
+	})
+	u := strings.TrimRight(cand.PublicAddr, "/") + "/api/v1/claim-batch"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(body))
+	if err != nil {
+		return nil, 0, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+cand.AccessJWT)
+
+	resp, err := a.apiClient.Do(req)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer resp.Body.Close()
+
+	// Graceful compatibility fallback for older v1.0 Agent A nodes that only expose /api/v1/claim.
+	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusMethodNotAllowed {
+		cr, status, err := a.claimFromA(ctx, cand, projectID, availDisk, leaseTTLSec)
+		if err != nil || cr == nil {
+			return nil, status, err
+		}
+		return []protocol.ClaimResp{*cr}, status, nil
+	}
+	if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusUnauthorized {
+		return nil, resp.StatusCode, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, resp.StatusCode, fmt.Errorf("claim-batch returned HTTP %d", resp.StatusCode)
+	}
+	var out protocol.ClaimBatchResp
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, resp.StatusCode, err
+	}
+	return out.Items, http.StatusOK, nil
 }
 
 func (a *Agent) claimFromA(ctx context.Context, cand protocol.DiscoverCandidate, projectID string, availDisk uint64, leaseTTLSec int) (*protocol.ClaimResp, int, error) {
@@ -730,14 +957,24 @@ func (a *Agent) runDownload(ctx context.Context, dl ActiveDownload) {
 		LeaseToken: dl.LeaseToken,
 		SHA256:     actualSHA,
 		DurationMs: time.Since(startTime).Milliseconds(),
+		DestDir:    filepath.Dir(targetPath),
 		CreatedAt:  time.Now().UTC(),
 	}
 	_ = a.store.CompleteActiveAndQueueAck(dl.FileID, ack)
-	if err := a.sendAck(ctx, ack); err == nil {
-		_ = a.store.DeletePendingAck(ack.FileID)
+	if a.cfg.AckBatchIntervalMs <= 0 {
+		if !skipCommit {
+			_ = transfer.SyncDir(filepath.Dir(targetPath))
+		}
+		if err := a.sendAck(ctx, ack); err == nil {
+			_ = a.store.DeletePendingAck(ack.FileID)
+		} else {
+			a.logger.Warn("immediate ACK failed, queued for retry", "file_id", dl.FileID, "err", err)
+			a.triggerAckFlush()
+		}
 	} else {
-		a.logger.Warn("immediate ACK failed, queued for retry", "file_id", dl.FileID, "err", err)
-		a.triggerAckFlush()
+		if a.pendingAckCount.Add(1) >= int64(a.cfg.AckBatchSize) {
+			a.triggerAckFlush()
+		}
 	}
 
 	a.logger.Info("download verified and committed", "file_id", dl.FileID, "project", dl.ProjectID, "target", targetPath, "size", dl.Size)
@@ -754,7 +991,7 @@ func (a *Agent) streamOnce(ctx context.Context, dl ActiveDownload, offset int64,
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
 	}
 
-	resp, err := a.streamClient.Do(req)
+	resp, err := a.nextStreamClient().Do(req)
 	if err != nil {
 		return 0, "", 0, err
 	}
@@ -925,7 +1162,14 @@ func (a *Agent) sendNack(ctx context.Context, dl ActiveDownload, reason string) 
 }
 
 func (a *Agent) ackFlushLoop(ctx context.Context) {
-	ticker := time.NewTicker(2 * time.Second)
+	interval := 2 * time.Second
+	if a.cfg.AckBatchIntervalMs > 0 {
+		interval = time.Duration(a.cfg.AckBatchIntervalMs) * time.Millisecond
+		if interval < 50*time.Millisecond {
+			interval = 50 * time.Millisecond
+		}
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -939,19 +1183,124 @@ func (a *Agent) ackFlushLoop(ctx context.Context) {
 	}
 }
 
+func (a *Agent) sendBatchAck(ctx context.Context, publicAddr string, acks []PendingAck) ([]string, bool, error) {
+	items := make([]protocol.BatchAckItem, len(acks))
+	for i, ak := range acks {
+		items[i] = protocol.BatchAckItem{
+			FileID:     ak.FileID,
+			LeaseID:    ak.LeaseID,
+			LeaseToken: ak.LeaseToken,
+			SHA256:     ak.SHA256,
+			DurationMs: ak.DurationMs,
+		}
+	}
+	body, _ := json.Marshal(protocol.BatchAckReq{
+		BNodeID: a.cfg.NodeID,
+		Items:   items,
+	})
+	u := strings.TrimRight(publicAddr, "/") + "/api/v1/files/batch-ack"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(body))
+	if err != nil {
+		return nil, false, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := a.apiClient.Do(req)
+	if err != nil {
+		return nil, false, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusMethodNotAllowed {
+		return nil, true, nil // fallback to legacy single ACK
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, false, fmt.Errorf("batch-ack returned HTTP %d", resp.StatusCode)
+	}
+	var out protocol.BatchAckResp
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, false, err
+	}
+	doneIDs := make([]string, 0, len(out.Results))
+	for _, r := range out.Results {
+		switch r.Status {
+		case "deleted", "already_deleted", "not_found":
+			doneIDs = append(doneIDs, r.FileID)
+		default:
+			a.logger.Warn("batch-ack item not confirmed", "file_id", r.FileID, "status", r.Status, "err", r.Error)
+		}
+	}
+	return doneIDs, false, nil
+}
+
 func (a *Agent) flushPendingAcks(ctx context.Context) {
 	acks, err := a.store.ListPendingAcks()
 	if err != nil || len(acks) == 0 {
+		a.pendingAckCount.Store(0)
 		return
 	}
-	for _, ack := range acks {
-		if ctx.Err() != nil {
-			return
+
+	// Ensure every destination directory containing newly landed files is fsynced on disk
+	// BEFORE confirming ACK to Agent A ("没落盘的不准删").
+	syncedDirs := make(map[string]bool)
+	failedDirs := make(map[string]bool)
+	for _, ak := range acks {
+		if ak.DestDir == "" || syncedDirs[ak.DestDir] || failedDirs[ak.DestDir] {
+			continue
 		}
-		if err := a.sendAck(ctx, ack); err == nil {
-			_ = a.store.DeletePendingAck(ack.FileID)
+		if err := transfer.SyncDir(ak.DestDir); err != nil {
+			a.logger.Warn("fsync dest dir failed, deferring ACK", "dir", ak.DestDir, "err", err)
+			failedDirs[ak.DestDir] = true
+		} else {
+			syncedDirs[ak.DestDir] = true
 		}
 	}
+
+	// Group durable ACKs by Agent A address.
+	byAddr := make(map[string][]PendingAck)
+	for _, ak := range acks {
+		if ak.DestDir != "" && failedDirs[ak.DestDir] {
+			continue
+		}
+		byAddr[ak.PublicAddr] = append(byAddr[ak.PublicAddr], ak)
+	}
+
+	var allDone []string
+	const maxChunk = 128
+	for pubAddr, group := range byAddr {
+		for start := 0; start < len(group); start += maxChunk {
+			if ctx.Err() != nil {
+				break
+			}
+			end := start + maxChunk
+			if end > len(group) {
+				end = len(group)
+			}
+			chunk := group[start:end]
+			doneIDs, fallback, err := a.sendBatchAck(ctx, pubAddr, chunk)
+			if err != nil {
+				a.logger.Warn("batch-ack failed, will retry", "public_addr", pubAddr, "count", len(chunk), "err", err)
+				continue
+			}
+			if fallback {
+				for _, ak := range chunk {
+					if ctx.Err() != nil {
+						break
+					}
+					if err := a.sendAck(ctx, ak); err == nil {
+						allDone = append(allDone, ak.FileID)
+					}
+				}
+				continue
+			}
+			allDone = append(allDone, doneIDs...)
+		}
+	}
+
+	if len(allDone) > 0 {
+		_ = a.store.DeletePendingAcks(allDone)
+	}
+	a.pendingAckCount.Store(int64(a.store.PendingAckCount()))
 }
 
 func (a *Agent) heartbeatLoop(ctx context.Context) {
@@ -973,12 +1322,25 @@ func (a *Agent) heartbeatLoop(ctx context.Context) {
 func (a *Agent) sendHeartbeat(ctx context.Context) {
 	var totalDisk, freeDisk uint64
 	var usedPct float64
+	seenDev := make(map[uint64]struct{})
 	for _, projID := range a.cfg.ProjectIDs() {
-		dir := a.cfg.Projects[projID]
-		if t, f, pct, err := transfer.DiskUsage(dir); err == nil {
-			totalDisk, freeDisk, usedPct = t, f, pct
-			break
+		for _, dir := range a.cfg.DestDirsFor(projID) {
+			var st unix.Stat_t
+			if err := unix.Stat(dir, &st); err == nil {
+				dev := uint64(st.Dev)
+				if _, dup := seenDev[dev]; dup {
+					continue
+				}
+				seenDev[dev] = struct{}{}
+			}
+			if t, f, _, err := transfer.DiskUsage(dir); err == nil {
+				totalDisk += t
+				freeDisk += f
+			}
 		}
+	}
+	if totalDisk > 0 {
+		usedPct = (float64(totalDisk-freeDisk) / float64(totalDisk)) * 100.0
 	}
 
 	a.mu.RLock()

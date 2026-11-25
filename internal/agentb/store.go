@@ -41,6 +41,7 @@ type PendingAck struct {
 	LeaseToken string    `json:"lease_token"`
 	SHA256     string    `json:"sha256"`
 	DurationMs int64     `json:"duration_ms"`
+	DestDir    string    `json:"dest_dir,omitempty"`
 	CreatedAt  time.Time `json:"created_at"`
 }
 
@@ -75,17 +76,36 @@ func (s *Store) Close() error {
 }
 
 func (s *Store) PutActive(dl ActiveDownload) error {
-	return s.db.Update(func(tx *bolt.Tx) error {
-		raw, err := json.Marshal(dl)
-		if err != nil {
-			return err
-		}
+	raw, err := json.Marshal(dl)
+	if err != nil {
+		return err
+	}
+	return s.db.Batch(func(tx *bolt.Tx) error {
 		return tx.Bucket(bucketActiveDownloads).Put([]byte(dl.FileID), raw)
 	})
 }
 
-func (s *Store) DeleteActive(fileID string) error {
+func (s *Store) PutActiveBatch(dls []ActiveDownload) error {
+	if len(dls) == 0 {
+		return nil
+	}
 	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketActiveDownloads)
+		for _, dl := range dls {
+			raw, err := json.Marshal(dl)
+			if err != nil {
+				return err
+			}
+			if err := b.Put([]byte(dl.FileID), raw); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func (s *Store) DeleteActive(fileID string) error {
+	return s.db.Batch(func(tx *bolt.Tx) error {
 		return tx.Bucket(bucketActiveDownloads).Delete([]byte(fileID))
 	})
 }
@@ -116,13 +136,14 @@ func (s *Store) PutPendingAck(ack PendingAck) error {
 }
 
 // CompleteActiveAndQueueAck atomically removes an active download record and persists its pending ACK.
+// Uses db.Batch so concurrent completions coalesce into a single BoltDB fsync while preserving ACID durability.
 func (s *Store) CompleteActiveAndQueueAck(fileID string, ack PendingAck) error {
-	return s.db.Update(func(tx *bolt.Tx) error {
+	raw, err := json.Marshal(ack)
+	if err != nil {
+		return err
+	}
+	return s.db.Batch(func(tx *bolt.Tx) error {
 		if err := tx.Bucket(bucketActiveDownloads).Delete([]byte(fileID)); err != nil {
-			return err
-		}
-		raw, err := json.Marshal(ack)
-		if err != nil {
 			return err
 		}
 		return tx.Bucket(bucketPendingAcks).Put([]byte(ack.FileID), raw)
@@ -130,9 +151,33 @@ func (s *Store) CompleteActiveAndQueueAck(fileID string, ack PendingAck) error {
 }
 
 func (s *Store) DeletePendingAck(fileID string) error {
-	return s.db.Update(func(tx *bolt.Tx) error {
+	return s.db.Batch(func(tx *bolt.Tx) error {
 		return tx.Bucket(bucketPendingAcks).Delete([]byte(fileID))
 	})
+}
+
+func (s *Store) DeletePendingAcks(fileIDs []string) error {
+	if len(fileIDs) == 0 {
+		return nil
+	}
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketPendingAcks)
+		for _, id := range fileIDs {
+			if err := b.Delete([]byte(id)); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func (s *Store) PendingAckCount() int {
+	var n int
+	_ = s.db.View(func(tx *bolt.Tx) error {
+		n = tx.Bucket(bucketPendingAcks).Stats().KeyN
+		return nil
+	})
+	return n
 }
 
 func (s *Store) ListPendingAcks() ([]PendingAck, error) {

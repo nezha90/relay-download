@@ -171,6 +171,18 @@ type ClaimResp struct {
 	UploadedAt     time.Time `json:"uploaded_at"`
 }
 
+type ClaimBatchReq struct {
+	ProjectID          string `json:"project_id"`
+	BNodeID            string `json:"b_node_id"`
+	AvailableDiskBytes uint64 `json:"available_disk_bytes"`
+	LeaseTTLSec        int    `json:"lease_ttl_sec,omitempty"`
+	MaxCount           int    `json:"max_count"`
+}
+
+type ClaimBatchResp struct {
+	Items []ClaimResp `json:"items"`
+}
+
 type RenewReq struct {
 	LeaseID     string `json:"lease_id"`
 	BNodeID     string `json:"b_node_id"`
@@ -190,6 +202,29 @@ type AckReq struct {
 
 type AckResp struct {
 	Status string `json:"status"` // "deleted" | "already_deleted"
+}
+
+type BatchAckItem struct {
+	FileID     string `json:"file_id"`
+	LeaseID    string `json:"lease_id"`
+	LeaseToken string `json:"lease_token"`
+	SHA256     string `json:"sha256"`
+	DurationMs int64  `json:"duration_ms"`
+}
+
+type BatchAckReq struct {
+	BNodeID string         `json:"b_node_id"`
+	Items   []BatchAckItem `json:"items"`
+}
+
+type BatchAckItemResult struct {
+	FileID string `json:"file_id"`
+	Status string `json:"status"` // "deleted" | "already_deleted" | "not_found" | "lease_invalid" | "checksum_failed" | "error"
+	Error  string `json:"error,omitempty"`
+}
+
+type BatchAckResp struct {
+	Results []BatchAckItemResult `json:"results"`
 }
 
 type NackReq struct {
@@ -215,6 +250,20 @@ type LocalRegisterReq struct {
 	Mode           string `json:"mode,omitempty"` // "move" (default) | "hardlink"
 }
 
+type LocalRegisterBatchReq struct {
+	Items []LocalRegisterReq `json:"items"`
+}
+
+type LocalRegisterBatchItemResult struct {
+	Index int              `json:"index"`
+	File  *LocalUploadResp `json:"file,omitempty"`
+	Error string           `json:"error,omitempty"`
+}
+
+type LocalRegisterBatchResp struct {
+	Results []LocalRegisterBatchItemResult `json:"results"`
+}
+
 type LiveFileItem struct {
 	FileID         string     `json:"file_id"`
 	ProjectID      string     `json:"project_id"`
@@ -229,15 +278,21 @@ type LiveFileItem struct {
 }
 
 type LiveFilesResp struct {
-	ANodeID       string         `json:"a_node_id"`
-	AName         string         `json:"a_name"`
-	PublicAddr    string         `json:"public_addr,omitempty"`
-	Files         []LiveFileItem `json:"files"`
-	DiskTotal     uint64         `json:"disk_total_bytes"`
-	DiskFree      uint64         `json:"disk_free_bytes"`
-	DiskUsedPct   float64        `json:"disk_used_pct"`
-	DiskAlarm     bool           `json:"disk_alarm"`
-	Error         string         `json:"error,omitempty"`
+	ANodeID      string         `json:"a_node_id"`
+	AName        string         `json:"a_name"`
+	PublicAddr   string         `json:"public_addr,omitempty"`
+	Files        []LiveFileItem `json:"files"`
+	TotalFiles   int            `json:"total_files,omitempty"`
+	Truncated    bool           `json:"truncated,omitempty"`
+	ReadyCount   int            `json:"ready_count,omitempty"`
+	ClaimedCount int            `json:"claimed_count,omitempty"`
+	ReadyBytes   int64          `json:"ready_bytes,omitempty"`
+	ClaimedBytes int64          `json:"claimed_bytes,omitempty"`
+	DiskTotal    uint64         `json:"disk_total_bytes"`
+	DiskFree     uint64         `json:"disk_free_bytes"`
+	DiskUsedPct  float64        `json:"disk_used_pct"`
+	DiskAlarm    bool           `json:"disk_alarm"`
+	Error        string         `json:"error,omitempty"`
 }
 
 type DailyStat struct {
@@ -434,9 +489,10 @@ type DeployAgentAReq struct {
 	MaxDiskUsagePct      float64  `json:"max_disk_usage_pct,omitempty"`
 	MinFreeDiskBytes     uint64   `json:"min_free_disk_bytes,omitempty"`
 	LeaseTTLSec          int      `json:"lease_ttl_sec,omitempty"`
-	MaxConcurrentStreams int      `json:"max_concurrent_streams,omitempty"`
-	RateLimitMBps        float64  `json:"rate_limit_mbps,omitempty"`
-	ForceOverwrite       bool     `json:"force_overwrite,omitempty"`
+	MaxConcurrentStreams   int      `json:"max_concurrent_streams,omitempty"`
+	RateLimitMBps          float64  `json:"rate_limit_mbps,omitempty"`
+	DeleteBatchIntervalSec int      `json:"delete_batch_interval_sec,omitempty"`
+	ForceOverwrite         bool     `json:"force_overwrite,omitempty"`
 }
 
 type DeployTask struct {
@@ -455,15 +511,17 @@ type DeployTask struct {
 }
 
 type AgentBScriptReq struct {
-	NodeID           string            `json:"node_id"`
-	NodeToken        string            `json:"node_token,omitempty"`
-	RotateToken      bool              `json:"rotate_token,omitempty"`
-	InstallDir       string            `json:"install_dir,omitempty"`
-	StateDir         string            `json:"state_dir,omitempty"`
-	Projects         map[string]string `json:"projects,omitempty"`
-	MaxConcurrent    int               `json:"max_concurrent,omitempty"`
-	MinFreeDiskBytes uint64            `json:"min_free_disk_bytes,omitempty"`
-	ReleaseID        string            `json:"release_id,omitempty"`
+	NodeID             string              `json:"node_id"`
+	NodeToken          string              `json:"node_token,omitempty"`
+	RotateToken        bool                `json:"rotate_token,omitempty"`
+	InstallDir         string              `json:"install_dir,omitempty"`
+	StateDir           string              `json:"state_dir,omitempty"`
+	Projects           map[string]string   `json:"projects,omitempty"`
+	ProjectDirs        map[string][]string `json:"project_dirs,omitempty"`
+	MaxConcurrent      int                 `json:"max_concurrent,omitempty"`
+	MinFreeDiskBytes   uint64              `json:"min_free_disk_bytes,omitempty"`
+	AckBatchIntervalMs int                 `json:"ack_batch_interval_ms,omitempty"`
+	ReleaseID          string              `json:"release_id,omitempty"`
 }
 
 type AgentBScriptResp struct {

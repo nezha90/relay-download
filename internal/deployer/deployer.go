@@ -699,10 +699,11 @@ func (d *Deployer) InstallAgentA(ctx context.Context, p InstallAgentAParams) err
 		DataDir:              req.DataDir,
 		MaxDiskUsagePct:      req.MaxDiskUsagePct,
 		MinFreeDiskBytes:     req.MinFreeDiskBytes,
-		LeaseTTLSec:          req.LeaseTTLSec,
-		MaxConcurrentStreams: req.MaxConcurrentStreams,
-		RateLimitMBps:        req.RateLimitMBps,
-		HeartbeatIntervalSec: 5,
+		LeaseTTLSec:            req.LeaseTTLSec,
+		MaxConcurrentStreams:   req.MaxConcurrentStreams,
+		RateLimitMBps:          req.RateLimitMBps,
+		DeleteBatchIntervalSec: req.DeleteBatchIntervalSec,
+		HeartbeatIntervalSec:   5,
 	}
 	cfgYAML, err := yaml.Marshal(&aCfg)
 	if err != nil {
@@ -768,7 +769,8 @@ func RenderAgentBInstallScript(centerPublicURL string, caCertPEM []byte, node pr
 		return "", err
 	}
 	projects := req.Projects
-	if len(projects) == 0 {
+	projectDirs := req.ProjectDirs
+	if len(projects) == 0 && len(projectDirs) == 0 {
 		projects = make(map[string]string)
 		for _, pid := range node.Projects {
 			projects[pid] = filepath.Join("/data/relay-b/files", pid)
@@ -793,8 +795,10 @@ func RenderAgentBInstallScript(centerPublicURL string, caCertPEM []byte, node pr
 		CenterToken:          tokVal,
 		CACert:               filepath.Join(installDir, "certs", "ca.crt"),
 		Projects:             projects,
+		ProjectDirs:          projectDirs,
 		StateDir:             stateDir,
 		MaxConcurrent:        maxConc,
+		AckBatchIntervalMs:   req.AckBatchIntervalMs,
 		MinFreeDiskBytes:     req.MinFreeDiskBytes,
 		PollIntervalSec:      10,
 		HeartbeatIntervalSec: 2,

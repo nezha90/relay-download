@@ -17,7 +17,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const BufSize = 256 * 1024 // 256 KiB fixed streaming buffer
+const BufSize = 512 * 1024 // 512 KiB fixed streaming buffer tuned for 1 Gbps WAN streams
 
 var bufPool = sync.Pool{
 	New: func() any {
@@ -232,4 +232,15 @@ func DiskUsage(dir string) (totalBytes uint64, freeBytes uint64, usedPct float64
 		pct = (float64(used) / float64(total)) * 100.0
 	}
 	return total, avail, pct, nil
+}
+
+// SyncDir fsyncs a directory entry so atomic renames inside it are durable against power loss.
+func SyncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	err = d.Sync()
+	_ = d.Close()
+	return err
 }
