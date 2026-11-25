@@ -102,6 +102,33 @@ func (c *checkpointStore) MarkPushed(key, stamp string) error {
 	})
 }
 
+// ResumeStartAfter returns a safe S3 start-after cursor by seeking to the lexicographically
+// last pushed key matching prefix in BoltDB and stepping back overlap keys so in-flight
+// out-of-order workers from a prior run can never be skipped.
+func (c *checkpointStore) ResumeStartAfter(prefix string, overlap int) string {
+	var startAfter string
+	_ = c.db.View(func(tx *bolt.Tx) error {
+		cur := tx.Bucket(bucketPushed).Cursor()
+		k, _ := cur.Last()
+		for k != nil && !strings.HasPrefix(string(k), prefix) {
+			k, _ = cur.Prev()
+		}
+		if k == nil {
+			return nil
+		}
+		for i := 0; i < overlap; i++ {
+			prevK, _ := cur.Prev()
+			if prevK == nil || !strings.HasPrefix(string(prevK), prefix) {
+				return nil // fewer than overlap keys pushed -> scan from beginning
+			}
+			k = prevK
+		}
+		startAfter = string(k)
+		return nil
+	})
+	return startAfter
+}
+
 type feeder struct {
 	s3             *s3client.ReadOnlyClient
 	httpClient     *http.Client
@@ -328,20 +355,25 @@ func (f *feeder) runPass(ctx context.Context) error {
 
 	var (
 		token      string
+		startAfter = f.store.ResumeStartAfter(f.prefix, 128)
 		dispatched int64
 		listErr    error
 	)
+	if startAfter != "" {
+		f.logger.Info("resuming S3 listing via start-after cursor", "start_after", startAfter)
+	}
 	checkEvery := 0
 listLoop:
 	for {
 		if ctx.Err() != nil {
 			break
 		}
-		page, err := f.s3.ListObjectsV2(ctx, f.bucket, f.prefix, token, 1000)
+		page, err := f.s3.ListObjectsV2From(ctx, f.bucket, f.prefix, token, startAfter, 1000)
 		if err != nil {
 			listErr = err
 			break
 		}
+		startAfter = "" // only used on first page; subsequent pages use continuation-token
 		for _, obj := range page.Objects {
 			if ctx.Err() != nil {
 				break listLoop

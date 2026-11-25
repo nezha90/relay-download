@@ -85,6 +85,10 @@ type listBucketResultXML struct {
 }
 
 func (c *ReadOnlyClient) ListObjectsV2(ctx context.Context, bucket, prefix, continuationToken string, maxKeys int) (*ListResult, error) {
+	return c.ListObjectsV2From(ctx, bucket, prefix, continuationToken, "", maxKeys)
+}
+
+func (c *ReadOnlyClient) ListObjectsV2From(ctx context.Context, bucket, prefix, continuationToken, startAfter string, maxKeys int) (*ListResult, error) {
 	if maxKeys <= 0 || maxKeys > 1000 {
 		maxKeys = 1000
 	}
@@ -96,6 +100,8 @@ func (c *ReadOnlyClient) ListObjectsV2(ctx context.Context, bucket, prefix, cont
 	}
 	if continuationToken != "" {
 		q.Set("continuation-token", continuationToken)
+	} else if startAfter != "" {
+		q.Set("start-after", startAfter)
 	}
 
 	canonPath := "/" + awsURIEncode(bucket, false)
