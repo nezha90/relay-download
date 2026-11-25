@@ -23,6 +23,7 @@ type Config struct {
 	MaxConcurrent        int                 `yaml:"max_concurrent"`
 	StreamProtocol       string              `yaml:"stream_protocol,omitempty"`       // "h2" (default, TLS 1.3 HTTP/2) or "h1" (TLS 1.3 HTTP/1.1, removes 4MiB H2 flow-control cap for 10Gbps)
 	StreamConns          int                 `yaml:"stream_conns,omitempty"`          // independent TLS 1.3 TCP sockets for h2 pool (or idle pool floor for h1)
+	StreamConnMaxAgeSec  int                 `yaml:"stream_conn_max_age_sec,omitempty"` // if >0, staggered rotation of stream transports every N seconds (evades ISP long-flow QoS throttling; 0 = keepalive forever)
 	MaxTotalStreams      int                 `yaml:"max_total_streams,omitempty"`     // global cap on simultaneous active HTTP range streams across all workers
 	ChunkConcurrency     int                 `yaml:"chunk_concurrency,omitempty"`     // parallel range streams per large file (<=1 disables chunking)
 	ChunkSizeMB          int                 `yaml:"chunk_size_mb,omitempty"`         // range chunk size in MiB (default 4; auto-scales to 16/32MiB for large files)

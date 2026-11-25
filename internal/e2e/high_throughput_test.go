@@ -437,6 +437,7 @@ func Test10GbpsH1StreamProtocolAndPipelinedChunkedHash(t *testing.T) {
 		MaxConcurrent:        4,
 		StreamProtocol:       "h1",
 		StreamConns:          16,
+		StreamConnMaxAgeSec:  2,
 		MaxTotalStreams:      32,
 		ChunkConcurrency:     6,
 		ChunkSizeMB:          1,

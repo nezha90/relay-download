@@ -47,14 +47,16 @@ type cachedDiscover struct {
 }
 
 type Agent struct {
-	cfg           *Config
-	store         *Store
-	logger        *slog.Logger
-	apiClient     *http.Client
-	sseClient     *http.Client
-	streamClients []*http.Client
-	streamIdx     atomic.Uint64
-	limiter       *transfer.RateLimiter
+	cfg            *Config
+	store          *Store
+	logger         *slog.Logger
+	apiClient      *http.Client
+	sseClient      *http.Client
+	streamMu       sync.RWMutex
+	streamClients  []*http.Client
+	makeStreamCli  func() *http.Client
+	streamIdx      atomic.Uint64
+	limiter        *transfer.RateLimiter
 
 	workSem   chan struct{}
 	streamSem chan struct{}
@@ -146,12 +148,13 @@ func New(cfg *Config, logger *slog.Logger) (*Agent, error) {
 		}
 	}
 
-	var streamClients []*http.Client
+	var (
+		streamClients []*http.Client
+		makeStreamCli func() *http.Client
+	)
 	if cfg.StreamProtocol == "h1" {
 		// Strict TLS 1.3 + HTTP/1.1 data-plane transport: eliminates HTTP/2's 4MiB flow-control cap
 		// and frame-copy overhead so each TCP socket rides the full 64MiB kernel TCP/BBR window for 10Gbps.
-		h1TLS := clientTLS.Clone()
-		h1TLS.NextProtos = []string{"http/1.1"}
 		poolSize := cfg.MaxTotalStreams
 		if cfg.StreamConns > poolSize {
 			poolSize = cfg.StreamConns
@@ -159,23 +162,47 @@ func New(cfg *Config, logger *slog.Logger) (*Agent, error) {
 		if poolSize < 64 {
 			poolSize = 64
 		}
-		streamClients = []*http.Client{{
-			Transport: &http.Transport{
-				TLSClientConfig:     h1TLS,
-				ForceAttemptHTTP2:   false,
-				TLSNextProto:        make(map[string]func(authority string, c *tls.Conn) http.RoundTripper),
-				MaxIdleConns:        poolSize,
-				MaxIdleConnsPerHost: poolSize,
-				IdleConnTimeout:     90 * time.Second,
-				TLSHandshakeTimeout: 10 * time.Second,
-				ReadBufferSize:      1 << 20,
-				WriteBufferSize:     256 << 10,
-			},
-		}}
+		shards := 1
+		if cfg.StreamConnMaxAgeSec > 0 {
+			shards = 8
+		}
+		perShardPool := (poolSize + shards - 1) / shards
+		if perShardPool < 16 {
+			perShardPool = 16
+		}
+		idleTimeout := 90 * time.Second
+		if cfg.StreamConnMaxAgeSec > 0 {
+			idleTimeout = time.Duration(cfg.StreamConnMaxAgeSec) * time.Second
+			if idleTimeout < 5*time.Second {
+				idleTimeout = 5 * time.Second
+			}
+		}
+		makeStreamCli = func() *http.Client {
+			h1TLS := clientTLS.Clone()
+			h1TLS.NextProtos = []string{"http/1.1"}
+			return &http.Client{
+				Transport: &http.Transport{
+					TLSClientConfig:     h1TLS,
+					ForceAttemptHTTP2:   false,
+					TLSNextProto:        make(map[string]func(authority string, c *tls.Conn) http.RoundTripper),
+					MaxIdleConns:        perShardPool,
+					MaxIdleConnsPerHost: perShardPool,
+					IdleConnTimeout:     idleTimeout,
+					TLSHandshakeTimeout: 10 * time.Second,
+					ReadBufferSize:      1 << 20,
+					WriteBufferSize:     256 << 10,
+				},
+			}
+		}
+		streamClients = make([]*http.Client, shards)
+		for i := range streamClients {
+			streamClients[i] = makeStreamCli()
+		}
 	} else {
+		makeStreamCli = makeH2StreamClient
 		streamClients = make([]*http.Client, cfg.StreamConns)
 		for i := range streamClients {
-			streamClients[i] = makeH2StreamClient()
+			streamClients[i] = makeStreamCli()
 		}
 	}
 
@@ -195,6 +222,7 @@ func New(cfg *Config, logger *slog.Logger) (*Agent, error) {
 		},
 		sseClient:     makeH2StreamClient(),
 		streamClients: streamClients,
+		makeStreamCli: makeStreamCli,
 		workSem:       make(chan struct{}, cfg.MaxConcurrent),
 		streamSem:     make(chan struct{}, cfg.MaxTotalStreams),
 		wakeupCh:      make(chan string, 256),
@@ -228,12 +256,62 @@ func New(cfg *Config, logger *slog.Logger) (*Agent, error) {
 }
 
 func (a *Agent) nextStreamClient() *http.Client {
+	a.streamMu.RLock()
 	n := uint64(len(a.streamClients))
 	if n == 0 {
+		a.streamMu.RUnlock()
 		return a.sseClient
 	}
 	idx := a.streamIdx.Add(1) - 1
-	return a.streamClients[idx%n]
+	cli := a.streamClients[idx%n]
+	a.streamMu.RUnlock()
+	return cli
+}
+
+// streamRotateLoop staggered-rotates data-plane HTTP transports so no single TCP socket
+// stays alive long enough to trigger cross-border ISP per-flow QoS policing, without
+// ever interrupting in-flight downloads (retired transports drain via CloseIdleConnections).
+func (a *Agent) streamRotateLoop(ctx context.Context) {
+	a.streamMu.RLock()
+	shards := len(a.streamClients)
+	a.streamMu.RUnlock()
+	if shards == 0 || a.cfg.StreamConnMaxAgeSec <= 0 || a.makeStreamCli == nil {
+		return
+	}
+	maxAge := time.Duration(a.cfg.StreamConnMaxAgeSec) * time.Second
+	step := maxAge / time.Duration(shards)
+	if step < 250*time.Millisecond {
+		step = 250 * time.Millisecond
+	}
+	ticker := time.NewTicker(step)
+	defer ticker.Stop()
+
+	nextShard := 0
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			fresh := a.makeStreamCli()
+			a.streamMu.Lock()
+			idx := nextShard % len(a.streamClients)
+			old := a.streamClients[idx]
+			a.streamClients[idx] = fresh
+			a.streamMu.Unlock()
+			nextShard++
+
+			if old != nil {
+				if tr, ok := old.Transport.(*http.Transport); ok {
+					tr.CloseIdleConnections()
+					// Sweep again after in-flight requests on the retired shard finish so
+					// aged sockets never sit open until IdleConnTimeout.
+					for _, delay := range []time.Duration{3 * time.Second, 10 * time.Second, 25 * time.Second} {
+						time.AfterFunc(delay, tr.CloseIdleConnections)
+					}
+				}
+			}
+		}
+	}
 }
 
 func (a *Agent) Start(ctx context.Context) error {
@@ -293,6 +371,9 @@ func (a *Agent) Start(ctx context.Context) error {
 	launchBG(a.ackFlushLoop)
 	launchBG(a.sseLoop)
 	launchBG(a.dispatchLoop)
+	if a.cfg.StreamConnMaxAgeSec > 0 {
+		launchBG(a.streamRotateLoop)
+	}
 
 	<-runCtx.Done()
 	return nil
@@ -1360,14 +1441,17 @@ func (a *Agent) fetchRangeWithRetry(ctx context.Context, dl ActiveDownload, f *o
 			return 0, ctx.Err()
 		}
 
-		// Per-attempt stall watchdog: if a single WAN TCP flow stalls with zero progress for 25s,
-		// abort this range attempt and immediately retry on a fresh TCP socket from the pool.
+		// Per-attempt stall & slow-flow watchdog: if a single WAN TCP flow stalls for >12s
+		// OR degrades below 150 KB/s after 10s (ISP per-flow policer), abort this range attempt
+		// and immediately retry on a fresh TCP socket from the rotated pool.
 		reqCtx, reqCancel := context.WithCancel(ctx)
+		attemptStart := time.Now()
 		var lastActivity atomic.Int64
-		lastActivity.Store(time.Now().UnixNano())
+		var attemptBytes atomic.Int64
+		lastActivity.Store(attemptStart.UnixNano())
 		watchDone := make(chan struct{})
 		go func() {
-			t := time.NewTicker(5 * time.Second)
+			t := time.NewTicker(3 * time.Second)
 			defer t.Stop()
 			for {
 				select {
@@ -1376,15 +1460,23 @@ func (a *Agent) fetchRangeWithRetry(ctx context.Context, dl ActiveDownload, f *o
 				case <-reqCtx.Done():
 					return
 				case <-t.C:
-					if time.Since(time.Unix(0, lastActivity.Load())) > 25*time.Second {
+					if time.Since(time.Unix(0, lastActivity.Load())) > 12*time.Second {
 						reqCancel()
 						return
+					}
+					if a.limiter == nil {
+						if elapsed := time.Since(attemptStart); elapsed > 10*time.Second {
+							if float64(attemptBytes.Load())/elapsed.Seconds() < 150*1024 {
+								reqCancel()
+								return
+							}
+						}
 					}
 				}
 			}
 		}()
 
-		written, status, streamErr := a.streamRangeOnce(reqCtx, u, dl.LeaseToken, f, cur, end, prog, completedBytes, &lastActivity)
+		written, status, streamErr := a.streamRangeOnce(reqCtx, u, dl.LeaseToken, f, cur, end, prog, completedBytes, &lastActivity, &attemptBytes)
 		close(watchDone)
 		reqCancel()
 		<-a.streamSem
@@ -1417,7 +1509,7 @@ func (a *Agent) fetchRangeWithRetry(ctx context.Context, dl ActiveDownload, f *o
 	return 0, fmt.Errorf("range %d-%d exhausted retries at offset %d", start, end, cur)
 }
 
-func (a *Agent) streamRangeOnce(ctx context.Context, streamURL, leaseToken string, f *os.File, start, end int64, prog *activeProgress, completedBytes *atomic.Int64, lastActivity *atomic.Int64) (int64, int, error) {
+func (a *Agent) streamRangeOnce(ctx context.Context, streamURL, leaseToken string, f *os.File, start, end int64, prog *activeProgress, completedBytes *atomic.Int64, lastActivity *atomic.Int64, attemptBytes *atomic.Int64) (int64, int, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, streamURL, nil)
 	if err != nil {
 		return 0, 0, err
@@ -1460,6 +1552,7 @@ func (a *Agent) streamRangeOnce(ctx context.Context, streamURL, leaseToken strin
 			nw, wErr := f.WriteAt(buf[:nr], start+written)
 			if nw > 0 {
 				written += int64(nw)
+				attemptBytes.Add(int64(nw))
 				a.inBytes.Add(int64(nw))
 				tot := completedBytes.Add(int64(nw))
 				prog.addBytes(tot, int64(nw))
@@ -1491,8 +1584,33 @@ func (a *Agent) streamOnce(ctx context.Context, dl ActiveDownload, offset int64,
 	case <-ctx.Done():
 		return 0, "", 0, ctx.Err()
 	}
+
+	reqCtx, reqCancel := context.WithCancel(ctx)
+	defer reqCancel()
+	var lastActivity atomic.Int64
+	lastActivity.Store(time.Now().UnixNano())
+	watchDone := make(chan struct{})
+	defer close(watchDone)
+	go func() {
+		t := time.NewTicker(5 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-watchDone:
+				return
+			case <-reqCtx.Done():
+				return
+			case <-t.C:
+				if time.Since(time.Unix(0, lastActivity.Load())) > 20*time.Second {
+					reqCancel()
+					return
+				}
+			}
+		}
+	}()
+
 	u := strings.TrimRight(dl.PublicAddr, "/") + "/api/v1/files/" + url.PathEscape(dl.FileID) + "/stream"
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, u, nil)
 	if err != nil {
 		return 0, "", 0, err
 	}
@@ -1539,14 +1657,15 @@ func (a *Agent) streamOnce(ctx context.Context, dl ActiveDownload, offset int64,
 	}
 
 	for {
-		if err := ctx.Err(); err != nil {
+		if err := reqCtx.Err(); err != nil {
 			_ = f.Sync()
 			return written, "", resp.StatusCode, err
 		}
 		nr, rErr := resp.Body.Read(buf)
 		if nr > 0 {
+			lastActivity.Store(time.Now().UnixNano())
 			if a.limiter != nil {
-				if err := a.limiter.Wait(ctx, nr); err != nil {
+				if err := a.limiter.Wait(reqCtx, nr); err != nil {
 					_ = f.Sync()
 					return written, "", resp.StatusCode, err
 				}
