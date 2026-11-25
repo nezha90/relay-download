@@ -1555,7 +1555,7 @@ func (a *Agent) fetchRangeWithRetry(ctx context.Context, dl ActiveDownload, f *o
 					}
 					if a.limiter == nil {
 						if elapsed := time.Since(attemptStart); elapsed > 10*time.Second {
-							if float64(attemptBytes.Load())/elapsed.Seconds() < 150*1024 {
+							if float64(attemptBytes.Load())/elapsed.Seconds() < 32*1024 {
 								reqCancel()
 								return
 							}
@@ -1696,13 +1696,13 @@ func (a *Agent) streamOnce(ctx context.Context, dl ActiveDownload, offset int64)
 			case <-reqCtx.Done():
 				return
 			case <-t.C:
-				if time.Since(time.Unix(0, lastActivity.Load())) > 8*time.Second {
+				if time.Since(time.Unix(0, lastActivity.Load())) > 10*time.Second {
 					reqCancel()
 					return
 				}
 				if a.limiter == nil {
-					if elapsed := time.Since(attemptStart); elapsed > 8*time.Second {
-						if float64(attemptBytes.Load())/elapsed.Seconds() < 150*1024 {
+					if elapsed := time.Since(attemptStart); elapsed > 10*time.Second {
+						if float64(attemptBytes.Load())/elapsed.Seconds() < 32*1024 {
 							reqCancel()
 							return
 						}
