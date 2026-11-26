@@ -289,3 +289,24 @@ func TestDispatchCustomWatermarkHotUpdate(t *testing.T) {
 		t.Fatalf("expected >99%% clamped to 99%%, got %.1f", got)
 	}
 }
+
+func TestExtractAndSnapshotProjectCustomerHints(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPut, "http://127.0.0.1:18081/local/v1/files/p-new/a.m4a?customer=cust-2", nil)
+	req.Header.Set(protocol.HeaderCustomer, "cust-1, cust-2, ../bad")
+	req.Header.Set(protocol.HeaderProjectName, "台湾音频\n测试")
+	name, custs := extractProjectHintFromRequest(req)
+	if name != "台湾音频 测试" {
+		t.Fatalf("unexpected sanitized project name: %q", name)
+	}
+	if len(custs) != 2 || custs[0] != "cust-1" || custs[1] != "cust-2" {
+		t.Fatalf("unexpected parsed customer IDs: %+v", custs)
+	}
+
+	a := &Agent{}
+	a.recordProjectHint("p-new", name, custs)
+	snap := a.snapshotProjectHints([]protocol.ProjectAvailability{{ProjectID: "p-new", ReadyCount: 1}})
+	h, ok := snap["p-new"]
+	if !ok || h.Name != "台湾音频 测试" || len(h.CustomerIDs) != 2 {
+		t.Fatalf("unexpected project hint snapshot: %+v", snap)
+	}
+}

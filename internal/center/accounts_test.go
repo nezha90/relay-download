@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -503,5 +504,69 @@ func TestNodePauseResumeAndAgentAScript(t *testing.T) {
 	}
 	if asResp.LocalToken == "" || asResp.RotatedToken == "" {
 		t.Fatalf("expected non-empty local_token and rotated_token")
+	}
+
+	// 4. Auto-creating a new project via dispatch activity WITH X-Customer / ProjectHints:
+	//    - New project "auto-cust-proj" with customer hint [cust-auto-1] & name "自动分配测试" is immediately visible to cust-auto-1!
+	//    - Pre-existing project "proj-1" with customer hint [cust-auto-2] does NOT overwrite admin's existing permissions!
+	//    - Invalid customer ID is ignored safely without failing project creation.
+	for _, cid := range []string{"cust-auto-1", "cust-auto-2"} {
+		if res := reqJSON(http.MethodPost, "/api/v1/admin/accounts", adminHdr, map[string]any{"id": cid, "name": cid}); res.Code != http.StatusOK {
+			t.Fatalf("create %s failed: %d %s", cid, res.Code, res.Body.String())
+		}
+	}
+	rotANodeHdr := map[string]string{protocol.HeaderNodeID: "a-1", protocol.HeaderNodeToken: asResp.RotatedToken}
+	recAutoHB := reqJSON(http.MethodPost, "/api/v1/a/heartbeat", rotANodeHdr, protocol.AgentAHeartbeatReq{
+		NodeID:     "a-1",
+		PublicAddr: "https://frp.example.com:9443",
+		Availability: []protocol.ProjectAvailability{
+			{ProjectID: "auto-cust-proj", ReadyCount: 1, ReadyBytes: 123},
+			{ProjectID: "proj-1", ReadyCount: 1, ReadyBytes: 123},
+		},
+		ProjectHints: map[string]protocol.ProjectAutoHint{
+			"auto-cust-proj": {Name: "自动分配测试", CustomerIDs: []string{"cust-auto-1", "nonexistent-cust"}},
+			"proj-1":         {Name: "不应覆盖", CustomerIDs: []string{"cust-auto-2"}},
+		},
+	})
+	if recAutoHB.Code != http.StatusOK {
+		t.Fatalf("auto-create heartbeat failed: %d %s", recAutoHB.Code, recAutoHB.Body.String())
+	}
+
+	autoProj, err := srv.Store().GetProject(ctx, "auto-cust-proj")
+	if err != nil || autoProj.Name != "自动分配测试" {
+		t.Fatalf("expected auto-created project with display name '自动分配测试', got %+v err=%v", autoProj, err)
+	}
+	c1After, err := srv.Store().GetAccount(ctx, "cust-auto-1")
+	if err != nil || !slices.Contains(c1After.Projects, "auto-cust-proj") {
+		t.Fatalf("expected cust-auto-1 to automatically receive 'auto-cust-proj', got %+v err=%v", c1After, err)
+	}
+	c2After, err := srv.Store().GetAccount(ctx, "cust-auto-2")
+	if err != nil || slices.Contains(c2After.Projects, "proj-1") {
+		t.Fatalf("existing project proj-1 must NOT be auto-reassigned to cust-auto-2, got %+v err=%v", c2After, err)
+	}
+
+	// Also verify SummaryEvent auto-create path (if events arrive before heartbeat!).
+	recAutoEv := reqJSON(http.MethodPost, "/api/v1/a/events", rotANodeHdr, protocol.SummaryEventsReq{
+		Events: []protocol.SummaryEvent{
+			{
+				EventID:     "ev-auto-cust-2",
+				ProjectID:   "auto-ev-proj",
+				ProjectName: "事件优先创建",
+				CustomerIDs: []string{"cust-auto-2"},
+				EventType:   protocol.EventUploaded,
+				Bytes:       456,
+			},
+		},
+	})
+	if recAutoEv.Code != http.StatusOK {
+		t.Fatalf("auto-create events failed: %d %s", recAutoEv.Code, recAutoEv.Body.String())
+	}
+	evProj, err := srv.Store().GetProject(ctx, "auto-ev-proj")
+	if err != nil || evProj.Name != "事件优先创建" {
+		t.Fatalf("expected event-created project '事件优先创建', got %+v err=%v", evProj, err)
+	}
+	c2AfterEv, _ := srv.Store().GetAccount(ctx, "cust-auto-2")
+	if !slices.Contains(c2AfterEv.Projects, "auto-ev-proj") {
+		t.Fatalf("expected cust-auto-2 to automatically receive 'auto-ev-proj' via events, got %+v", c2AfterEv.Projects)
 	}
 }

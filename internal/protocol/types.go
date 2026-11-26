@@ -15,6 +15,8 @@ const (
 	HeaderProject        = "X-Project"
 	HeaderFilename       = "X-Filename"
 	HeaderExpectedSHA256 = "X-Expected-SHA256"
+	HeaderCustomer       = "X-Customer"
+	HeaderProjectName    = "X-Project-Name"
 )
 
 const (
@@ -170,6 +172,11 @@ func (n NodeRecord) DiskAffinityEnabled() bool {
 	return *n.DiskAffinity
 }
 
+type ProjectAutoHint struct {
+	Name        string   `json:"name,omitempty"`
+	CustomerIDs []string `json:"customer_ids,omitempty"`
+}
+
 type ProjectAvailability struct {
 	ProjectID    string `json:"project_id"`
 	ReadyCount   int    `json:"ready_count"`
@@ -178,40 +185,43 @@ type ProjectAvailability struct {
 }
 
 type AgentAHeartbeatReq struct {
-	NodeID           string                `json:"node_id"`
-	Name             string                `json:"name"`
-	PublicAddr       string                `json:"public_addr"`
-	Projects         []string              `json:"projects"`
-	Version          string                `json:"version,omitempty"`
-	OS               string                `json:"os,omitempty"`
-	Arch             string                `json:"arch,omitempty"`
-	UpgradeAttemptID string                `json:"upgrade_attempt_id,omitempty"`
-	UpgradeStatus    string                `json:"upgrade_status,omitempty"`
-	UpgradeError     string                `json:"upgrade_error,omitempty"`
-	DiskTotalBytes       uint64                `json:"disk_total_bytes"`
-	DiskFreeBytes        uint64                `json:"disk_free_bytes"`
-	DiskUsedPct          float64               `json:"disk_used_pct"`
-	DiskAlarm            bool                  `json:"disk_alarm"`
-	MaxDiskUsagePct      float64               `json:"max_disk_usage_pct,omitempty"`
-	StorageDirs          []string              `json:"storage_dirs,omitempty"`
-	Disks                []DiskStatus          `json:"disks,omitempty"`
-	HostDisks            []HostDisk            `json:"host_disks,omitempty"`
-	AwaitingDisk         bool                  `json:"awaiting_disk,omitempty"`
-	Paused               bool                  `json:"paused,omitempty"`
-	ActiveStreams        int                   `json:"active_streams,omitempty"`
-	MaxConcurrentStreams int                   `json:"max_concurrent_streams,omitempty"`
-	Availability         []ProjectAvailability `json:"availability"`
+	NodeID               string                     `json:"node_id"`
+	Name                 string                     `json:"name"`
+	PublicAddr           string                     `json:"public_addr"`
+	Projects             []string                   `json:"projects"`
+	Version              string                     `json:"version,omitempty"`
+	OS                   string                     `json:"os,omitempty"`
+	Arch                 string                     `json:"arch,omitempty"`
+	UpgradeAttemptID     string                     `json:"upgrade_attempt_id,omitempty"`
+	UpgradeStatus        string                     `json:"upgrade_status,omitempty"`
+	UpgradeError         string                     `json:"upgrade_error,omitempty"`
+	DiskTotalBytes       uint64                     `json:"disk_total_bytes"`
+	DiskFreeBytes        uint64                     `json:"disk_free_bytes"`
+	DiskUsedPct          float64                    `json:"disk_used_pct"`
+	DiskAlarm            bool                       `json:"disk_alarm"`
+	MaxDiskUsagePct      float64                    `json:"max_disk_usage_pct,omitempty"`
+	StorageDirs          []string                   `json:"storage_dirs,omitempty"`
+	Disks                []DiskStatus               `json:"disks,omitempty"`
+	HostDisks            []HostDisk                 `json:"host_disks,omitempty"`
+	AwaitingDisk         bool                       `json:"awaiting_disk,omitempty"`
+	Paused               bool                       `json:"paused,omitempty"`
+	ActiveStreams        int                        `json:"active_streams,omitempty"`
+	MaxConcurrentStreams int                        `json:"max_concurrent_streams,omitempty"`
+	Availability         []ProjectAvailability      `json:"availability"`
+	ProjectHints         map[string]ProjectAutoHint `json:"project_hints,omitempty"`
 }
 
 type SummaryEvent struct {
-	EventID    string    `json:"event_id"`
-	ProjectID  string    `json:"project_id"`
-	ANodeID    string    `json:"a_node_id"`
-	BNodeID    string    `json:"b_node_id,omitempty"`
-	EventType  string    `json:"event_type"`
-	Bytes      int64     `json:"bytes"`
-	DurationMs int64     `json:"duration_ms"`
-	Timestamp  time.Time `json:"timestamp"`
+	EventID     string    `json:"event_id"`
+	ProjectID   string    `json:"project_id"`
+	ProjectName string    `json:"project_name,omitempty"`
+	CustomerIDs []string  `json:"customer_ids,omitempty"`
+	ANodeID     string    `json:"a_node_id"`
+	BNodeID     string    `json:"b_node_id,omitempty"`
+	EventType   string    `json:"event_type"`
+	Bytes       int64     `json:"bytes"`
+	DurationMs  int64     `json:"duration_ms"`
+	Timestamp   time.Time `json:"timestamp"`
 }
 
 type SummaryEventsReq struct {
@@ -371,20 +381,24 @@ type NackReq struct {
 }
 
 type LocalUploadResp struct {
-	FileID    string `json:"file_id"`
-	ProjectID string `json:"project_id"`
-	Filename  string `json:"filename"`
-	Size      int64  `json:"size"`
-	SHA256    string `json:"sha256"`
-	Status    string `json:"status"`
+	FileID      string   `json:"file_id"`
+	ProjectID   string   `json:"project_id"`
+	Filename    string   `json:"filename"`
+	Size        int64    `json:"size"`
+	SHA256      string   `json:"sha256"`
+	Status      string   `json:"status"`
+	CustomerIDs []string `json:"customer_ids,omitempty"`
 }
 
 type LocalRegisterReq struct {
-	ProjectID      string `json:"project_id"`
-	LocalPath      string `json:"local_path"`
-	Filename       string `json:"filename"`
-	ExpectedSHA256 string `json:"expected_sha256,omitempty"`
-	Mode           string `json:"mode,omitempty"` // "move" (default) | "hardlink"
+	ProjectID      string   `json:"project_id"`
+	ProjectName    string   `json:"project_name,omitempty"`
+	Customer       string   `json:"customer,omitempty"`
+	Customers      []string `json:"customers,omitempty"`
+	LocalPath      string   `json:"local_path"`
+	Filename       string   `json:"filename"`
+	ExpectedSHA256 string   `json:"expected_sha256,omitempty"`
+	Mode           string   `json:"mode,omitempty"` // "move" (default) | "hardlink"
 }
 
 type LocalRegisterBatchReq struct {

@@ -128,7 +128,7 @@ type Server struct {
 	closeOnce     sync.Once
 }
 
-func (s *Server) ensureKnownProjects(ctx context.Context, ids []string) {
+func (s *Server) ensureKnownProjects(ctx context.Context, ids []string, hints map[string]protocol.ProjectAutoHint) {
 	var missing []string
 	seen := make(map[string]struct{})
 	for _, raw := range ids {
@@ -148,7 +148,32 @@ func (s *Server) ensureKnownProjects(ctx context.Context, ids []string) {
 	if len(missing) == 0 {
 		return
 	}
-	inserted, err := s.store.EnsureProjects(ctx, missing)
+	var cleanHints map[string]protocol.ProjectAutoHint
+	if len(hints) > 0 {
+		cleanHints = make(map[string]protocol.ProjectAutoHint, len(missing))
+		for _, id := range missing {
+			h, ok := hints[id]
+			if !ok {
+				continue
+			}
+			ch := protocol.ProjectAutoHint{
+				Name: sanitizeSingleLine(h.Name, 128),
+			}
+			for _, cid := range h.CustomerIDs {
+				cid = strings.TrimSpace(cid)
+				if cid != "" && validIDRe.MatchString(cid) {
+					ch.CustomerIDs = append(ch.CustomerIDs, cid)
+					if len(ch.CustomerIDs) >= 16 {
+						break
+					}
+				}
+			}
+			if ch.Name != "" || len(ch.CustomerIDs) > 0 {
+				cleanHints[id] = ch
+			}
+		}
+	}
+	inserted, assigned, missingCustomers, err := s.store.EnsureProjectsWithHints(ctx, missing, cleanHints)
 	if err != nil {
 		s.logger.Warn("auto-create projects failed", "projects", missing, "err", err)
 		return
@@ -156,8 +181,11 @@ func (s *Server) ensureKnownProjects(ctx context.Context, ids []string) {
 	for _, id := range missing {
 		s.knownProjects.Store(id, struct{}{})
 	}
+	if len(missingCustomers) > 0 {
+		s.logger.Warn("auto-assign skipped unknown or non-customer accounts on project auto-creation", "projects", missing, "missing_customers", missingCustomers)
+	}
 	if inserted > 0 {
-		s.logger.Info("auto-created projects from dispatch activity", "count", inserted, "projects", missing)
+		s.logger.Info("auto-created projects from dispatch activity", "count", inserted, "projects", missing, "assigned_customers", assigned)
 	}
 }
 
@@ -491,7 +519,7 @@ func (s *Server) handleAHeartbeat(w http.ResponseWriter, r *http.Request, node *
 		for _, av := range req.Availability {
 			availIDs = append(availIDs, av.ProjectID)
 		}
-		s.ensureKnownProjects(r.Context(), availIDs)
+		s.ensureKnownProjects(r.Context(), availIDs, req.ProjectHints)
 	}
 	req.Paused = node.Paused
 	s.processUnplugLatches(r.Context(), node, req.Disks)
@@ -529,6 +557,7 @@ func (s *Server) handleAEvents(w http.ResponseWriter, r *http.Request, node *Sto
 	}
 	validEvents := make([]protocol.SummaryEvent, 0, len(req.Events))
 	evProjects := make([]string, 0, len(req.Events))
+	var evHints map[string]protocol.ProjectAutoHint
 	for _, ev := range req.Events {
 		if !nodeAllowsProject(node.Projects, ev.ProjectID) || ev.Bytes < 0 || ev.DurationMs < 0 {
 			continue
@@ -536,9 +565,22 @@ func (s *Server) handleAEvents(w http.ResponseWriter, r *http.Request, node *Sto
 		ev.ANodeID = node.ID
 		validEvents = append(validEvents, ev)
 		evProjects = append(evProjects, ev.ProjectID)
+		if ev.ProjectName != "" || len(ev.CustomerIDs) > 0 {
+			if evHints == nil {
+				evHints = make(map[string]protocol.ProjectAutoHint)
+			}
+			cur := evHints[ev.ProjectID]
+			if cur.Name == "" && ev.ProjectName != "" {
+				cur.Name = ev.ProjectName
+			}
+			if len(cur.CustomerIDs) == 0 && len(ev.CustomerIDs) > 0 {
+				cur.CustomerIDs = append([]string(nil), ev.CustomerIDs...)
+			}
+			evHints[ev.ProjectID] = cur
+		}
 	}
 	if len(evProjects) > 0 {
-		s.ensureKnownProjects(r.Context(), evProjects)
+		s.ensureKnownProjects(r.Context(), evProjects, evHints)
 	}
 	applied, err := s.store.RecordSummaryEvents(r.Context(), validEvents)
 	if err != nil {

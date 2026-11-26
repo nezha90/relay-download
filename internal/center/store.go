@@ -220,37 +220,99 @@ CREATE TABLE IF NOT EXISTS accounts (
 // EnsureProjects idempotently inserts newly discovered project IDs so projects uploaded to
 // dispatch nodes automatically appear in the console and in receiver scheduling queues.
 func (s *Store) EnsureProjects(ctx context.Context, ids []string) (int, error) {
+	inserted, _, _, err := s.EnsureProjectsWithHints(ctx, ids, nil)
+	return inserted, err
+}
+
+// EnsureProjectsWithHints atomically inserts newly discovered projects and, ONLY for projects
+// newly created in this transaction, optionally sets their initial display name and assigns them
+// to the specified customer accounts. Pre-existing projects are never modified so admin-curated
+// permissions can never be overwritten or re-granted by old upload scripts.
+func (s *Store) EnsureProjectsWithHints(ctx context.Context, ids []string, hints map[string]protocol.ProjectAutoHint) (inserted int, assigned map[string][]string, missingCustomers []string, err error) {
 	if len(ids) == 0 {
-		return 0, nil
+		return 0, nil, nil, nil
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return 0, err
+		return 0, nil, nil, err
 	}
 	defer tx.Rollback()
 
 	now := time.Now().UTC()
-	inserted := 0
+	missingSeen := make(map[string]struct{})
 	for _, raw := range ids {
 		id := strings.TrimSpace(raw)
 		if id == "" {
 			continue
 		}
-		res, err := tx.ExecContext(ctx, `
+		hint := hints[id]
+		projName := strings.TrimSpace(hint.Name)
+		if projName == "" {
+			projName = id
+		}
+		res, execErr := tx.ExecContext(ctx, `
 INSERT OR IGNORE INTO projects (id, name, description, conflict_policy, lease_ttl_sec, created_at)
 VALUES (?, ?, '上传自动发现创建', 'overwrite', 300, ?)
-`, id, id, now)
-		if err != nil {
-			return 0, err
+`, id, projName, now)
+		if execErr != nil {
+			return 0, nil, nil, execErr
 		}
-		if n, _ := res.RowsAffected(); n > 0 {
-			inserted++
+		n, _ := res.RowsAffected()
+		if n == 0 {
+			continue
+		}
+		inserted++
+		if len(hint.CustomerIDs) == 0 {
+			continue
+		}
+		seenAcc := make(map[string]struct{}, len(hint.CustomerIDs))
+		for _, rawAcc := range hint.CustomerIDs {
+			accID := strings.TrimSpace(rawAcc)
+			if accID == "" {
+				continue
+			}
+			if _, dup := seenAcc[accID]; dup {
+				continue
+			}
+			seenAcc[accID] = struct{}{}
+			var role, projsJSON string
+			qErr := tx.QueryRowContext(ctx, `SELECT role, projects_json FROM accounts WHERE id = ?`, accID).Scan(&role, &projsJSON)
+			if errors.Is(qErr, sql.ErrNoRows) || (qErr == nil && role != protocol.AccountRoleCustomer) {
+				if _, dup := missingSeen[accID]; !dup {
+					missingSeen[accID] = struct{}{}
+					missingCustomers = append(missingCustomers, accID)
+				}
+				continue
+			}
+			if qErr != nil {
+				return 0, nil, nil, qErr
+			}
+			var curProjs []string
+			_ = json.Unmarshal([]byte(projsJSON), &curProjs)
+			already := false
+			for _, p := range curProjs {
+				if p == id {
+					already = true
+					break
+				}
+			}
+			if !already {
+				curProjs = append(curProjs, id)
+				newJSON, _ := json.Marshal(curProjs)
+				if _, uErr := tx.ExecContext(ctx, `UPDATE accounts SET projects_json = ? WHERE id = ?`, string(newJSON), accID); uErr != nil {
+					return 0, nil, nil, uErr
+				}
+			}
+			if assigned == nil {
+				assigned = make(map[string][]string)
+			}
+			assigned[id] = append(assigned[id], accID)
 		}
 	}
 	if err := tx.Commit(); err != nil {
-		return 0, err
+		return 0, nil, nil, err
 	}
-	return inserted, nil
+	return inserted, assigned, missingCustomers, nil
 }
 
 func (s *Store) ListProjectIDs(ctx context.Context) ([]string, error) {

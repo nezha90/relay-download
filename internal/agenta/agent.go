@@ -49,6 +49,9 @@ type Agent struct {
 	diskHealth      *transfer.DiskHealthTracker
 	diskRRIdx       atomic.Uint64
 
+	hintMu       sync.RWMutex
+	projectHints map[string]protocol.ProjectAutoHint
+
 	localSrv  *http.Server
 	publicSrv *http.Server
 
@@ -134,6 +137,7 @@ func New(cfg *Config, logger *slog.Logger) (*Agent, error) {
 		disabledDisks:   make(map[string]struct{}),
 		maxDiskUsagePct: transfer.NormalizeMaxDiskUsagePct(cfg.MaxDiskUsagePct),
 		diskHealth:      diskHealth,
+		projectHints:    make(map[string]protocol.ProjectAutoHint),
 		limiter:       limiter,
 		httpClient: &http.Client{
 			Timeout: 15 * time.Second,
@@ -870,14 +874,111 @@ func isValidProjectID(id string) bool {
 	return true
 }
 
+func parseCustomerIDList(raws ...string) []string {
+	var out []string
+	seen := make(map[string]struct{})
+	for _, raw := range raws {
+		for _, part := range strings.Split(raw, ",") {
+			id := strings.TrimSpace(part)
+			if id == "" || !isValidProjectID(id) {
+				continue
+			}
+			if _, dup := seen[id]; dup {
+				continue
+			}
+			seen[id] = struct{}{}
+			out = append(out, id)
+			if len(out) >= 16 {
+				return out
+			}
+		}
+	}
+	return out
+}
+
+func sanitizeHintName(s string) string {
+	s = strings.TrimSpace(strings.ReplaceAll(strings.ReplaceAll(s, "\r", " "), "\n", " "))
+	if r := []rune(s); len(r) > 128 {
+		s = string(r[:128])
+	}
+	return s
+}
+
+func extractProjectHintFromRequest(r *http.Request) (projName string, customers []string) {
+	q := r.URL.Query()
+	projName = sanitizeHintName(r.Header.Get(protocol.HeaderProjectName))
+	if projName == "" {
+		projName = sanitizeHintName(q.Get("project_name"))
+	}
+	customers = parseCustomerIDList(
+		r.Header.Get(protocol.HeaderCustomer),
+		r.Header.Get("X-Account"),
+		q.Get("customer"),
+		q.Get("account"),
+	)
+	return projName, customers
+}
+
+func (a *Agent) recordProjectHint(projectID, projName string, customers []string) {
+	if projectID == "" || (projName == "" && len(customers) == 0) {
+		return
+	}
+	a.hintMu.Lock()
+	defer a.hintMu.Unlock()
+	if a.projectHints == nil {
+		a.projectHints = make(map[string]protocol.ProjectAutoHint)
+	}
+	if len(a.projectHints) >= 4096 {
+		if _, exists := a.projectHints[projectID]; !exists {
+			// Clear stale cache once upper bound is hit; active projects re-populate on next upload.
+			a.projectHints = make(map[string]protocol.ProjectAutoHint)
+		}
+	}
+	cur := a.projectHints[projectID]
+	if cur.Name == "" && projName != "" {
+		cur.Name = projName
+	}
+	if len(cur.CustomerIDs) == 0 && len(customers) > 0 {
+		cur.CustomerIDs = append([]string(nil), customers...)
+	}
+	a.projectHints[projectID] = cur
+}
+
+func (a *Agent) snapshotProjectHints(avail []protocol.ProjectAvailability) map[string]protocol.ProjectAutoHint {
+	if len(avail) == 0 {
+		return nil
+	}
+	a.hintMu.RLock()
+	defer a.hintMu.RUnlock()
+	if len(a.projectHints) == 0 {
+		return nil
+	}
+	var out map[string]protocol.ProjectAutoHint
+	for _, av := range avail {
+		h, ok := a.projectHints[av.ProjectID]
+		if !ok || (h.Name == "" && len(h.CustomerIDs) == 0) {
+			continue
+		}
+		if out == nil {
+			out = make(map[string]protocol.ProjectAutoHint)
+		}
+		out[av.ProjectID] = protocol.ProjectAutoHint{
+			Name:        h.Name,
+			CustomerIDs: append([]string(nil), h.CustomerIDs...),
+		}
+	}
+	return out
+}
+
 func (a *Agent) handleLocalPutFile(w http.ResponseWriter, r *http.Request) {
 	projectID := strings.TrimSpace(r.PathValue("project"))
 	filename := strings.TrimSpace(r.PathValue("filename"))
 	expectedSHA256 := strings.TrimSpace(r.Header.Get(protocol.HeaderExpectedSHA256))
-	a.ingestRawBody(w, r, projectID, filename, expectedSHA256)
+	projName, customers := extractProjectHintFromRequest(r)
+	a.ingestRawBody(w, r, projectID, filename, expectedSHA256, projName, customers)
 }
 
-func (a *Agent) ingestRawBody(w http.ResponseWriter, r *http.Request, projectID, filename, expectedSHA256 string) {
+func (a *Agent) ingestRawBody(w http.ResponseWriter, r *http.Request, projectID, filename, expectedSHA256, projName string, customers []string) {
 	var extraBytes uint64
 	if r.ContentLength > 0 {
 		extraBytes = uint64(r.ContentLength)
@@ -961,30 +1062,34 @@ func (a *Agent) ingestRawBody(w http.ResponseWriter, r *http.Request, projectID,
 		UploadedAt: time.Now().UTC(),
 	}
 	uplEv := &protocol.SummaryEvent{
-		EventID:   "upl-" + fileID,
-		ProjectID: projectID,
-		ANodeID:   a.cfg.NodeID,
-		EventType: protocol.EventUploaded,
-		Bytes:     written,
-		Timestamp: rec.UploadedAt,
+		EventID:     "upl-" + fileID,
+		ProjectID:   projectID,
+		ProjectName: projName,
+		CustomerIDs: customers,
+		ANodeID:     a.cfg.NodeID,
+		EventType:   protocol.EventUploaded,
+		Bytes:       written,
+		Timestamp:   rec.UploadedAt,
 	}
 	if err := a.store.PutReady(rec, uplEv); err != nil {
 		_ = os.Remove(readyPath)
 		protocol.WriteError(w, http.StatusInternalServerError, "persist file metadata: "+err.Error())
 		return
 	}
+	a.recordProjectHint(projectID, projName, customers)
 
 	a.triggerEventFlush()
 	a.triggerHeartbeat()
 
-	a.logger.Info("local file uploaded via PUT and verified READY", "file_id", fileID, "project", projectID, "filename", cleanName, "size", written)
+	a.logger.Info("local file uploaded via PUT and verified READY", "file_id", fileID, "project", projectID, "filename", cleanName, "size", written, "customers", customers)
 	protocol.WriteJSON(w, http.StatusOK, protocol.LocalUploadResp{
-		FileID:    fileID,
-		ProjectID: projectID,
-		Filename:  cleanName,
-		Size:      written,
-		SHA256:    actualSHA,
-		Status:    protocol.FileStatusReady,
+		FileID:      fileID,
+		ProjectID:   projectID,
+		Filename:    cleanName,
+		Size:        written,
+		SHA256:      actualSHA,
+		Status:      protocol.FileStatusReady,
+		CustomerIDs: customers,
 	})
 }
 
@@ -1008,6 +1113,7 @@ func (a *Agent) handleLocalUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	projName, customers := extractProjectHintFromRequest(r)
 	var (
 		projectID      = strings.TrimSpace(r.Header.Get(protocol.HeaderProject))
 		filename       = strings.TrimSpace(r.Header.Get(protocol.HeaderFilename))
@@ -1056,6 +1162,18 @@ func (a *Agent) handleLocalUpload(w http.ResponseWriter, r *http.Request) {
 			case "sha256", "expected_sha256":
 				b, _ := io.ReadAll(io.LimitReader(part, 256))
 				expectedSHA256 = strings.TrimSpace(string(b))
+				_ = part.Close()
+			case "customer", "customers", "account":
+				b, _ := io.ReadAll(io.LimitReader(part, 1024))
+				if cs := parseCustomerIDList(string(b)); len(cs) > 0 {
+					customers = parseCustomerIDList(strings.Join(append(customers, cs...), ","))
+				}
+				_ = part.Close()
+			case "project_name":
+				b, _ := io.ReadAll(io.LimitReader(part, 512))
+				if nm := sanitizeHintName(string(b)); nm != "" {
+					projName = nm
+				}
 				_ = part.Close()
 			case "file":
 				if sawFile {
@@ -1181,30 +1299,34 @@ func (a *Agent) handleLocalUpload(w http.ResponseWriter, r *http.Request) {
 		UploadedAt: time.Now().UTC(),
 	}
 	uplEv := &protocol.SummaryEvent{
-		EventID:   "upl-" + fileID,
-		ProjectID: projectID,
-		ANodeID:   a.cfg.NodeID,
-		EventType: protocol.EventUploaded,
-		Bytes:     written,
-		Timestamp: rec.UploadedAt,
+		EventID:     "upl-" + fileID,
+		ProjectID:   projectID,
+		ProjectName: projName,
+		CustomerIDs: customers,
+		ANodeID:     a.cfg.NodeID,
+		EventType:   protocol.EventUploaded,
+		Bytes:       written,
+		Timestamp:   rec.UploadedAt,
 	}
 	if err := a.store.PutReady(rec, uplEv); err != nil {
 		_ = os.Remove(readyPath)
 		protocol.WriteError(w, http.StatusInternalServerError, "persist file metadata: "+err.Error())
 		return
 	}
+	a.recordProjectHint(projectID, projName, customers)
 
 	a.triggerEventFlush()
 	a.triggerHeartbeat()
 
-	a.logger.Info("local file uploaded and verified READY", "file_id", fileID, "project", projectID, "filename", cleanName, "size", written)
+	a.logger.Info("local file uploaded and verified READY", "file_id", fileID, "project", projectID, "filename", cleanName, "size", written, "customers", customers)
 	protocol.WriteJSON(w, http.StatusOK, protocol.LocalUploadResp{
-		FileID:    fileID,
-		ProjectID: projectID,
-		Filename:  cleanName,
-		Size:      written,
-		SHA256:    actualSHA,
-		Status:    protocol.FileStatusReady,
+		FileID:      fileID,
+		ProjectID:   projectID,
+		Filename:    cleanName,
+		Size:        written,
+		SHA256:      actualSHA,
+		Status:      protocol.FileStatusReady,
+		CustomerIDs: customers,
 	})
 }
 
@@ -1302,31 +1424,40 @@ func (a *Agent) handleLocalRegister(w http.ResponseWriter, r *http.Request) {
 		Status:     protocol.FileStatusReady,
 		UploadedAt: time.Now().UTC(),
 	}
+	reqProjName, reqCustomers := extractProjectHintFromRequest(r)
+	if nm := sanitizeHintName(req.ProjectName); nm != "" {
+		reqProjName = nm
+	}
+	regCustomers := parseCustomerIDList(append(append([]string{req.Customer}, req.Customers...), reqCustomers...)...)
 	uplEv := &protocol.SummaryEvent{
-		EventID:   "upl-" + fileID,
-		ProjectID: req.ProjectID,
-		ANodeID:   a.cfg.NodeID,
-		EventType: protocol.EventUploaded,
-		Bytes:     size,
-		Timestamp: rec.UploadedAt,
+		EventID:     "upl-" + fileID,
+		ProjectID:   req.ProjectID,
+		ProjectName: reqProjName,
+		CustomerIDs: regCustomers,
+		ANodeID:     a.cfg.NodeID,
+		EventType:   protocol.EventUploaded,
+		Bytes:       size,
+		Timestamp:   rec.UploadedAt,
 	}
 	if err := a.store.PutReady(rec, uplEv); err != nil {
 		_ = os.Remove(readyPath)
 		protocol.WriteError(w, http.StatusInternalServerError, "persist file metadata: "+err.Error())
 		return
 	}
+	a.recordProjectHint(req.ProjectID, reqProjName, regCustomers)
 
 	a.triggerEventFlush()
 	a.triggerHeartbeat()
 
-	a.logger.Info("local file registered and verified READY", "file_id", fileID, "project", req.ProjectID, "filename", cleanName, "size", size, "mode", mode)
+	a.logger.Info("local file registered and verified READY", "file_id", fileID, "project", req.ProjectID, "filename", cleanName, "size", size, "mode", mode, "customers", regCustomers)
 	protocol.WriteJSON(w, http.StatusOK, protocol.LocalUploadResp{
-		FileID:    fileID,
-		ProjectID: req.ProjectID,
-		Filename:  cleanName,
-		Size:      size,
-		SHA256:    actualSHA,
-		Status:    protocol.FileStatusReady,
+		FileID:      fileID,
+		ProjectID:   req.ProjectID,
+		Filename:    cleanName,
+		Size:        size,
+		SHA256:      actualSHA,
+		Status:      protocol.FileStatusReady,
+		CustomerIDs: regCustomers,
 	})
 }
 
@@ -1385,6 +1516,7 @@ func (a *Agent) handleLocalRegisterBatch(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	reqProjName, reqCustomers := extractProjectHintFromRequest(r)
 	results := make([]protocol.LocalRegisterBatchItemResult, len(req.Items))
 	var (
 		recs       []FileRecord
@@ -1473,15 +1605,23 @@ func (a *Agent) handleLocalRegisterBatch(w http.ResponseWriter, r *http.Request)
 			Status:     protocol.FileStatusReady,
 			UploadedAt: now,
 		}
+		itProjName := sanitizeHintName(it.ProjectName)
+		if itProjName == "" {
+			itProjName = reqProjName
+		}
+		itCustomers := parseCustomerIDList(append(append([]string{it.Customer}, it.Customers...), reqCustomers...)...)
 		recs = append(recs, rec)
 		evs = append(evs, &protocol.SummaryEvent{
-			EventID:   "upl-" + fileID,
-			ProjectID: it.ProjectID,
-			ANodeID:   a.cfg.NodeID,
-			EventType: protocol.EventUploaded,
-			Bytes:     size,
-			Timestamp: now,
+			EventID:     "upl-" + fileID,
+			ProjectID:   it.ProjectID,
+			ProjectName: itProjName,
+			CustomerIDs: itCustomers,
+			ANodeID:     a.cfg.NodeID,
+			EventType:   protocol.EventUploaded,
+			Bytes:       size,
+			Timestamp:   now,
 		})
+		a.recordProjectHint(it.ProjectID, itProjName, itCustomers)
 		readyPaths = append(readyPaths, readyPath)
 		recIdx = append(recIdx, i)
 	}
@@ -2154,6 +2294,7 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 		ActiveStreams:        int(a.activeStreams.Load()),
 		MaxConcurrentStreams: a.cfg.MaxConcurrentStreams,
 		Availability:         avail,
+		ProjectHints:         a.snapshotProjectHints(avail),
 	}
 	body, _ := json.Marshal(payload)
 	url := strings.TrimRight(a.cfg.CenterURL, "/") + "/api/v1/a/heartbeat"

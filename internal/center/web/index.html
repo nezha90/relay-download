@@ -174,7 +174,7 @@
           <div class="concept-box">
             <strong>接口接入说明：</strong> 业务方在<strong>分发节点本机</strong>直接调用 <code>http://127.0.0.1:&lt;本机上传端口&gt;</code>（默认
             <code>18081</code>），<strong>仅限本机回环访问、免鉴权直传</strong>（无需配置任何
-            Token）。<strong>新项目无需提前建档</strong>，首次上传自动创建项目隔离目录（默认仅管理员可见，分配给指定客户后客户立即可见）；如需自定义冲突覆盖/全局限速，先点右上角「+ 新建项目」即可。
+            Token）。<strong>新项目无需提前建档</strong>，首次上传自动创建项目隔离目录：携带 <code>X-Customer</code> 请求头可直接自动分配给指定客户（同时支持可选 <code>X-Project-Name</code> 设置备注名），不带则默认仅管理员可见；已存在项目不会覆盖后台已调权限。
           </div>
 
           <div class="api-var-bar">
@@ -186,7 +186,13 @@
                   autocomplete="off" />
               </div>
             </label>
-            <label class="api-var-item" style="max-width:150px">
+            <label class="api-var-item" style="min-width:210px">
+              <span>首次建档自动分配给客户（可选）</span>
+              <select id="guide-p-customer-select" class="window-select">
+                <option value="">不指定（默认仅管理员可见）</option>
+              </select>
+            </label>
+            <label class="api-var-item" style="max-width:130px">
               <span>本机上传端口</span>
               <input id="guide-p-port" type="number" value="18081" min="1" max="65535" />
             </label>

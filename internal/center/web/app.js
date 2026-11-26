@@ -409,6 +409,7 @@ async function refreshAll() {
     if (!isCustomer()) {
       renderDeployTasks(tasks || []);
       renderAccounts(cachedAccounts);
+      syncProjectGuideCustomerOptions(cachedAccounts);
     }
   } catch (e) {
     if (e.message !== 'unauthorized') console.error(e);
@@ -889,14 +890,36 @@ function syncProjectGuideSelect(projects) {
   renderProjectGuideSnippets();
 }
 
+function syncProjectGuideCustomerOptions(accounts) {
+  const sel = document.getElementById('guide-p-customer-select');
+  if (!sel) return;
+  const prev = sel.value;
+  const list = (accounts || []).filter(a => a && a.enabled !== false);
+  const opts = ['<option value="">不指定（默认仅管理员可见）</option>'];
+  for (const a of list) {
+    opts.push(`<option value="${esc(a.id)}">${esc(a.name || a.id)} (${esc(a.id)})</option>`);
+  }
+  sel.innerHTML = opts.join('');
+  if (prev && list.some(a => a.id === prev)) {
+    sel.value = prev;
+  }
+  renderProjectGuideSnippets();
+}
+
 function renderProjectGuideSnippets() {
   const inp = document.getElementById('guide-p-project-input');
   const portEl = document.getElementById('guide-p-port');
+  const custEl = document.getElementById('guide-p-customer-select');
   if (!inp || !portEl) return;
 
   const proj = (inp.value || 'my-project').trim().replace(/[^A-Za-z0-9._-]/g, '') || 'my-project';
   const port = Math.max(1, Math.min(65535, Number(portEl.value || 18081) || 18081));
+  const cust = (custEl && custEl.value || '').trim();
   const base = `http://127.0.0.1:${port}`;
+  const custHdrLine = cust ? `  -H "X-Customer: ${cust}" \\\n` : '';
+  const custFormLine = cust ? `  -F "customer=${cust}" \\\n` : '';
+  const custJsonField = cust ? `\n    "customer": "${cust}",` : '';
+  const custBatchField = cust ? `, "customer": "${cust}"` : '';
 
   const setText = (id, text) => {
     const el = document.getElementById(id);
@@ -904,16 +927,16 @@ function renderProjectGuideSnippets() {
   };
 
   setText('code-p-put',
-`# 单文件流式 PUT（本机回环免鉴权，支持任意相对子目录，新项目自动建档）
+`# 单文件流式 PUT（本机回环免鉴权，新项目自动建档${cust ? `并直接分配给客户 ${cust}` : '；可选加 -H "X-Customer: <客户ID>" 自动分配客户'}）
 curl -fsS -X PUT \\
-  --data-binary @./sample.mp4 \\
+${custHdrLine}  --data-binary @./sample.mp4 \\
   "${base}/local/v1/files/${proj}/videos/sample.mp4"`);
 
   setText('code-p-put-sha',
 `# 先算 SHA256 再上传，服务端落盘前强校验
 SHA=$(sha256sum ./sample.mp4 | awk '{print $1}')
 curl -fsS -X PUT \\
-  -H "X-Expected-SHA256: $SHA" \\
+${custHdrLine}  -H "X-Expected-SHA256: $SHA" \\
   --data-binary @./sample.mp4 \\
   "${base}/local/v1/files/${proj}/videos/sample.mp4"`);
 
@@ -921,7 +944,7 @@ curl -fsS -X PUT \\
 `# Multipart 表单上传（兼容传统上传表单）
 curl -fsS -X POST \\
   -F "project=${proj}" \\
-  -F "filename=videos/sample.mp4" \\
+${custFormLine}  -F "filename=videos/sample.mp4" \\
   -F "file=@./sample.mp4" \\
   "${base}/local/v1/upload"`);
 
@@ -930,7 +953,7 @@ curl -fsS -X POST \\
 curl -fsS -X POST \\
   -H "Content-Type: application/json" \\
   -d '{
-    "project_id": "${proj}",
+    "project_id": "${proj}",${custJsonField}
     "local_path": "/data/incoming/001.opus",
     "filename": "2026/001.opus",
     "mode": "move"
@@ -943,12 +966,15 @@ curl -fsS -X POST \\
   -H "Content-Type: application/json" \\
   -d '{
     "items": [
-      {"project_id": "${proj}", "local_path": "/data/in/v1.m4a", "filename": "v1.m4a", "mode": "move"},
-      {"project_id": "${proj}", "local_path": "/data/in/v1.info.json", "filename": "v1.info.json", "mode": "move"}
+      {"project_id": "${proj}"${custBatchField}, "local_path": "/data/in/v1.m4a", "filename": "v1.m4a", "mode": "move"},
+      {"project_id": "${proj}"${custBatchField}, "local_path": "/data/in/v1.info.json", "filename": "v1.info.json", "mode": "move"}
     ]
   }' \\
   "${base}/local/v1/register-batch"`);
 
+  const pyHeaders = cust
+    ? `{"X-Expected-SHA256": sha, "X-Customer": "${cust}"}`
+    : `{"X-Expected-SHA256": sha}`;
   setText('code-p-python',
 `import time, hashlib, pathlib, requests
 
@@ -959,7 +985,7 @@ def push_file(local_path: str, rel_name: str):
     p = pathlib.Path(local_path)
     sha = hashlib.sha256(p.read_bytes()).hexdigest()
     url = f"{BASE}/local/v1/files/{PROJECT}/{rel_name.lstrip('/')}"
-    headers = {"X-Expected-SHA256": sha}
+    headers = ${pyHeaders}
     for attempt in range(10):
         with p.open("rb") as f:
             r = requests.put(url, headers=headers, data=f, timeout=600)
@@ -2871,6 +2897,7 @@ function setupEvents() {
     renderProjectGuideSnippets();
   });
   document.getElementById('guide-p-port')?.addEventListener('input', renderProjectGuideSnippets);
+  document.getElementById('guide-p-customer-select')?.addEventListener('change', renderProjectGuideSnippets);
   renderProjectGuideSnippets();
 
   document.addEventListener('change', (e) => {
