@@ -236,4 +236,20 @@ func TestCenterDiskHotPlugAutoLockAndManualReconfirm(t *testing.T) {
 	if hbA1.MaxDiskUsagePct != 1 {
 		t.Fatalf("expected dispatch heartbeat watermark 1%%, got %.1f", hbA1.MaxDiskUsagePct)
 	}
+
+	// 5. Orthogonal disk_affinity toggle (default true, persisted, pushed to receiver directive).
+	if hbB99.Directive == nil || hbB99.Directive.DiskAffinity == nil || !*hbB99.Directive.DiskAffinity {
+		t.Fatalf("expected default disk_affinity=true in receiver directive, got %+v", hbB99.Directive)
+	}
+	reqAffOff := httptest.NewRequest(http.MethodPut, "/api/v1/admin/nodes/b-nas", strings.NewReader(`{"disk_policy":"most_free","disk_affinity":false}`))
+	reqAffOff.Header.Set(protocol.HeaderAdminToken, "admin-secret")
+	recAffOff := httptest.NewRecorder()
+	handler.ServeHTTP(recAffOff, reqAffOff)
+	if recAffOff.Code != http.StatusOK {
+		t.Fatalf("PUT disk_affinity=false failed: %d %s", recAffOff.Code, recAffOff.Body.String())
+	}
+	hbAffOff := sendBHB(nil, nil)
+	if hbAffOff.Directive == nil || hbAffOff.Directive.DiskPolicy != protocol.DiskPolicyMostFree || hbAffOff.Directive.DiskAffinity == nil || *hbAffOff.Directive.DiskAffinity {
+		t.Fatalf("expected disk_policy=most_free & disk_affinity=false in directive, got %+v", hbAffOff.Directive)
+	}
 }

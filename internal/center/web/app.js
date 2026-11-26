@@ -1120,13 +1120,31 @@ function scheduleLabel(sched) {
 
 function diskPolicyLabel(pol, activeWin = 10) {
   switch (pol) {
-    case 'rolling_window': return `分批滚动 (${activeWin || 10}盘并发)`;
+    case 'rolling_window': return `分批滚动 (${activeWin || 10}盘)`;
     case 'most_free': return '最大余量优先';
-    case 'round_robin': return '逐文件轮询';
-    case 'first': return '首盘写满再切';
+    case 'first': return '单盘顺序写满';
+    case 'round_robin':
     case 'affinity_hash':
-    default: return '同源均匀';
+    default: return '多盘均衡';
   }
+}
+
+function normalizeUiDiskPolicy(pol) {
+  switch (pol) {
+    case 'rolling_window':
+    case 'most_free':
+    case 'first':
+    case 'round_robin':
+      return pol;
+    case 'affinity_hash':
+    default:
+      return 'round_robin';
+  }
+}
+
+function nodeDiskAffinityEnabled(node) {
+  if (!node || node.disk_affinity === undefined || node.disk_affinity === null) return true;
+  return !!node.disk_affinity;
 }
 
 function renderAdaptiveBadge(n) {
@@ -1347,61 +1365,99 @@ function updateDiskPickerWatermarkPreview(listEl, wm) {
   });
 }
 
+function classifyDiskState(d, disabledSet, lockedSet) {
+  const isLocked = !!(d.unplug_latched || lockedSet.has(d.path));
+  if (d.detached) return 'detached';
+  if (isLocked) return 'locked';
+  const enabled = d.enabled !== false && !disabledSet.has(d.path);
+  if (!enabled) return d.safe_to_eject ? 'safe_eject' : 'disabled';
+  if (d.disk_role === 'full' || d.low_space) return 'full';
+  if (d.disk_role === 'standby') return 'standby';
+  return 'active';
+}
+
+function summarizeNodeDisks(n) {
+  const disks = n.disks || [];
+  const disabledSet = new Set(n.disabled_disks || []);
+  const lockedSet = new Set(n.unplug_locked_disks || []);
+  const counts = { total: disks.length, active: 0, standby: 0, full: 0, disabled: 0, safeEject: 0, detached: 0, locked: 0, inFlight: 0 };
+  let sumTotal = 0;
+  let sumFree = 0;
+  for (const d of disks) {
+    const st = classifyDiskState(d, disabledSet, lockedSet);
+    counts.inFlight += (d.in_flight || 0);
+    if (st === 'detached') counts.detached++;
+    else if (st === 'locked') counts.locked++;
+    else if (st === 'safe_eject') { counts.safeEject++; counts.disabled++; }
+    else if (st === 'disabled') counts.disabled++;
+    else if (st === 'full') counts.full++;
+    else if (st === 'standby') counts.standby++;
+    else counts.active++;
+    if (!d.detached && d.total_bytes > 0) {
+      sumTotal += d.total_bytes;
+      sumFree += (d.free_bytes || 0);
+    }
+  }
+  const totalBytes = n.disk_total_bytes > 0 ? n.disk_total_bytes : sumTotal;
+  const freeBytes = n.disk_total_bytes > 0 ? (n.disk_free_bytes || 0) : sumFree;
+  const usedBytes = Math.max(0, totalBytes - freeBytes);
+  const usedPct = totalBytes > 0 ? (usedBytes / totalBytes) * 100 : Number(n.disk_used_pct || 0);
+  return { counts, totalBytes, freeBytes, usedBytes, usedPct, disabledSet, lockedSet };
+}
+
 function renderReceiverDisks(n) {
   const wm = nodeWatermarkPct(n);
+  const polBadge = `<span class="badge">${esc(diskPolicyLabel(n.disk_policy, n.active_disk_window))}</span>`;
+  const affOn = nodeDiskAffinityEnabled(n);
+  const affBadge = affOn
+    ? '<span class="badge accent">同源亲和</span>'
+    : '<span class="badge standby">无亲和</span>';
   const wmBadge = `<span class="badge">水位 ≤${wm}%</span>`;
+
   if (n.awaiting_disk) {
     const foundCnt = (n.host_disks || []).length;
     return `
-      <div style="display:flex;gap:4px;flex-wrap:wrap;align-items:center"><span class="badge awaiting">⚠ 待选择数据盘（未激活）</span>${wmBadge}</div>
-      <div class="muted" style="margin-top:4px">${foundCnt > 0 ? `已扫描到 ${foundCnt} 块物理盘，请点右侧「选择数据盘并激活」` : '请点右侧「选择数据盘并激活」'}</div>
+      <div class="disk-overview-card">
+        <div class="disk-overview-badges">
+          <span class="badge awaiting">⚠ 待选盘 · 未激活</span>
+          ${polBadge}${affBadge}${wmBadge}
+        </div>
+        <div class="muted">${foundCnt > 0 ? `已扫描到 ${foundCnt} 块物理盘，请点右侧「选择数据盘并激活」` : '请点右侧「选择数据盘并激活」'}</div>
+      </div>
     `;
   }
-  const polBadge = `<span class="badge">${esc(diskPolicyLabel(n.disk_policy, n.active_disk_window))}</span>`;
-  const disks = n.disks || [];
-  if (!disks.length) {
-    return `
-      <div>${fmtBytes(n.disk_free_bytes)} <span class="muted">(${(n.disk_used_pct || 0).toFixed(1)}% 已用)</span></div>
-      <div style="margin-top:4px;display:flex;gap:4px;flex-wrap:wrap">${polBadge}${wmBadge}</div>
-    `;
+
+  const s = summarizeNodeDisks(n);
+  const c = s.counts;
+  const hasAlert = c.detached > 0 || c.locked > 0;
+  const barCls = hasAlert || s.usedPct >= wm || (c.total > 0 && c.active === 0 && c.full > 0) ? 'red' : 'green';
+  const countPills = [];
+  if (c.total > 0) {
+    countPills.push(`<span class="badge">共 ${c.total} 盘</span>`);
+    if (c.active > 0) countPills.push(`<span class="badge online">写入 ${c.active}</span>`);
+    if (c.standby > 0) countPills.push(`<span class="badge standby">候补 ${c.standby}</span>`);
+    if (c.full > 0) countPills.push(`<span class="badge full-disk">已满 ${c.full}</span>`);
+    if (c.safeEject > 0) countPills.push(`<span class="badge safe-eject">✓ 可拔 ${c.safeEject}</span>`);
+    else if (c.disabled > 0) countPills.push(`<span class="badge offline">停用 ${c.disabled}</span>`);
+    if (c.detached > 0) countPills.push(`<span class="badge detached">⚠ 拔出 ${c.detached}</span>`);
+    if (c.locked > 0) countPills.push(`<span class="badge reinsert">🔌 重插 ${c.locked}</span>`);
   }
-  const disabledSet = new Set(n.disabled_disks || []);
-  const lockedSet = new Set(n.unplug_locked_disks || []);
-  let activeCnt = 0, standbyCnt = 0, fullCnt = 0, detachedCnt = 0;
-  for (const d of disks) {
-    if (d.detached) detachedCnt++;
-    else if (d.disk_role === 'full' || d.low_space) fullCnt++;
-    else if (d.disk_role === 'standby') standbyCnt++;
-    else if (d.enabled !== false && !disabledSet.has(d.path) && !d.unplug_latched && !lockedSet.has(d.path)) activeCnt++;
-  }
-  // For ultra-high-density servers (e.g. 20~100+ disks), show a compact role summary strip
-  // and prioritize alert/full/active disks in the table cell so rows stay clean and scannable.
-  let displayDisks = disks;
-  let hiddenCount = 0;
-  if (disks.length > 6) {
-    const priority = disks.filter(d => d.detached || d.unplug_latched || lockedSet.has(d.path) || d.safe_to_eject || d.disk_role === 'full' || d.low_space || d.disk_role === 'active');
-    displayDisks = (priority.length ? priority : disks).slice(0, 6);
-    hiddenCount = disks.length - displayDisks.length;
-  }
-  const items = displayDisks.map(d => renderDiskMiniItem(d, disabledSet, lockedSet, wm)).join('');
-  const summaryHtml = disks.length > 6 ? `
-    <div class="disk-summary-strip">
-      <span class="badge online">写入 ${activeCnt}</span>
-      ${standbyCnt > 0 ? `<span class="badge standby">候补 ${standbyCnt}</span>` : ''}
-      ${fullCnt > 0 ? `<span class="badge full-disk">已满 ${fullCnt}</span>` : ''}
-      ${detachedCnt > 0 ? `<span class="badge detached">拔出 ${detachedCnt}</span>` : ''}
-      <span class="muted" style="font-size:11px">共 ${disks.length} 块盘</span>
-    </div>
-  ` : '';
+  const viewBtn = (c.total > 0 || (n.host_disks && n.host_disks.length > 0))
+    ? `<button type="button" class="btn sm ghost" data-action="view-node-disks" data-id="${esc(n.id)}">查看盘列表 (${c.total || n.host_disks.length}) ▸</button>`
+    : '';
+
   return `
-    <div style="margin-bottom:5px;display:flex;gap:4px;flex-wrap:wrap;align-items:center">
-      ${polBadge}
-      ${wmBadge}
-      ${activeCnt > 1 ? `<span class="badge accent">${activeCnt} 盘并发</span>` : ''}
+    <div class="disk-overview-card">
+      <div class="disk-overview-badges">${polBadge}${affBadge}${wmBadge}</div>
+      <div class="disk-overview-cap">
+        <div class="bar-wrap"><div class="bar-fill ${barCls}" style="width:${Math.min(100, s.usedPct).toFixed(1)}%"></div></div>
+        <div class="muted">剩 ${fmtBytes(s.freeBytes)} / 共 ${fmtBytes(s.totalBytes)} (${s.usedPct.toFixed(1)}% 已用)</div>
+      </div>
+      <div class="disk-overview-foot">
+        ${countPills.join('')}
+        ${viewBtn}
+      </div>
     </div>
-    ${summaryHtml}
-    <div class="disk-mini-list">${items}</div>
-    ${hiddenCount > 0 ? `<div class="muted" style="margin-top:4px;font-size:11px">+ 其余 ${hiddenCount} 块候补/已配置盘（点「配置项目与磁盘」查看全部）</div>` : ''}
   `;
 }
 
@@ -1411,29 +1467,42 @@ function renderDispatchDisks(n) {
   if (n.awaiting_disk) {
     const foundCnt = (n.host_disks || []).length;
     return `
-      <div style="display:flex;gap:4px;flex-wrap:wrap;align-items:center"><span class="badge awaiting">⚠ 待选缓存盘（未激活）</span>${wmBadge}</div>
-      <div class="muted" style="margin-top:4px">${foundCnt > 0 ? `已扫描到 ${foundCnt} 块物理盘，请点右侧激活` : '请点右侧「选择数据盘并激活」'}</div>
-    `;
-  }
-  const disks = n.disks || [];
-  if (disks.length > 0) {
-    const disabledSet = new Set(n.disabled_disks || []);
-    const lockedSet = new Set(n.unplug_locked_disks || []);
-    const activeCnt = disks.filter(d => d.enabled !== false && !disabledSet.has(d.path) && !d.detached && !d.unplug_latched && !lockedSet.has(d.path)).length;
-    const items = disks.map(d => renderDiskMiniItem(d, disabledSet, lockedSet, wm)).join('');
-    return `
-      <div style="margin-bottom:5px;display:flex;gap:4px;flex-wrap:wrap;align-items:center">
-        ${wmBadge}
-        ${activeCnt > 1 ? `<span class="badge accent">${activeCnt} 盘并发缓存</span>` : ''}
+      <div class="disk-overview-card">
+        <div class="disk-overview-badges"><span class="badge awaiting">⚠ 待选缓存盘</span>${wmBadge}</div>
+        <div class="muted">${foundCnt > 0 ? `已扫描到 ${foundCnt} 块物理盘，请点右侧激活` : '请点右侧「选择数据盘并激活」'}</div>
       </div>
-      <div class="disk-mini-list">${items}</div>
     `;
   }
-  const pct = Number(n.disk_used_pct || 0).toFixed(1);
+  const s = summarizeNodeDisks(n);
+  const c = s.counts;
+  const barCls = n.disk_alarm || c.detached > 0 || s.usedPct >= wm ? 'red' : 'green';
+  const countPills = [];
+  if (c.total > 0) {
+    countPills.push(`<span class="badge">共 ${c.total} 盘</span>`);
+    if (c.active > 0) countPills.push(`<span class="badge online">启用 ${c.active}</span>`);
+    if (c.full > 0) countPills.push(`<span class="badge full-disk">已满 ${c.full}</span>`);
+    if (c.safeEject > 0) countPills.push(`<span class="badge safe-eject">✓ 可拔 ${c.safeEject}</span>`);
+    if (c.detached > 0) countPills.push(`<span class="badge detached">⚠ 拔出 ${c.detached}</span>`);
+    if (c.locked > 0) countPills.push(`<span class="badge reinsert">🔌 重插 ${c.locked}</span>`);
+  }
+  const viewBtn = (c.total > 0 || (n.host_disks && n.host_disks.length > 0))
+    ? `<button type="button" class="btn sm ghost" data-action="view-node-disks" data-id="${esc(n.id)}">查看盘列表 (${c.total || n.host_disks.length}) ▸</button>`
+    : '';
   return `
-    <div style="margin-bottom:4px">${wmBadge}</div>
-    <div class="bar-wrap"><div class="bar-fill ${n.disk_alarm || Number(pct) >= wm ? 'red' : ''}" style="width:${Math.min(100, Number(pct))}%"></div></div>
-    <div class="muted">${pct}% (剩余 ${fmtBytes(n.disk_free_bytes)})</div>
+    <div class="disk-overview-card">
+      <div class="disk-overview-badges">
+        ${wmBadge}
+        ${c.active > 1 ? `<span class="badge accent">${c.active} 盘并发缓存</span>` : ''}
+      </div>
+      <div class="disk-overview-cap">
+        <div class="bar-wrap"><div class="bar-fill ${barCls}" style="width:${Math.min(100, s.usedPct).toFixed(1)}%"></div></div>
+        <div class="muted">剩 ${fmtBytes(s.freeBytes)} / 共 ${fmtBytes(s.totalBytes)} (${s.usedPct.toFixed(1)}% 已用)</div>
+      </div>
+      <div class="disk-overview-foot">
+        ${countPills.join('')}
+        ${viewBtn}
+      </div>
+    </div>
   `;
 }
 
@@ -2145,9 +2214,18 @@ function renderHostDiskPicker(wrap, node, watermarkPct) {
         ? `<button type="button" class="btn sm ghost" data-toggle-remove-disk="1">移出磁盘池</button>`
         : '';
 
+      let diskStateTag = 'unchecked';
+      if (isLocked) diskStateTag = 'alert';
+      else if (isConfigured && isDisabled) diskStateTag = (dStat && dStat.safe_to_eject) ? 'alert' : 'unchecked';
+      else if (checked) {
+        if (dStat && (dStat.disk_role === 'full' || dStat.low_space || overWM)) diskStateTag = 'full';
+        else if (dStat && dStat.disk_role === 'standby') diskStateTag = 'standby';
+        else diskStateTag = 'active';
+      }
+
       const searchHaystack = `${hd.mount_point} ${hd.device} ${hd.fs_type} ${targetPath}`.toLowerCase();
       return `
-        <div class="disk-toggle-row${rowCls}" data-disk-row="1" data-used-pct="${pct.toFixed(2)}" data-search="${esc(searchHaystack)}">
+        <div class="disk-toggle-row${rowCls}" data-disk-row="1" data-disk-state="${diskStateTag}" data-used-pct="${pct.toFixed(2)}" data-search="${esc(searchHaystack)}">
           <label class="disk-toggle-left" style="cursor:pointer;flex:1">
             <input type="checkbox" class="edit-disk-chk" data-source="host" data-is-system="${hd.is_system ? '1' : '0'}" data-writable="${hd.writable === false ? '0' : '1'}" data-configured="${isConfigured ? '1' : '0'}" data-dir="${esc(targetPath)}" value="${esc(targetPath)}" ${checked ? 'checked' : ''} />
             <div>
@@ -2177,7 +2255,7 @@ function renderHostDiskPicker(wrap, node, watermarkPct) {
         const dStat = diskByPath.get(p);
         const reason = (dStat && dStat.status_reason) || '未检测到该挂载点，已自动锁定并拦截写入（防止穿透写进系统盘）';
         return `
-          <div class="disk-toggle-row is-detached" data-disk-row="1">
+          <div class="disk-toggle-row is-detached" data-disk-row="1" data-disk-state="alert" data-search="${esc(p.toLowerCase())}">
             <div class="disk-toggle-left" style="flex:1">
               <input type="checkbox" class="edit-disk-chk" data-source="detached" data-configured="1" data-dir="${esc(p)}" value="${esc(p)}" disabled />
               <div>
@@ -2198,6 +2276,7 @@ function renderHostDiskPicker(wrap, node, watermarkPct) {
 
     wrap.innerHTML = [...missingRows, ...hostRows].join('');
     updateDiskPickerCounter(wrap);
+    applyDiskPickerFilters(wrap.id);
     return;
   }
 
@@ -2341,6 +2420,118 @@ async function refreshNodeDisksInModal(nodeId, role, btnEl) {
   }
 }
 
+function applyDiskPickerFilters(listId) {
+  const listEl = document.getElementById(listId);
+  if (!listEl) return;
+  const searchEl = document.querySelector(`input[data-disk-filter="${listId}"]`);
+  const q = (searchEl?.value || '').trim().toLowerCase();
+  const activeChip = document.querySelector(`[data-picker-chips="${listId}"] .disk-chip.active`);
+  const state = activeChip?.dataset?.diskState || 'all';
+  listEl.querySelectorAll('[data-disk-row]').forEach(row => {
+    const hay = (row.dataset.search || row.textContent || '').toLowerCase();
+    const matchText = !q || hay.includes(q);
+    let matchState = true;
+    const chk = row.querySelector('input.edit-disk-chk');
+    const rowState = row.dataset.diskState || '';
+    if (state === 'checked') matchState = !!(chk && chk.checked);
+    else if (state === 'unchecked') matchState = !!(chk && !chk.checked);
+    else if (state !== 'all') matchState = rowState === state;
+    row.classList.toggle('hidden', !(matchText && matchState));
+  });
+}
+
+let activeViewDisksNodeId = '';
+let activeViewDisksState = 'all';
+
+function renderNodeDisksViewModal(node) {
+  if (!node) return;
+  const wm = nodeWatermarkPct(node);
+  const s = summarizeNodeDisks(node);
+  const c = s.counts;
+  const isB = node.role === 'agent_b';
+
+  document.getElementById('node-disks-view-title').textContent = `${isB ? '接收节点' : '分发节点'}磁盘池: ${node.name || node.id}`;
+  document.getElementById('node-disks-view-sub').textContent = `节点 ${node.id} · ${node.online ? '在线' : '离线'} · 共 ${c.total} 块已配置盘`;
+
+  const sumEl = document.getElementById('node-disks-view-summary');
+  const polHtml = isB
+    ? `<span class="badge">${esc(diskPolicyLabel(node.disk_policy, node.active_disk_window))}</span>
+       ${nodeDiskAffinityEnabled(node) ? '<span class="badge accent">同源亲和</span>' : '<span class="badge standby">无亲和</span>'}`
+    : '';
+  sumEl.innerHTML = `
+    <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+      ${polHtml}
+      <span class="badge">强制水位 ≤${wm}%</span>
+      <span class="badge online">写入 ${c.active}</span>
+      ${c.standby > 0 ? `<span class="badge standby">候补 ${c.standby}</span>` : ''}
+      ${c.full > 0 ? `<span class="badge full-disk">已满 ${c.full}</span>` : ''}
+      ${c.safeEject > 0 ? `<span class="badge safe-eject">✓ 可拔盘 ${c.safeEject}</span>` : ''}
+      ${c.detached > 0 ? `<span class="badge detached">⚠ 拔出 ${c.detached}</span>` : ''}
+      ${c.locked > 0 ? `<span class="badge reinsert">🔌 重插 ${c.locked}</span>` : ''}
+    </div>
+    <div style="min-width:210px">
+      <div class="bar-wrap"><div class="bar-fill ${s.usedPct >= wm ? 'red' : 'green'}" style="width:${Math.min(100, s.usedPct).toFixed(1)}%"></div></div>
+      <div class="muted" style="margin-top:3px">总剩 ${fmtBytes(s.freeBytes)} / 共 ${fmtBytes(s.totalBytes)} (${s.usedPct.toFixed(1)}% 已用)</div>
+    </div>
+  `;
+
+  const q = (document.getElementById('node-disks-view-search')?.value || '').trim().toLowerCase();
+  const grid = document.getElementById('node-disks-view-grid');
+  const disks = node.disks || [];
+  const filtered = disks.filter(d => {
+    const st = classifyDiskState(d, s.disabledSet, s.lockedSet);
+    let stateOk = true;
+    if (activeViewDisksState === 'active') stateOk = st === 'active';
+    else if (activeViewDisksState === 'standby') stateOk = st === 'standby';
+    else if (activeViewDisksState === 'full') stateOk = st === 'full';
+    else if (activeViewDisksState === 'disabled') stateOk = st === 'disabled' || st === 'safe_eject';
+    else if (activeViewDisksState === 'alert') stateOk = st === 'detached' || st === 'locked';
+    if (!stateOk) return false;
+    if (!q) return true;
+    const hay = `${d.path || ''} ${d.status_reason || ''}`.toLowerCase();
+    return hay.includes(q);
+  });
+
+  const counter = document.getElementById('node-disks-view-counter');
+  if (counter) counter.textContent = `显示 ${filtered.length} / ${disks.length} 块盘`;
+
+  if (!filtered.length) {
+    grid.innerHTML = `<div class="empty" style="grid-column:1/-1;padding:24px">${disks.length ? '当前筛选条件下没有匹配的磁盘' : '该节点尚未激活或上报磁盘状态，请点右上角「勾选 / 管理数据盘」'}</div>`;
+    return;
+  }
+  grid.innerHTML = filtered.map(d => renderDiskMiniItem(d, s.disabledSet, s.lockedSet, wm)).join('');
+}
+
+async function openNodeDisksViewModal(nodeId) {
+  const node = cachedNodes.find(n => n.id === nodeId);
+  if (!node) return;
+  activeViewDisksNodeId = nodeId;
+  activeViewDisksState = 'all';
+  const searchEl = document.getElementById('node-disks-view-search');
+  if (searchEl) searchEl.value = '';
+  document.querySelectorAll('#node-disks-view-chips .disk-chip').forEach(b => {
+    b.classList.toggle('active', b.dataset.viewState === 'all');
+  });
+  renderNodeDisksViewModal(node);
+  openModal('node-disks-view-modal');
+  if (node.online) {
+    try {
+      const fresh = await api(`/api/v1/admin/nodes/${encodeURIComponent(nodeId)}/disks`);
+      node.online = !!fresh.online;
+      node.awaiting_disk = !!fresh.awaiting_disk;
+      if (fresh.max_disk_usage_pct) node.max_disk_usage_pct = fresh.max_disk_usage_pct;
+      if (fresh.disk_policy) node.disk_policy = fresh.disk_policy;
+      if (fresh.disk_affinity !== undefined) node.disk_affinity = fresh.disk_affinity;
+      if (fresh.active_disk_window) node.active_disk_window = fresh.active_disk_window;
+      node.disks = fresh.disks || [];
+      node.host_disks = fresh.host_disks || [];
+      node.disabled_disks = fresh.disabled_disks || [];
+      node.unplug_locked_disks = fresh.unplug_locked_disks || [];
+      if (activeViewDisksNodeId === nodeId) renderNodeDisksViewModal(node);
+    } catch {}
+  }
+}
+
 function openEditADisksModal(nodeId) {
   const node = cachedNodes.find(n => n.id === nodeId);
   if (!node) return;
@@ -2374,7 +2565,10 @@ function openEditNodeProjectsModal(nodeId) {
     populateOwnerAccountSelect(document.getElementById('edit-node-owner-select'), node.owner_account_id || '');
   }
   form.elements.project_schedule.value = node.project_schedule || 'fifo';
-  form.elements.disk_policy.value = node.disk_policy || 'affinity_hash';
+  form.elements.disk_policy.value = normalizeUiDiskPolicy(node.disk_policy);
+  if (form.elements.disk_affinity) {
+    form.elements.disk_affinity.checked = nodeDiskAffinityEnabled(node);
+  }
   if (form.elements.active_disk_window) {
     form.elements.active_disk_window.value = node.active_disk_window || 10;
   }
@@ -2384,6 +2578,9 @@ function openEditNodeProjectsModal(nodeId) {
   syncDiskPolicyWindowUI('edit-disk-policy-select', 'edit-disk-window-wrap');
   const bSearch = document.getElementById('edit-b-disk-search');
   if (bSearch) bSearch.value = '';
+  document.querySelectorAll('[data-picker-chips="edit-disks-list"] .disk-chip').forEach(b => {
+    b.classList.toggle('active', b.dataset.diskState === 'all');
+  });
   form.elements.concurrency_mode.value = node.concurrency_mode || 'auto';
   form.elements.max_concurrent_override.value = node.max_concurrent_override || 0;
   form.elements.rate_limit_mbps.value = node.rate_limit_mbps || 0;
@@ -2645,6 +2842,7 @@ function setupEvents() {
       case 'open-b-script': openBScriptModal(id); break;
       case 'edit-a-disks': openEditADisksModal(id); break;
       case 'edit-node-projects': openEditNodeProjectsModal(id); break;
+      case 'view-node-disks': openNodeDisksViewModal(id); break;
       case 'edit-account': openAccountModal(id); break;
       case 'rotate-account': rotateAccountToken(id); break;
       case 'delete-account': deleteAccount(id); break;
@@ -2822,15 +3020,39 @@ function setupEvents() {
   bindDiskPickerEvents('edit-a-disks-list');
 
   document.querySelectorAll('input[data-disk-filter]').forEach(inp => {
-    inp.addEventListener('input', () => {
-      const listEl = document.getElementById(inp.dataset.diskFilter);
-      if (!listEl) return;
-      const q = (inp.value || '').trim().toLowerCase();
-      listEl.querySelectorAll('[data-disk-row]').forEach(row => {
-        const hay = (row.dataset.search || row.textContent || '').toLowerCase();
-        row.classList.toggle('hidden', !!q && !hay.includes(q));
-      });
+    inp.addEventListener('input', () => applyDiskPickerFilters(inp.dataset.diskFilter));
+  });
+  document.querySelectorAll('[data-picker-chips]').forEach(bar => {
+    bar.addEventListener('click', (e) => {
+      const chip = e.target.closest('button.disk-chip');
+      if (!chip) return;
+      bar.querySelectorAll('.disk-chip').forEach(b => b.classList.toggle('active', b === chip));
+      applyDiskPickerFilters(bar.dataset.pickerChips);
     });
+  });
+
+  // Scrollable All-Disks Overview Modal controls
+  document.getElementById('node-disks-view-search')?.addEventListener('input', () => {
+    const node = cachedNodes.find(n => n.id === activeViewDisksNodeId);
+    if (node) renderNodeDisksViewModal(node);
+  });
+  document.getElementById('node-disks-view-chips')?.addEventListener('click', (e) => {
+    const chip = e.target.closest('button.disk-chip');
+    if (!chip) return;
+    activeViewDisksState = chip.dataset.viewState || 'all';
+    document.querySelectorAll('#node-disks-view-chips .disk-chip').forEach(b => b.classList.toggle('active', b === chip));
+    const node = cachedNodes.find(n => n.id === activeViewDisksNodeId);
+    if (node) renderNodeDisksViewModal(node);
+  });
+  document.getElementById('btn-refresh-view-disks')?.addEventListener('click', () => {
+    if (activeViewDisksNodeId) openNodeDisksViewModal(activeViewDisksNodeId);
+  });
+  document.getElementById('btn-manage-from-view-disks')?.addEventListener('click', () => {
+    const node = cachedNodes.find(n => n.id === activeViewDisksNodeId);
+    if (!node) return;
+    closeModal('node-disks-view-modal');
+    if (node.role === 'agent_b') openEditNodeProjectsModal(node.id);
+    else openEditADisksModal(node.id);
   });
 
   document.getElementById('create-disk-policy-select')?.addEventListener('change', () => {
@@ -2971,7 +3193,8 @@ function setupEvents() {
       };
       if (role === 'agent_b') {
         payload.project_schedule = String(fd.get('project_schedule') || 'fifo');
-        payload.disk_policy = String(fd.get('disk_policy') || 'affinity_hash');
+        payload.disk_policy = String(fd.get('disk_policy') || 'round_robin');
+        payload.disk_affinity = fd.get('disk_affinity') === 'on';
         payload.active_disk_window = Number(fd.get('active_disk_window') || 10);
         if (!isCustomer()) {
           payload.owner_account_id = String(fd.get('owner_account_id') || '').trim();
@@ -3045,6 +3268,7 @@ function setupEvents() {
       projects: projs,
       project_schedule: projectSchedule,
       disk_policy: diskPolicy,
+      disk_affinity: fd.get('disk_affinity') === 'on',
       active_disk_window: Number(fd.get('active_disk_window') || 10),
       max_disk_usage_pct: maxDiskPct,
       concurrency_mode: String(fd.get('concurrency_mode') || 'auto'),

@@ -613,12 +613,14 @@ func (s *Server) handleBHeartbeat(w http.ResponseWriter, r *http.Request, node *
 	dbNodes, _ := s.store.ListNodes(r.Context())
 	maxConc, suggestedStreamCap, rateLimitMBps := s.hub.ComputeClusterQuotas(node, projs, dbNodes)
 
+	diskAff := node.DiskAffinityEnabled()
 	dir := &protocol.ReceiverDirective{
 		Paused:             effPaused,
 		ProjectMode:        "all",
 		KnownProjects:      knownIDs,
 		ProjectSchedule:    node.ProjectSchedule,
 		DiskPolicy:         node.DiskPolicy,
+		DiskAffinity:       &diskAff,
 		ActiveDiskWindow:   node.ActiveDiskWindow,
 		StorageDirs:        append([]string(nil), node.StorageDirs...),
 		DisabledDisks:      append([]string(nil), node.DisabledDisks...),
@@ -1145,6 +1147,7 @@ func (s *Server) handleAdminListNodes(w http.ResponseWriter, r *http.Request) {
 		if !principal.CanAccessNode(n) {
 			continue
 		}
+		diskAff := n.DiskAffinityEnabled()
 		v := protocol.LiveNodeView{
 			ID:                    n.ID,
 			Name:                  n.Name,
@@ -1153,6 +1156,7 @@ func (s *Server) handleAdminListNodes(w http.ResponseWriter, r *http.Request) {
 			Projects:              n.Projects,
 			ProjectSchedule:       n.ProjectSchedule,
 			DiskPolicy:            n.DiskPolicy,
+			DiskAffinity:          &diskAff,
 			ActiveDiskWindow:      n.ActiveDiskWindow,
 			StorageDirs:           append([]string(nil), n.StorageDirs...),
 			DisabledDisks:         n.DisabledDisks,
@@ -1251,6 +1255,7 @@ type createNodeReq struct {
 	Projects              []string `json:"projects"`
 	ProjectSchedule       string   `json:"project_schedule,omitempty"`
 	DiskPolicy            string   `json:"disk_policy,omitempty"`
+	DiskAffinity          *bool    `json:"disk_affinity,omitempty"`
 	ActiveDiskWindow      int      `json:"active_disk_window,omitempty"`
 	StorageDirs           []string `json:"storage_dirs,omitempty"`
 	DisabledDisks         []string `json:"disabled_disks,omitempty"`
@@ -1285,6 +1290,9 @@ func (s *Server) handleAdminGetNodeDisks(w http.ResponseWriter, r *http.Request)
 		"online":              false,
 		"awaiting_disk":       false,
 		"disk_gen":            node.DiskGen,
+		"disk_policy":         node.DiskPolicy,
+		"disk_affinity":       node.DiskAffinityEnabled(),
+		"active_disk_window":  node.ActiveDiskWindow,
 		"max_disk_usage_pct":  transfer.NormalizeMaxDiskUsagePct(node.MaxDiskUsagePct),
 		"storage_dirs":        node.StorageDirs,
 		"disabled_disks":      node.DisabledDisks,
@@ -1494,6 +1502,10 @@ func (s *Server) handleAdminCreateNode(w http.ResponseWriter, r *http.Request) {
 	if rawToken == "" {
 		rawToken = auth.GenerateRandomToken(24)
 	}
+	diskAff := true
+	if req.DiskAffinity != nil {
+		diskAff = *req.DiskAffinity
+	}
 	rec := protocol.NodeRecord{
 		ID:                    req.ID,
 		Name:                  req.Name,
@@ -1502,6 +1514,7 @@ func (s *Server) handleAdminCreateNode(w http.ResponseWriter, r *http.Request) {
 		Projects:              cleanProjects,
 		ProjectSchedule:       sched,
 		DiskPolicy:            dp,
+		DiskAffinity:          &diskAff,
 		ActiveDiskWindow:      diskWin,
 		StorageDirs:           cleanStorageDirs,
 		DisabledDisks:         cleanDisks,
@@ -1530,6 +1543,7 @@ type updateNodeReq struct {
 	Projects              *[]string `json:"projects,omitempty"`
 	ProjectSchedule       string    `json:"project_schedule,omitempty"`
 	DiskPolicy            string    `json:"disk_policy,omitempty"`
+	DiskAffinity          *bool     `json:"disk_affinity,omitempty"`
 	ActiveDiskWindow      *int      `json:"active_disk_window,omitempty"`
 	StorageDirs           *[]string `json:"storage_dirs,omitempty"`
 	DisabledDisks         *[]string `json:"disabled_disks,omitempty"`
@@ -1601,6 +1615,10 @@ func (s *Server) handleAdminUpdateNode(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		rec.DiskPolicy = dp
+	}
+	if req.DiskAffinity != nil {
+		v := *req.DiskAffinity
+		rec.DiskAffinity = &v
 	}
 	if req.ActiveDiskWindow != nil {
 		v := *req.ActiveDiskWindow

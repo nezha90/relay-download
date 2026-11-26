@@ -108,7 +108,8 @@ type ReceiverDirective struct {
 	AllowedProjects    []string `json:"allowed_projects,omitempty"`     // explicit ordered allowlist when project_mode=="selected"
 	KnownProjects      []string `json:"known_projects,omitempty"`       // all projects ordered by created_at ASC
 	ProjectSchedule    string   `json:"project_schedule,omitempty"`     // "fifo" | "fair" | "random"
-	DiskPolicy         string   `json:"disk_policy,omitempty"`          // "affinity_hash" | "most_free" | "round_robin" | "first" | "rolling_window"
+	DiskPolicy         string   `json:"disk_policy,omitempty"`          // "rolling_window" | "round_robin" | "most_free" | "first" | legacy "affinity_hash"
+	DiskAffinity       *bool    `json:"disk_affinity,omitempty"`        // default true: keep paired media+metadata on the same disk across ALL disk policies
 	ActiveDiskWindow   int      `json:"active_disk_window,omitempty"`   // >0 concurrent active disk window size for rolling_window policy (default 10)
 	StorageDirs        []string `json:"storage_dirs,omitempty"`         // optional Center-managed data disk pool roots (overrides local storage_dirs when non-empty)
 	DisabledDisks      []string `json:"disabled_disks,omitempty"`       // storage root dirs disabled via console or auto-locked on unplug
@@ -147,6 +148,7 @@ type NodeRecord struct {
 	Projects              []string  `json:"projects"`
 	ProjectSchedule       string    `json:"project_schedule,omitempty"`
 	DiskPolicy            string    `json:"disk_policy,omitempty"`
+	DiskAffinity          *bool     `json:"disk_affinity,omitempty"`
 	ActiveDiskWindow      int       `json:"active_disk_window,omitempty"`
 	StorageDirs           []string  `json:"storage_dirs,omitempty"`
 	DisabledDisks         []string  `json:"disabled_disks,omitempty"`
@@ -159,6 +161,13 @@ type NodeRecord struct {
 	Paused                bool      `json:"paused,omitempty"`
 	PublicAddr            string    `json:"public_addr,omitempty"`
 	CreatedAt             time.Time `json:"created_at"`
+}
+
+func (n NodeRecord) DiskAffinityEnabled() bool {
+	if n.DiskAffinity == nil {
+		return true
+	}
+	return *n.DiskAffinity
 }
 
 type ProjectAvailability struct {
@@ -218,6 +227,7 @@ type AgentBHeartbeatReq struct {
 	HostDisks             []HostDisk        `json:"host_disks,omitempty"`
 	ProjectSchedule       string            `json:"project_schedule,omitempty"`
 	DiskPolicy            string            `json:"disk_policy,omitempty"`
+	DiskAffinity          *bool             `json:"disk_affinity,omitempty"`
 	ActiveDiskWindow      int               `json:"active_disk_window,omitempty"`
 	ConcurrencyMode       string            `json:"concurrency_mode,omitempty"`
 	EffectiveConcurrent   int               `json:"effective_concurrent,omitempty"`
@@ -500,6 +510,7 @@ type LiveNodeView struct {
 	Projects              []string              `json:"projects"`
 	ProjectSchedule       string                `json:"project_schedule,omitempty"`
 	DiskPolicy            string                `json:"disk_policy,omitempty"`
+	DiskAffinity          *bool                 `json:"disk_affinity,omitempty"`
 	ActiveDiskWindow      int                   `json:"active_disk_window,omitempty"`
 	DisabledDisks         []string              `json:"disabled_disks,omitempty"`
 	UnplugLockedDisks     []string              `json:"unplug_locked_disks,omitempty"`

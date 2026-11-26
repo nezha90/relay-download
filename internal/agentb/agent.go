@@ -68,13 +68,20 @@ type Agent struct {
 	allowedProjects map[string]struct{} // non-nil when directiveMode=="selected"
 	knownOrder      []string            // Center-reported known projects ordered by created_at ASC
 	projectSchedule  string              // "fifo" | "fair" | "random"
-	diskPolicy       string              // "affinity_hash" | "most_free" | "round_robin" | "first" | "rolling_window"
+	diskPolicy       string              // "rolling_window" | "round_robin" | "most_free" | "first" | legacy "affinity_hash"
+	diskAffinity     bool                // default true: keep paired assets on the same disk across all disk policies
+	diskAffinitySet  bool                // distinguishes zero-value struct construction in unit tests from explicit false
 	activeDiskWindow int                 // concurrent active disk window for rolling_window policy
 	dirStorageDirs   []string            // Center-managed data disk pool roots (overrides cfg.StorageDirs when non-empty)
 	disabledDisks    map[string]struct{} // cleaned root paths disabled via Console or auto-locked on unplug
 	diskGen          int64               // monotonic Center disk-config generation
 	maxDiskUsagePct  float64             // Center-customizable mandatory disk watermark [1..99], default 85
 	diskHealth       *transfer.DiskHealthTracker
+
+	stemMu      sync.Mutex
+	stemToDir   map[string]string
+	stemRing    []string
+	stemRingPos int
 
 	hostDiskMu     sync.Mutex
 	hostDisksCache []protocol.HostDisk
@@ -289,6 +296,8 @@ func New(cfg *Config, logger *slog.Logger) (*Agent, error) {
 		discCache:       make(map[string]cachedDiscover),
 		projectSchedule:  cfg.ProjectSchedule,
 		diskPolicy:       cfg.DiskPolicy,
+		diskAffinity:     cfg.DiskAffinityEnabled(),
+		diskAffinitySet:  true,
 		activeDiskWindow: cfg.ActiveDiskWindow,
 		maxDiskUsagePct:  transfer.NormalizeMaxDiskUsagePct(cfg.MaxDiskUsagePct),
 		diskHealth:       diskHealth,
@@ -545,6 +554,55 @@ func (a *Agent) effectiveDiskPolicy() string {
 		return a.cfg.DiskPolicy
 	}
 	return p
+}
+
+func (a *Agent) effectiveDiskAffinity() bool {
+	a.dirMu.RLock()
+	set := a.diskAffinitySet
+	val := a.diskAffinity
+	a.dirMu.RUnlock()
+	if set {
+		return val
+	}
+	if a.cfg != nil {
+		return a.cfg.DiskAffinityEnabled()
+	}
+	return true
+}
+
+const maxStemAffinityEntries = 65536
+
+func (a *Agent) lookupStemDisk(key string) string {
+	a.stemMu.Lock()
+	dir := a.stemToDir[key]
+	a.stemMu.Unlock()
+	return dir
+}
+
+// rememberOrGetStemDisk atomically associates stem key -> chosenDir. If another goroutine
+// concurrently recorded a sibling file for the same stem moments ago, returns that existing dir
+// so microsecond-simultaneous paired files still land on the exact same disk.
+func (a *Agent) rememberOrGetStemDisk(key, chosenDir string, allowed func(string) bool) string {
+	a.stemMu.Lock()
+	defer a.stemMu.Unlock()
+	if a.stemToDir == nil {
+		a.stemToDir = make(map[string]string, 1024)
+		a.stemRing = make([]string, maxStemAffinityEntries)
+	}
+	if prev, ok := a.stemToDir[key]; ok && prev != "" {
+		if prev == chosenDir || (allowed != nil && allowed(prev)) {
+			return prev
+		}
+	}
+	if _, existed := a.stemToDir[key]; !existed {
+		if old := a.stemRing[a.stemRingPos]; old != "" && old != key {
+			delete(a.stemToDir, old)
+		}
+		a.stemRing[a.stemRingPos] = key
+		a.stemRingPos = (a.stemRingPos + 1) % len(a.stemRing)
+	}
+	a.stemToDir[key] = chosenDir
+	return chosenDir
 }
 
 func (a *Agent) effectiveActiveDiskWindow() int {
@@ -890,6 +948,7 @@ func (a *Agent) applyDirective(dir *protocol.ReceiverDirective, legacyAllowed []
 		nextKnown       []string
 		nextSched       = a.cfg.ProjectSchedule
 		nextDiskPol     = a.cfg.DiskPolicy
+		nextDiskAff     = a.cfg.DiskAffinityEnabled()
 		nextDiskWin     = a.cfg.ActiveDiskWindow
 		nextMaxDiskPct  = transfer.NormalizeMaxDiskUsagePct(a.cfg.MaxDiskUsagePct)
 		nextStorageDirs []string
@@ -933,6 +992,9 @@ func (a *Agent) applyDirective(dir *protocol.ReceiverDirective, legacyAllowed []
 		switch strings.ToLower(strings.TrimSpace(dir.DiskPolicy)) {
 		case protocol.DiskPolicyAffinityHash, protocol.DiskPolicyMostFree, protocol.DiskPolicyRoundRobin, protocol.DiskPolicyFirst, protocol.DiskPolicyRollingWindow:
 			nextDiskPol = strings.ToLower(strings.TrimSpace(dir.DiskPolicy))
+		}
+		if dir.DiskAffinity != nil {
+			nextDiskAff = *dir.DiskAffinity
 		}
 		if dir.ActiveDiskWindow > 0 {
 			nextDiskWin = dir.ActiveDiskWindow
@@ -999,6 +1061,7 @@ func (a *Agent) applyDirective(dir *protocol.ReceiverDirective, legacyAllowed []
 		!equalStringSlices(a.knownOrder, nextKnown)
 	policyChanged := a.projectSchedule != nextSched ||
 		a.diskPolicy != nextDiskPol ||
+		!a.diskAffinitySet || a.diskAffinity != nextDiskAff ||
 		a.activeDiskWindow != nextDiskWin ||
 		a.maxDiskUsagePct != nextMaxDiskPct ||
 		!equalStringSlices(a.dirStorageDirs, nextStorageDirs) ||
@@ -1011,6 +1074,8 @@ func (a *Agent) applyDirective(dir *protocol.ReceiverDirective, legacyAllowed []
 	a.knownOrder = nextKnown
 	a.projectSchedule = nextSched
 	a.diskPolicy = nextDiskPol
+	a.diskAffinity = nextDiskAff
+	a.diskAffinitySet = true
 	a.activeDiskWindow = nextDiskWin
 	a.maxDiskUsagePct = nextMaxDiskPct
 	a.dirStorageDirs = nextStorageDirs
@@ -1412,29 +1477,57 @@ func (a *Agent) chooseDestDir(projectID, filename string, fileSize int64) string
 		return bestDir
 	}
 
+	dirSet := make(map[string]struct{}, len(dirs))
+	for _, d := range dirs {
+		dirSet[d] = struct{}{}
+	}
+	dirEligible := func(d string) bool {
+		if _, ok := dirSet[d]; !ok {
+			return false
+		}
+		return fits(d)
+	}
+
+	affEnabled := a.effectiveDiskAffinity()
+	var stemKey string
+	if affEnabled {
+		stemKey = projectID + "\x00" + mediaAffinityKey(filename)
+		// Universal asset-group affinity across ALL disk policies:
+		// if a sibling file (.m4a / .info.json / .srt) already chose a healthy disk with headroom, reuse it.
+		if cached := a.lookupStemDisk(stemKey); cached != "" && dirEligible(cached) {
+			return cached
+		}
+	}
+
+	var chosen string
 	switch a.effectiveDiskPolicy() {
 	case protocol.DiskPolicyMostFree:
-		return pickMostFree()
+		chosen = pickMostFree()
 	case protocol.DiskPolicyRoundRobin:
 		start := int((a.diskRRIdx.Add(1) - 1) % uint64(len(dirs)))
 		for i := range dirs {
 			cand := dirs[(start+i)%len(dirs)]
 			if fits(cand) {
-				return cand
+				chosen = cand
+				break
 			}
 		}
-		return pickMostFree()
+		if chosen == "" {
+			chosen = pickMostFree()
+		}
 	case protocol.DiskPolicyFirst:
 		for _, cand := range dirs {
 			if fits(cand) {
-				return cand
+				chosen = cand
+				break
 			}
 		}
-		return pickMostFree()
+		if chosen == "" {
+			chosen = pickMostFree()
+		}
 	case protocol.DiskPolicyRollingWindow:
 		// Sliding active window: concurrently fill the first N healthy non-full disks in order.
-		// Within the active window, hash by media affinity key so paired assets stay on the same disk;
-		// once any disk hits the mandatory watermark (or is disabled/detached), disk N+1 automatically slides in.
+		// Once any disk hits the mandatory watermark (or is disabled/detached), disk N+1 automatically slides in.
 		winSize := a.effectiveActiveDiskWindow()
 		if winSize > len(dirs) {
 			winSize = len(dirs)
@@ -1449,24 +1542,48 @@ func (a *Agent) chooseDestDir(projectID, filename string, fileSize int64) string
 			}
 		}
 		if len(activeWin) == 0 {
-			return pickMostFree()
+			chosen = pickMostFree()
+		} else if len(activeWin) == 1 {
+			chosen = activeWin[0]
+		} else if affEnabled {
+			h := fnv.New32a()
+			_, _ = h.Write([]byte(mediaAffinityKey(filename)))
+			chosen = activeWin[int(h.Sum32()%uint32(len(activeWin)))]
+		} else {
+			idx := int((a.diskRRIdx.Add(1) - 1) % uint64(len(activeWin)))
+			chosen = activeWin[idx]
 		}
-		if len(activeWin) == 1 {
-			return activeWin[0]
-		}
-		h := fnv.New32a()
-		_, _ = h.Write([]byte(mediaAffinityKey(filename)))
-		return activeWin[int(h.Sum32()%uint32(len(activeWin)))]
 	default:
-		// affinity_hash: paired media + metadata land on the same disk; spill over when full.
-		h := fnv.New32a()
-		_, _ = h.Write([]byte(mediaAffinityKey(filename)))
-		primaryIdx := int(h.Sum32() % uint32(len(dirs)))
-		if fits(dirs[primaryIdx]) {
-			return dirs[primaryIdx]
+		// Legacy "affinity_hash" (balanced distribution): hash by stem when affinity is enabled,
+		// or pure round-robin when affinity is explicitly turned off.
+		if affEnabled {
+			h := fnv.New32a()
+			_, _ = h.Write([]byte(mediaAffinityKey(filename)))
+			primaryIdx := int(h.Sum32() % uint32(len(dirs)))
+			if fits(dirs[primaryIdx]) {
+				chosen = dirs[primaryIdx]
+			} else {
+				chosen = pickMostFree()
+			}
+		} else {
+			start := int((a.diskRRIdx.Add(1) - 1) % uint64(len(dirs)))
+			for i := range dirs {
+				cand := dirs[(start+i)%len(dirs)]
+				if fits(cand) {
+					chosen = cand
+					break
+				}
+			}
+			if chosen == "" {
+				chosen = pickMostFree()
+			}
 		}
-		return pickMostFree()
 	}
+
+	if affEnabled && chosen != "" {
+		chosen = a.rememberOrGetStemDisk(stemKey, chosen, dirEligible)
+	}
+	return chosen
 }
 
 func (a *Agent) availableDiskForProject(projectID string) uint64 {
@@ -3038,6 +3155,7 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 		effRateMBps = float64(a.limiter.Rate()) / (1024 * 1024)
 	}
 
+	diskAff := a.effectiveDiskAffinity()
 	payload := protocol.AgentBHeartbeatReq{
 		NodeID:              a.cfg.NodeID,
 		Name:                a.cfg.NodeName,
@@ -3047,6 +3165,7 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 		HostDisks:           a.cachedHostDisks(),
 		ProjectSchedule:     a.effectiveProjectSchedule(),
 		DiskPolicy:          diskPol,
+		DiskAffinity:        &diskAff,
 		ActiveDiskWindow:    activeWinSize,
 		ConcurrencyMode:     snap.Mode,
 		EffectiveConcurrent: snap.EffectiveConcurrent,

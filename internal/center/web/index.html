@@ -1,12 +1,15 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
+
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Relay Center · 流式文件传输控制台</title>
-  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%233b82f6'/%3E%3Cpath d='M8 16h16M18 10l6 6-6 6' stroke='white' stroke-width='3' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E" />
+  <link rel="icon" type="image/svg+xml"
+    href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%233b82f6'/%3E%3Cpath d='M8 16h16M18 10l6 6-6 6' stroke='white' stroke-width='3' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E" />
   <link rel="stylesheet" href="/style.css" />
 </head>
+
 <body>
   <div id="login-overlay" class="overlay hidden">
     <div class="modal-card">
@@ -23,34 +26,68 @@
   <header class="topbar">
     <div class="brand">
       <span class="brand-logo" aria-hidden="true">
-        <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="m13 6 6 6-6 6"/></svg>
+        <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round"
+          stroke-linejoin="round">
+          <path d="M5 12h14" />
+          <path d="m13 6 6 6-6 6" />
+        </svg>
       </span>
       <span>Relay Center</span>
       <span class="brand-sub">去中心化直传 · 阶段汇总</span>
     </div>
     <nav class="tabs" role="tablist">
       <button class="tab active" data-tab="dashboard">
-        <svg class="ico ico-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="m19 9-5 5-4-4-3 3"/></svg>
+        <svg class="ico ico-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+          stroke-linecap="round" stroke-linejoin="round">
+          <path d="M3 3v18h18" />
+          <path d="m19 9-5 5-4-4-3 3" />
+        </svg>
         <span>总览看板</span>
       </button>
       <button class="tab" data-tab="projects">
-        <svg class="ico ico-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+        <svg class="ico ico-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+          stroke-linecap="round" stroke-linejoin="round">
+          <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
+        </svg>
         <span>项目视图</span>
       </button>
       <button class="tab" data-tab="nodes-a" data-admin-only="1">
-        <svg class="ico ico-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v10"/><path d="m16 6-4-4-4 4"/><rect x="3" y="14" width="18" height="7" rx="2"/></svg>
+        <svg class="ico ico-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+          stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 2v10" />
+          <path d="m16 6-4-4-4 4" />
+          <rect x="3" y="14" width="18" height="7" rx="2" />
+        </svg>
         <span>分发节点 (公网)</span>
       </button>
       <button class="tab" data-tab="nodes-b">
-        <svg class="ico ico-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="7" rx="2"/><rect x="3" y="14" width="18" height="7" rx="2"/><circle cx="7.5" cy="6.5" r="1"/><circle cx="7.5" cy="17.5" r="1"/></svg>
+        <svg class="ico ico-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+          stroke-linecap="round" stroke-linejoin="round">
+          <rect x="3" y="3" width="18" height="7" rx="2" />
+          <rect x="3" y="14" width="18" height="7" rx="2" />
+          <circle cx="7.5" cy="6.5" r="1" />
+          <circle cx="7.5" cy="17.5" r="1" />
+        </svg>
         <span>接收节点 (内网)</span>
       </button>
       <button class="tab" data-tab="deploy" data-admin-only="1">
-        <svg class="ico ico-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><path d="m3.3 7 8.7 5 8.7-5"/><path d="M12 22V12"/></svg>
+        <svg class="ico ico-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+          stroke-linecap="round" stroke-linejoin="round">
+          <path
+            d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z" />
+          <path d="m3.3 7 8.7 5 8.7-5" />
+          <path d="M12 22V12" />
+        </svg>
         <span>部署与版本</span>
       </button>
       <button class="tab" data-tab="accounts" data-admin-only="1">
-        <svg class="ico ico-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+        <svg class="ico ico-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+          stroke-linecap="round" stroke-linejoin="round">
+          <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
+          <circle cx="9" cy="7" r="4" />
+          <path d="M22 21v-2a4 4 0 0 0-3-3.87" />
+          <path d="M16 3.13a4 4 0 0 1 0 7.75" />
+        </svg>
         <span>客户账号</span>
       </button>
     </nav>
@@ -64,7 +101,11 @@
       </select>
       <span id="snapshot-time" class="muted snapshot-time"></span>
       <button id="refresh-now" class="btn">
-        <svg class="ico ico-sm ico-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/></svg>
+        <svg class="ico ico-sm ico-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1"
+          stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8" />
+          <path d="M21 3v5h-5" />
+        </svg>
         <span>刷新统计</span>
       </button>
       <span id="role-badge" class="badge accent hidden"></span>
@@ -114,7 +155,8 @@
       <div class="section-bar">
         <div>
           <h2>项目隔离管理</h2>
-          <div id="projects-section-desc" class="muted" style="margin-top:3px">业务方 PUT 上传新项目时将自动发现并建档；也可手动提前创建并自定义同名冲突策略</div>
+          <div id="projects-section-desc" class="muted" style="margin-top:3px">业务方 PUT 上传新项目时将自动发现并建档；也可手动提前创建并自定义同名冲突策略
+          </div>
         </div>
         <button id="open-create-project" class="btn primary" data-admin-only="1">+ 新建项目</button>
       </div>
@@ -130,7 +172,9 @@
         </div>
         <div id="guide-p-body" class="guide-body hidden">
           <div class="concept-box">
-            <strong>接口接入说明：</strong> 业务方在<strong>分发节点本机</strong>直接调用 <code>http://127.0.0.1:&lt;本机上传端口&gt;</code>（默认 <code>18081</code>），<strong>仅限本机回环访问、免鉴权直传</strong>（无需配置任何 Token）。<strong>新项目无需提前建档</strong>，首次上传自动创建项目隔离目录（默认仅管理员可见，分配给指定客户后客户立即可见）；如需自定义冲突覆盖/全局限速，先点右上角「+ 新建项目」即可。
+            <strong>接口接入说明：</strong> 业务方在<strong>分发节点本机</strong>直接调用 <code>http://127.0.0.1:&lt;本机上传端口&gt;</code>（默认
+            <code>18081</code>），<strong>仅限本机回环访问、免鉴权直传</strong>（无需配置任何
+            Token）。<strong>新项目无需提前建档</strong>，首次上传自动创建项目隔离目录（默认仅管理员可见，分配给指定客户后客户立即可见）；如需自定义冲突覆盖/全局限速，先点右上角「+ 新建项目」即可。
           </div>
 
           <div class="api-var-bar">
@@ -138,7 +182,8 @@
               <span>选择/填写项目 ID</span>
               <div style="display:flex;gap:6px">
                 <select id="guide-p-project-select" class="window-select"></select>
-                <input id="guide-p-project-input" type="text" placeholder="my-project" value="my-project" autocomplete="off" />
+                <input id="guide-p-project-input" type="text" placeholder="my-project" value="my-project"
+                  autocomplete="off" />
               </div>
             </label>
             <label class="api-var-item" style="max-width:150px">
@@ -148,7 +193,8 @@
           </div>
 
           <div class="guide-subtabs" role="tablist">
-            <button type="button" class="guide-subtab active" data-guide-p-mode="http">1. HTTP PUT / POST 上传（推荐）</button>
+            <button type="button" class="guide-subtab active" data-guide-p-mode="http">1. HTTP PUT / POST
+              上传（推荐）</button>
             <button type="button" class="guide-subtab" data-guide-p-mode="register">2. 本机零拷贝注册（亿级批量）</button>
             <button type="button" class="guide-subtab" data-guide-p-mode="python">3. Python 接入示例（含水位重试）</button>
             <button type="button" class="guide-subtab" data-guide-p-mode="status">4. 状态查询与错误码规范</button>
@@ -187,7 +233,9 @@
                 </div>
                 <button type="button" class="btn sm" data-copy-el="code-p-multipart">一键复制</button>
               </div>
-              <div class="muted">适合已有 Web/SDK 表单上传逻辑；也支持直接 POST 二进制流并附带 Header <code>X-Project</code> 与 <code>X-Filename</code>。</div>
+              <div class="muted">适合已有 Web/SDK 表单上传逻辑；也支持直接 POST 二进制流并附带 Header <code>X-Project</code> 与
+                <code>X-Filename</code>。
+              </div>
               <pre id="code-p-multipart" class="code-block"></pre>
             </div>
           </div>
@@ -202,7 +250,8 @@
                   </div>
                   <button type="button" class="btn sm" data-copy-el="code-p-reg">一键复制</button>
                 </div>
-                <div class="muted">文件已在分发机磁盘上时，同盘 <code>move</code> 原子改名或 <code>hardlink</code> 硬链接（不删源文件），免 HTTP 重复拷贝。</div>
+                <div class="muted">文件已在分发机磁盘上时，同盘 <code>move</code> 原子改名或 <code>hardlink</code> 硬链接（不删源文件），免 HTTP 重复拷贝。
+                </div>
                 <pre id="code-p-reg" class="code-block"></pre>
               </div>
               <div class="api-snippet-card">
@@ -228,7 +277,9 @@
                 </div>
                 <button type="button" class="btn sm" data-copy-el="code-p-python">一键复制</button>
               </div>
-              <div class="muted">依赖 <code>requests</code>（或换成标准库 <code>urllib</code>）；遇到 <code>503</code>（待选盘）或 <code>507</code>（磁盘水位满）自动退避等待，确保业务零丢包。</div>
+              <div class="muted">依赖 <code>requests</code>（或换成标准库 <code>urllib</code>）；遇到 <code>503</code>（待选盘）或
+                <code>507</code>（磁盘水位满）自动退避等待，确保业务零丢包。
+              </div>
               <pre id="code-p-python" class="code-block"></pre>
             </div>
           </div>
@@ -245,11 +296,16 @@
               <pre id="code-p-status" class="code-block"></pre>
             </div>
             <div class="api-codes-grid">
-              <div class="api-code-item"><span class="badge online">200 OK</span><span>入队成功，返回 <code>{"file_id","project_id","filename","size","sha256","status":"ready"}</code></span></div>
-              <div class="api-code-item"><span class="badge offline">400</span><span>项目 ID 非法（仅允许 <code>A-Za-z0-9._-</code> 1~64 位）、文件名非法或 SHA256 不一致</span></div>
-              <div class="api-code-item"><span class="badge offline">403</span><span>仅允许本机 <code>localhost / 127.0.0.1</code> 直连（拒绝远程、反代或跨站请求），或该分发节点限制了允许的项目</span></div>
-              <div class="api-code-item"><span class="badge awaiting">503</span><span>分发节点尚未在控制台勾选激活数据盘，请前往「分发节点」选盘激活</span></div>
-              <div class="api-code-item"><span class="badge alarm">507</span><span>触发强制安全水位（默认 ≥85%，支持节点自定义 1%~99%），上游退避几秒重试即可，绝不写爆磁盘</span></div>
+              <div class="api-code-item"><span class="badge online">200 OK</span><span>入队成功，返回
+                  <code>{"file_id","project_id","filename","size","sha256","status":"ready"}</code></span></div>
+              <div class="api-code-item"><span class="badge offline">400</span><span>项目 ID 非法（仅允许
+                  <code>A-Za-z0-9._-</code> 1~64 位）、文件名非法或 SHA256 不一致</span></div>
+              <div class="api-code-item"><span class="badge offline">403</span><span>仅允许本机
+                  <code>localhost / 127.0.0.1</code> 直连（拒绝远程、反代或跨站请求），或该分发节点限制了允许的项目</span></div>
+              <div class="api-code-item"><span
+                  class="badge awaiting">503</span><span>分发节点尚未在控制台勾选激活数据盘，请前往「分发节点」选盘激活</span></div>
+              <div class="api-code-item"><span class="badge alarm">507</span><span>触发强制安全水位（默认 ≥85%，支持节点自定义
+                  1%~99%），上游退避几秒重试即可，绝不写爆磁盘</span></div>
             </div>
           </div>
         </div>
@@ -279,11 +335,15 @@
         </div>
         <div id="guide-a-body" class="guide-body hidden">
           <div class="concept-box">
-            <strong>什么是「分发节点」？</strong> 分发节点是部署在源端/中转机上的服务程序（<code>relay-agent-a</code>）：它在本机 <code>127.0.0.1:18081</code> 接收业务方或采集器推送的文件，并通过 TLS 1.3 加密端口（默认 <code>8443</code>）高速分发给所有内网接收节点；文件确认安全落盘后自动清理中转缓存。
+            <strong>什么是「分发节点」？</strong> 分发节点是部署在源端/中转机上的服务程序（<code>relay-agent-a</code>）：它在本机
+            <code>127.0.0.1:18081</code> 接收业务方或采集器推送的文件，并通过 TLS 1.3 加密端口（默认
+            <code>8443</code>）高速分发给所有内网接收节点；文件确认安全落盘后自动清理中转缓存。
           </div>
           <div class="guide-subtabs" role="tablist">
-            <button type="button" class="guide-subtab active" data-guide-a-mode="ssh">方式 A：有公网 IP + SSH（全自动一键部署）</button>
-            <button type="button" class="guide-subtab" data-guide-a-mode="manual">方式 B：无公网 IP / 无直连 SSH（NAT·FRP 映射 + 自动化脚本）</button>
+            <button type="button" class="guide-subtab active" data-guide-a-mode="ssh">方式 A：有公网 IP +
+              SSH（全自动一键部署）</button>
+            <button type="button" class="guide-subtab" data-guide-a-mode="manual">方式 B：无公网 IP / 无直连 SSH（NAT·FRP 映射 +
+              自动化脚本）</button>
           </div>
 
           <div id="guide-a-steps-ssh" class="step-grid">
@@ -294,7 +354,8 @@
             </div>
             <div class="step-item">
               <div class="step-title"><span class="step-num">2</span>网页勾选数据盘（多盘并发）</div>
-              <div class="step-desc">节点上线后点「选择数据盘」（可点刷新实时扫新挂硬盘），勾选 1 块或多块盘自动建 <code>&lt;盘&gt;/relay-cache</code> 目录，支持多盘并发传大文件。</div>
+              <div class="step-desc">节点上线后点「选择数据盘」（可点刷新实时扫新挂硬盘），勾选 1 块或多块盘自动建 <code>&lt;盘&gt;/relay-cache</code>
+                目录，支持多盘并发传大文件。</div>
             </div>
             <div class="step-item">
               <div class="step-title"><span class="step-num">3</span>强制水位防写爆保护</div>
@@ -302,17 +363,20 @@
             </div>
             <div class="step-item">
               <div class="step-title"><span class="step-num">4</span>本机免鉴权推流并随时热控</div>
-              <div class="step-desc">业务方在分发机本机直接推送 <code>http://127.0.0.1:18081</code>（免 Token）；日常可随时点「暂停/启动」或热增减缓存数据盘。</div>
+              <div class="step-desc">业务方在分发机本机直接推送 <code>http://127.0.0.1:18081</code>（免 Token）；日常可随时点「暂停/启动」或热增减缓存数据盘。
+              </div>
             </div>
           </div>
 
           <div id="guide-a-steps-manual" class="step-grid hidden">
             <div class="step-item">
               <div class="step-title"><span class="step-num">1</span>登记分发节点（无公网先做映射）</div>
-              <div class="step-desc">无独立公网 IP 时，先用 NAT/FRP 将 TCP <code>8443</code> 映射到公网可达地址；点「+ 手动注册分发节点」填节点 ID 与映射地址（<strong>无需先填磁盘</strong>）。</div>
+              <div class="step-desc">无独立公网 IP 时，先用 NAT/FRP 将 TCP <code>8443</code> 映射到公网可达地址；点「+ 手动注册分发节点」填节点 ID
+                与映射地址（<strong>无需先填磁盘</strong>）。</div>
               <div class="btn-row">
                 <button type="button" class="btn sm primary" data-trigger-click="open-create-node-a">注册分发节点</button>
-                <button type="button" class="btn sm" data-copy-text="[[proxies]]&#10;name = &quot;relay-agent-a&quot;&#10;type = &quot;tcp&quot;&#10;localIP = &quot;127.0.0.1&quot;&#10;localPort = 8443&#10;remotePort = 8443">复制FRP</button>
+                <button type="button" class="btn sm"
+                  data-copy-text="[[proxies]]&#10;name = &quot;relay-agent-a&quot;&#10;type = &quot;tcp&quot;&#10;localIP = &quot;127.0.0.1&quot;&#10;localPort = 8443&#10;remotePort = 8443">复制FRP</button>
               </div>
             </div>
             <div class="step-item">
@@ -321,22 +385,26 @@
             </div>
             <div class="step-item">
               <div class="step-title"><span class="step-num">3</span>网页刷新并勾选数据盘激活</div>
-              <div class="step-desc">列表亮起「⚠ 待选盘 · 未激活」后，点显眼的「⚡ 选择数据盘并激活」，勾选 1 块或多块盘自动建 <code>relay-cache</code> 目录并立即激活！</div>
+              <div class="step-desc">列表亮起「⚠ 待选盘 · 未激活」后，点显眼的「⚡ 选择数据盘并激活」，勾选 1 块或多块盘自动建 <code>relay-cache</code> 目录并立即激活！
+              </div>
             </div>
             <div class="step-item">
               <div class="step-title"><span class="step-num">4</span>验证运行与日常免 SSH 管控</div>
               <div class="step-desc">激活后即可多盘并发缓存传输大文件；新插硬盘挂载后点「刷新物理盘」直接勾选用上，随时可暂停/启动。</div>
               <div class="cmd-copy-row">
                 <code>sudo systemctl status relay-agent-a --no-pager</code>
-                <button type="button" class="btn sm" data-copy-text="sudo systemctl status relay-agent-a --no-pager">复制</button>
+                <button type="button" class="btn sm"
+                  data-copy-text="sudo systemctl status relay-agent-a --no-pager">复制</button>
               </div>
             </div>
           </div>
 
           <div class="quick-cmd-bar">
             <span class="muted">常用排查命令一键复制：</span>
-            <button type="button" class="btn sm" data-copy-text="sudo systemctl status relay-agent-a --no-pager">查看分发服务状态</button>
-            <button type="button" class="btn sm" data-copy-text="sudo journalctl -u relay-agent-a -n 50 --no-pager">查看最近 50 行日志</button>
+            <button type="button" class="btn sm"
+              data-copy-text="sudo systemctl status relay-agent-a --no-pager">查看分发服务状态</button>
+            <button type="button" class="btn sm" data-copy-text="sudo journalctl -u relay-agent-a -n 50 --no-pager">查看最近
+              50 行日志</button>
             <button type="button" class="btn sm" data-copy-text="sudo systemctl restart relay-agent-a">重启分发服务</button>
           </div>
         </div>
@@ -385,18 +453,23 @@
         </div>
         <div id="guide-b-body" class="guide-body hidden">
           <div class="concept-box">
-            <strong>什么是「接收节点」？</strong> 接收节点就是你<strong>本地机房 / NAS / 用来最终存文件的 Linux 硬盘服务器</strong>（上面运行 <code>relay-agent-b</code> 客户端）。它<strong>完全不需要公网 IP，也不需要路由器端口映射或开放任何入站防火墙</strong>——只要机器能正常访问外网 HTTPS，就会主动向中心拉取任务并高速写盘，落盘校验完成后自动通知上游释放空间。
+            <strong>什么是「接收节点」？</strong> 接收节点就是你<strong>本地机房 / NAS / 用来最终存文件的 Linux 硬盘服务器</strong>（上面运行
+            <code>relay-agent-b</code> 客户端）。它<strong>完全不需要公网 IP，也不需要路由器端口映射或开放任何入站防火墙</strong>——只要机器能正常访问外网
+            HTTPS，就会主动向中心拉取任务并高速写盘，落盘校验完成后自动通知上游释放空间。
           </div>
 
           <div class="step-grid">
             <div class="step-item">
               <div class="step-title"><span class="step-num">1</span>登记新接收节点（免填磁盘路径）</div>
-              <div class="step-desc">点击下方按钮给本地存储机/NAS 取个编号（如 <code>nas-02</code>）和备注名，选好下载项目即可，<strong>完全不用提前手敲硬盘目录</strong>。</div>
+              <div class="step-desc">点击下方按钮给本地存储机/NAS 取个编号（如
+                <code>nas-02</code>）和备注名，选好下载项目即可，<strong>完全不用提前手敲硬盘目录</strong>。
+              </div>
               <button type="button" class="btn sm primary" data-trigger-click="open-create-node-b">+ 立即注册接收节点</button>
             </div>
             <div class="step-item">
               <div class="step-title"><span class="step-num">2</span>执行一键激活脚本上线扫盘</div>
-              <div class="step-desc">创建后点「生成一键安装脚本」→「复制一键执行命令」，粘贴到接收机终端回车。节点 3 秒上线并<strong>自动扫描机器上全部物理盘</strong>（未选盘前暂不下载）。</div>
+              <div class="step-desc">创建后点「生成一键安装脚本」→「复制一键执行命令」，粘贴到接收机终端回车。节点 3
+                秒上线并<strong>自动扫描机器上全部物理盘</strong>（未选盘前暂不下载）。</div>
               <div class="cmd-copy-row">
                 <code id="guide-b-check-cmd">curl -kI https://.../healthz</code>
                 <button type="button" class="btn sm" id="btn-copy-b-check-cmd">复制检测</button>
@@ -404,23 +477,30 @@
             </div>
             <div class="step-item">
               <div class="step-title"><span class="step-num">3</span>网页刷新并勾选数据盘激活</div>
-              <div class="step-desc">列表亮起「⚠ 待选盘 · 未激活」后，点显眼的<strong>「⚡ 选择数据盘并激活」</strong>（新插硬盘可点刷新物理盘），勾选 1 块或多块盘自动建 <code>relay-delivery</code> 目录，支持多盘并发写盘！</div>
+              <div class="step-desc">列表亮起「⚠ 待选盘 · 未激活」后，点显眼的<strong>「⚡ 选择数据盘并激活」</strong>（新插硬盘可点刷新物理盘），勾选 1 块或多块盘自动建
+                <code>relay-delivery</code> 目录，支持多盘并发写盘！
+              </div>
             </div>
             <div class="step-item">
               <div class="step-title"><span class="step-num">4</span>强制水位保护 & 免 SSH 热控</div>
-              <div class="step-desc">无论数据盘还是系统盘 <code>/</code> 均强制启用水位保护（支持自定义 1%~99%，默认 85%）；后续热增减硬盘、切项目、<strong>暂停/启动</strong>、热升级全在网页完成。</div>
+              <div class="step-desc">无论数据盘还是系统盘 <code>/</code> 均强制启用水位保护（支持自定义 1%~99%，默认
+                85%）；后续热增减硬盘、切项目、<strong>暂停/启动</strong>、热升级全在网页完成。</div>
               <div class="cmd-copy-row">
                 <code>sudo systemctl status relay-agent-b --no-pager</code>
-                <button type="button" class="btn sm" data-copy-text="sudo systemctl status relay-agent-b --no-pager">复制</button>
+                <button type="button" class="btn sm"
+                  data-copy-text="sudo systemctl status relay-agent-b --no-pager">复制</button>
               </div>
             </div>
           </div>
 
           <div class="quick-cmd-bar">
             <span class="muted">接收机常用命令一键复制：</span>
-            <button type="button" class="btn sm" data-copy-text="df -hT | grep -E 'Filesystem|/mnt|/data'">查看挂载盘与剩余空间</button>
-            <button type="button" class="btn sm" data-copy-text="sudo mkdir -p /mnt/sda/relay-delivery /mnt/sdb/relay-delivery">创建示例落盘目录</button>
-            <button type="button" class="btn sm" data-copy-text="sudo journalctl -u relay-agent-b -n 50 --no-pager">查看接收服务最近 50 行日志</button>
+            <button type="button" class="btn sm"
+              data-copy-text="df -hT | grep -E 'Filesystem|/mnt|/data'">查看挂载盘与剩余空间</button>
+            <button type="button" class="btn sm"
+              data-copy-text="sudo mkdir -p /mnt/sda/relay-delivery /mnt/sdb/relay-delivery">创建示例落盘目录</button>
+            <button type="button" class="btn sm"
+              data-copy-text="sudo journalctl -u relay-agent-b -n 50 --no-pager">查看接收服务最近 50 行日志</button>
             <button type="button" class="btn sm" data-copy-text="sudo systemctl restart relay-agent-b">重启接收服务</button>
           </div>
         </div>
@@ -587,7 +667,8 @@
         <label>项目内部 ID (底层目录与接口唯一标识，创建后不可改)
           <div class="input-with-btn">
             <input name="id" required placeholder="e.g. proj-8f3k2a" autocomplete="off" />
-            <button type="button" id="btn-gen-project-id" class="btn sm" data-gen-id="proj" data-gen-target="#create-project-form input[name='id']">自动生成</button>
+            <button type="button" id="btn-gen-project-id" class="btn sm" data-gen-id="proj"
+              data-gen-target="#create-project-form input[name='id']">自动生成</button>
           </div>
         </label>
         <label>项目显示名称 / 简称 * (如 tw-audio，全站与客户授权列表优先展示此名)
@@ -642,7 +723,8 @@
         <label>节点 ID *
           <div class="input-with-btn">
             <input name="id" required placeholder="e.g. edge-7q2n8r / nas-4m9x1p" autocomplete="off" />
-            <button type="button" id="btn-gen-node-id" class="btn sm" data-gen-id="node" data-gen-target="#create-node-form input[name='id']">自动生成</button>
+            <button type="button" id="btn-gen-node-id" class="btn sm" data-gen-id="node"
+              data-gen-target="#create-node-form input[name='id']">自动生成</button>
           </div>
         </label>
         <label>显示名称
@@ -687,14 +769,17 @@
             </label>
             <label>多磁盘落盘策略
               <select name="disk_policy" id="create-disk-policy-select">
-                <option value="affinity_hash" selected>同源亲和均匀 (推荐)</option>
-                <option value="rolling_window">分批滚动窗口 (超多盘先写 N 块，写满自动顶上)</option>
-                <option value="most_free">最大剩余空间优先</option>
-                <option value="round_robin">逐文件轮询均匀</option>
-                <option value="first">首盘写满再切下盘</option>
+                <option value="round_robin" selected>多盘均衡分布 (所有启用盘均匀并发写入)</option>
+                <option value="rolling_window">分批滚动窗口 (推荐超多盘：先写 N 块，写满自动顶上)</option>
+                <option value="most_free">最大剩余空间优先 (始终写入最空闲的磁盘)</option>
+                <option value="first">单盘顺序写满 (写满第 1 块再切下盘)</option>
               </select>
             </label>
           </div>
+          <label class="toggle">
+            <input type="checkbox" name="disk_affinity" checked />
+            <span>开启同源亲和（默认开启：同素材组的音视频与 .info.json 等配套文件优先落入同一块盘，所有落盘策略均生效）</span>
+          </label>
           <label id="create-disk-window-wrap" class="hidden">分批滚动并发盘数 N (同时写前 N 块，任意 1 块写满或拔出，第 N+1 块自动顶上)
             <input name="active_disk_window" type="number" value="10" min="1" max="256" />
           </label>
@@ -722,7 +807,8 @@
         <button class="btn ghost" type="button" data-close-modal="edit-node-modal">关闭</button>
       </div>
       <div id="edit-b-awaiting-banner" class="banner warn hidden" style="margin-bottom:12px">
-        <strong>⚡ 当前接收节点尚未激活：</strong>请从下方勾选至少 1 块物理磁盘并点击保存，系统将自动创建统一目录 <code>&lt;挂载点&gt;/relay-delivery/&lt;项目ID&gt;/</code> 并立即开始多盘并发下载！
+        <strong>⚡ 当前接收节点尚未激活：</strong>请从下方勾选至少 1 块物理磁盘并点击保存，系统将自动创建统一目录
+        <code>&lt;挂载点&gt;/relay-delivery/&lt;项目ID&gt;/</code> 并立即开始多盘并发下载！
       </div>
       <form id="edit-node-form" class="form-stack">
         <input type="hidden" name="node_id" />
@@ -778,36 +864,55 @@
           <div class="disk-sec-head">
             <div class="config-section-title">2. 选择数据盘、选盘策略与强制水位（支持多盘并发 · 自定义 1%~99%，默认 85%）</div>
             <button type="button" id="btn-refresh-b-disks" class="btn sm">
-              <svg class="ico ico-sm ico-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/></svg>
+              <svg class="ico ico-sm ico-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1"
+                stroke-linecap="round" stroke-linejoin="round">
+                <path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8" />
+                <path d="M21 3v5h-5" />
+              </svg>
               <span>刷新物理盘</span>
             </button>
           </div>
           <div class="form-grid-3">
-            <label>多磁盘选盘策略
+            <label>多磁盘落盘策略
               <select name="disk_policy" id="edit-disk-policy-select">
-                <option value="affinity_hash">同源亲和均匀 (音视频与 .info.json 同盘，满盘溢出)</option>
-                <option value="rolling_window">分批滚动窗口 (推荐超多盘：同时写前 N 块，写满自动顶上)</option>
+                <option value="round_robin">多盘均衡分布 (所有启用盘均匀分散并发写入)</option>
+                <option value="rolling_window">分批滚动窗口 (推荐超多盘：先写前 N 块，写满自动顶上)</option>
                 <option value="most_free">最大剩余空间优先 (始终写入最空闲的磁盘)</option>
-                <option value="round_robin">逐文件轮询均匀 (按文件依次轮询各启用磁盘)</option>
-                <option value="first">首盘写满再切下盘 (按顺序优先写满第一块启用盘)</option>
+                <option value="first">单盘顺序写满 (按顺序写满第 1 块再切下盘)</option>
               </select>
             </label>
             <label id="edit-disk-window-wrap" class="hidden">同时写入盘数 N (1~256，满 1 块自动滚下一块)
               <input name="active_disk_window" type="number" value="10" min="1" max="256" />
             </label>
             <label>强制安全水位上限 % (1~99%，默认 85%)
-              <input name="max_disk_usage_pct" id="edit-b-watermark-input" type="number" value="85" min="1" max="99" step="1" />
+              <input name="max_disk_usage_pct" id="edit-b-watermark-input" type="number" value="85" min="1" max="99"
+                step="1" />
             </label>
           </div>
+          <label class="toggle" style="margin:2px 0 4px">
+            <input type="checkbox" name="disk_affinity" checked />
+            <span>开启同源亲和（默认开启：同素材组的音视频、.info.json、字幕等配套文件优先落入同一块盘，上方所有落盘策略均生效）</span>
+          </label>
           <div id="edit-disks-section">
-            <div class="muted" style="margin-bottom:6px">勾选即可自动创建统一目录 <code>&lt;挂载点&gt;/relay-delivery</code> 并开启多盘并发落盘；<strong>准备拔盘</strong>时先关闭开关等在途写入归零再卸载，<strong>直接拔盘</strong>也会自动锁定防穿透写进系统盘（重插后需人工勾选确认启用）。</div>
+            <div class="muted" style="margin-bottom:6px">勾选即可自动创建统一目录 <code>&lt;挂载点&gt;/relay-delivery</code>
+              并开启多盘并发落盘；<strong>准备拔盘</strong>时先关闭开关等在途写入归零再卸载，<strong>直接拔盘</strong>也会自动锁定防穿透写进系统盘（重插后需人工勾选确认启用）。</div>
             <div class="disk-picker-toolbar">
-              <input type="text" id="edit-b-disk-search" class="disk-search-input" data-disk-filter="edit-disks-list" placeholder="搜索挂载点/设备名（如 /mnt/disk）..." autocomplete="off" />
+              <input type="text" id="edit-b-disk-search" class="disk-search-input" data-disk-filter="edit-disks-list"
+                placeholder="搜索挂载点/设备名（如 /mnt/disk）..." autocomplete="off" />
               <div class="btn-row">
                 <button type="button" class="btn sm" data-disk-select-all="edit-disks-list">全选数据盘</button>
                 <button type="button" class="btn sm ghost" data-disk-clear-all="edit-disks-list">清空勾选</button>
               </div>
               <span id="edit-b-disk-counter" class="muted"></span>
+            </div>
+            <div class="disk-filter-chips" data-picker-chips="edit-disks-list">
+              <button type="button" class="disk-chip active" data-disk-state="all">全部</button>
+              <button type="button" class="disk-chip" data-disk-state="checked">已启用</button>
+              <button type="button" class="disk-chip" data-disk-state="unchecked">未启用</button>
+              <button type="button" class="disk-chip" data-disk-state="active">写入中</button>
+              <button type="button" class="disk-chip" data-disk-state="standby">候补</button>
+              <button type="button" class="disk-chip" data-disk-state="full">已写满</button>
+              <button type="button" class="disk-chip" data-disk-state="alert">异常/拔出/可拔盘</button>
             </div>
             <div id="edit-disks-list" class="disk-toggle-list"></div>
           </div>
@@ -867,24 +972,40 @@
           <div class="disk-sec-head">
             <div class="config-section-title">本机已挂载物理盘列表与强制水位（自动过滤系统虚拟分区）</div>
             <button type="button" id="btn-refresh-a-disks" class="btn sm">
-              <svg class="ico ico-sm ico-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/></svg>
+              <svg class="ico ico-sm ico-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1"
+                stroke-linecap="round" stroke-linejoin="round">
+                <path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8" />
+                <path d="M21 3v5h-5" />
+              </svg>
               <span>刷新物理盘</span>
             </button>
           </div>
           <div class="form-grid-2" style="margin-bottom:8px">
             <label>缓存盘强制安全水位上限 %（最低 1%，最高 99%，默认 85%）
-              <input name="max_disk_usage_pct" id="edit-a-watermark-input" type="number" value="85" min="1" max="99" step="1" />
+              <input name="max_disk_usage_pct" id="edit-a-watermark-input" type="number" value="85" min="1" max="99"
+                step="1" />
             </label>
-            <div class="muted" style="align-self:end;padding-bottom:6px">任意启用缓存盘达到水位即自动切盘，全部达到水位时本机上传返回 <code>507</code> 退避保护。</div>
+            <div class="muted" style="align-self:end;padding-bottom:6px">任意启用缓存盘达到水位即自动切盘，全部达到水位时本机上传返回 <code>507</code>
+              退避保护。</div>
           </div>
-          <div class="muted">勾选即可自动创建 <code>&lt;挂载点&gt;/relay-cache</code>（系统盘自动建 <code>/data/relay-cache</code>）并开启多盘并发缓存；停用等待在途排空可安全拔盘，直接拔盘自动锁定防穿透写系统盘，重插后需人工勾选确认启用。</div>
+          <div class="muted">勾选即可自动创建 <code>&lt;挂载点&gt;/relay-cache</code>（系统盘自动建
+            <code>/data/relay-cache</code>）并开启多盘并发缓存；停用等待在途排空可安全拔盘，直接拔盘自动锁定防穿透写系统盘，重插后需人工勾选确认启用。
+          </div>
           <div class="disk-picker-toolbar">
-            <input type="text" id="edit-a-disk-search" class="disk-search-input" data-disk-filter="edit-a-disks-list" placeholder="搜索挂载点/设备名..." autocomplete="off" />
+            <input type="text" id="edit-a-disk-search" class="disk-search-input" data-disk-filter="edit-a-disks-list"
+              placeholder="搜索挂载点/设备名..." autocomplete="off" />
             <div class="btn-row">
               <button type="button" class="btn sm" data-disk-select-all="edit-a-disks-list">全选数据盘</button>
               <button type="button" class="btn sm ghost" data-disk-clear-all="edit-a-disks-list">清空勾选</button>
             </div>
             <span id="edit-a-disk-counter" class="muted"></span>
+          </div>
+          <div class="disk-filter-chips" data-picker-chips="edit-a-disks-list">
+            <button type="button" class="disk-chip active" data-disk-state="all">全部</button>
+            <button type="button" class="disk-chip" data-disk-state="checked">已启用</button>
+            <button type="button" class="disk-chip" data-disk-state="unchecked">未启用</button>
+            <button type="button" class="disk-chip" data-disk-state="full">已写满</button>
+            <button type="button" class="disk-chip" data-disk-state="alert">异常/拔出/可拔盘</button>
           </div>
           <div id="edit-a-disks-list" class="disk-toggle-list"></div>
         </div>
@@ -924,7 +1045,8 @@
           <label>节点 ID *
             <div class="input-with-btn">
               <input name="node_id" required placeholder="e.g. edge-7q2n8r" autocomplete="off" />
-              <button type="button" class="btn sm" data-gen-id="edge" data-gen-target="#deploy-a-form input[name='node_id']">自动生成</button>
+              <button type="button" class="btn sm" data-gen-id="edge"
+                data-gen-target="#deploy-a-form input[name='node_id']">自动生成</button>
             </div>
           </label>
           <label>节点显示名称
@@ -1019,8 +1141,10 @@
               </select>
             </label>
             <div id="b-script-pool-wrap" class="form-stack">
-              <label><span class="form-label-text">物理磁盘根目录列表（每行一个挂载目录，项目自动落盘至 <code>&lt;盘目录&gt;/&lt;项目ID&gt;/</code>）</span>
-                <textarea name="storage_dirs" rows="2" placeholder="/mnt/sda/relay-delivery&#10;/mnt/sdb/relay-delivery"></textarea>
+              <label><span class="form-label-text">物理磁盘根目录列表（每行一个挂载目录，项目自动落盘至
+                  <code>&lt;盘目录&gt;/&lt;项目ID&gt;/</code>）</span>
+                <textarea name="storage_dirs" rows="2"
+                  placeholder="/mnt/sda/relay-delivery&#10;/mnt/sdb/relay-delivery"></textarea>
               </label>
             </div>
             <div id="b-script-single-wrap" class="form-stack hidden">
@@ -1028,7 +1152,8 @@
                 <select id="b-script-single-project" name="only_project"></select>
               </label>
               <label><span class="form-label-text">本地落盘目录（每行一个目录，填多个目录自动多盘并发落盘）</span>
-                <textarea name="single_dest_dirs" rows="2" placeholder="/mnt/sda/relay-delivery&#10;/mnt/sdb/relay-delivery"></textarea>
+                <textarea name="single_dest_dirs" rows="2"
+                  placeholder="/mnt/sda/relay-delivery&#10;/mnt/sdb/relay-delivery"></textarea>
               </label>
             </div>
             <div id="b-script-multi-wrap" class="form-stack hidden">
@@ -1072,7 +1197,8 @@
         </div>
       </form>
       <div id="b-script-steps-tip" class="banner pass hidden" style="margin-top:12px;margin-bottom:0">
-        <strong>执行步骤：</strong> 1) SSH 登录你的内网接收机 → 2) 点击上方「复制一键执行命令」粘贴到终端回车（非 root 请先 <code>sudo -i</code>）→ 3) 等待 5 秒，本页面该节点变「在线」后即可在网页选盘激活。
+        <strong>执行步骤：</strong> 1) SSH 登录你的内网接收机 → 2) 点击上方「复制一键执行命令」粘贴到终端回车（非 root 请先 <code>sudo -i</code>）→ 3) 等待 5
+        秒，本页面该节点变「在线」后即可在网页选盘激活。
       </div>
       <div id="b-script-output" class="hidden" style="margin-top:10px"></div>
     </div>
@@ -1161,7 +1287,8 @@
         <label>账号 ID (留空或点自动生成)
           <div class="input-with-btn">
             <input name="id" placeholder="e.g. cust-6w3e9t" autocomplete="off" />
-            <button type="button" id="btn-gen-account-id" class="btn sm" data-gen-id="cust" data-gen-target="#account-form input[name='id']">自动生成</button>
+            <button type="button" id="btn-gen-account-id" class="btn sm" data-gen-id="cust"
+              data-gen-target="#account-form input[name='id']">自动生成</button>
           </div>
         </label>
         <label>客户名称 / 备注 *
@@ -1231,7 +1358,39 @@
     </div>
   </div>
 
+  <!-- Scrollable All-Disks Overview Modal (Supports 1~256 Disks Cleanly) -->
+  <div id="node-disks-view-modal" class="overlay hidden">
+    <div class="modal-card wide">
+      <div class="modal-head">
+        <div>
+          <h3 id="node-disks-view-title">节点磁盘池详情</h3>
+          <p id="node-disks-view-sub" class="muted">可滑动浏览全部已挂载/已配置磁盘实时水位与状态</p>
+        </div>
+        <div class="btn-row">
+          <button type="button" id="btn-refresh-view-disks" class="btn sm">刷新状态</button>
+          <button type="button" id="btn-manage-from-view-disks" class="btn sm primary">勾选 / 管理数据盘</button>
+          <button class="btn ghost" type="button" data-close-modal="node-disks-view-modal">关闭</button>
+        </div>
+      </div>
+      <div id="node-disks-view-summary" class="disk-view-summary"></div>
+      <div class="disk-picker-toolbar">
+        <input type="text" id="node-disks-view-search" class="disk-search-input" placeholder="搜索盘路径、挂载点或状态说明..." autocomplete="off" />
+        <span id="node-disks-view-counter" class="muted"></span>
+      </div>
+      <div id="node-disks-view-chips" class="disk-filter-chips">
+        <button type="button" class="disk-chip active" data-view-state="all">全部</button>
+        <button type="button" class="disk-chip" data-view-state="active">写入中</button>
+        <button type="button" class="disk-chip" data-view-state="standby">候补排队</button>
+        <button type="button" class="disk-chip" data-view-state="full">已写满</button>
+        <button type="button" class="disk-chip" data-view-state="disabled">停用/可拔盘</button>
+        <button type="button" class="disk-chip" data-view-state="alert">⚠ 异常/拔出/重插</button>
+      </div>
+      <div id="node-disks-view-grid" class="disk-scroll-grid"></div>
+    </div>
+  </div>
+
   <div id="toast-stack" class="toast-stack" aria-live="polite"></div>
   <script src="/app.js"></script>
 </body>
+
 </html>

@@ -272,3 +272,86 @@ func TestRollingWindowSlidingDiskSelection(t *testing.T) {
 		t.Fatalf("expected hot-updated receiver watermark 1%%, got %.1f", got)
 	}
 }
+
+func TestUniversalDiskAffinityAcrossAllPolicies(t *testing.T) {
+	base := t.TempDir()
+	roots := make([]string, 4)
+	for i := range roots {
+		roots[i] = filepath.Join(base, fmt.Sprintf("disk%d", i+1))
+		if err := os.MkdirAll(roots[i], 0o755); err != nil {
+			t.Fatalf("mkdir disk%d: %v", i+1, err)
+		}
+	}
+
+	cfg := Config{
+		NodeID:      "b-aff",
+		CenterURL:   "https://127.0.0.1:8440",
+		CenterToken: "tok",
+		StorageDirs: roots,
+		StateDir:    filepath.Join(base, "state"),
+	}
+	cfg.ApplyDefaults()
+	if !cfg.DiskAffinityEnabled() {
+		t.Fatalf("expected disk_affinity default to be true")
+	}
+
+	// Test paired assets stay on the exact same disk across ALL policies when disk_affinity=true.
+	for _, pol := range []string{
+		protocol.DiskPolicyRoundRobin,
+		protocol.DiskPolicyMostFree,
+		protocol.DiskPolicyFirst,
+		protocol.DiskPolicyRollingWindow,
+		protocol.DiskPolicyAffinityHash,
+	} {
+		ag := &Agent{
+			cfg:              &cfg,
+			logger:           slog.Default(),
+			discCache:        make(map[string]cachedDiscover),
+			wakeupCh:         make(chan string, 16),
+			diskHealth:       transfer.NewDiskHealthTracker(),
+			maxDiskUsagePct:  99.0,
+			activeDiskWindow: 3,
+		}
+		affOn := true
+		ag.applyDirective(&protocol.ReceiverDirective{
+			ProjectMode:      "selected",
+			AllowedProjects:  []string{"tw-audio"},
+			DiskPolicy:       pol,
+			DiskAffinity:     &affOn,
+			ActiveDiskWindow: 3,
+			StorageDirs:      roots,
+			MaxDiskUsagePct:  99.0,
+		}, nil)
+
+		dMedia := ag.chooseDestDir("tw-audio", "vid001.m4a", 1024)
+		dInfo := ag.chooseDestDir("tw-audio", "vid001.info.json", 512)
+		dSub := ag.chooseDestDir("tw-audio", "vid001.zh.vtt", 256)
+		if dMedia == "" || dMedia != dInfo || dMedia != dSub {
+			t.Fatalf("policy=%s with disk_affinity=true: paired files split across disks: m4a=%s info=%s vtt=%s", pol, dMedia, dInfo, dSub)
+		}
+	}
+
+	// When disk_affinity=false under round_robin, paired files do NOT stick to the same disk.
+	agOff := &Agent{
+		cfg:             &cfg,
+		logger:          slog.Default(),
+		discCache:       make(map[string]cachedDiscover),
+		wakeupCh:        make(chan string, 16),
+		diskHealth:      transfer.NewDiskHealthTracker(),
+		maxDiskUsagePct: 99.0,
+	}
+	affOff := false
+	agOff.applyDirective(&protocol.ReceiverDirective{
+		ProjectMode:     "selected",
+		AllowedProjects: []string{"tw-audio"},
+		DiskPolicy:      protocol.DiskPolicyRoundRobin,
+		DiskAffinity:    &affOff,
+		StorageDirs:     roots,
+		MaxDiskUsagePct: 99.0,
+	}, nil)
+	d1 := agOff.chooseDestDir("tw-audio", "vid002.m4a", 1024)
+	d2 := agOff.chooseDestDir("tw-audio", "vid002.info.json", 512)
+	if d1 == d2 {
+		t.Fatalf("expected round_robin with disk_affinity=false to alternate disks even for same stem, got %s twice", d1)
+	}
+}

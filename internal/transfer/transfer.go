@@ -158,7 +158,7 @@ func MediaAffinityKey(filename string) string {
 	lower := strings.ToLower(base)
 	stem := base
 	matchedCompound := false
-	for _, suffix := range []string{".info.json", ".meta.json", ".tar.gz", ".tar.zst"} {
+	for _, suffix := range []string{".info.json", ".meta.json", ".live_chat.json", ".tar.gz", ".tar.zst"} {
 		if strings.HasSuffix(lower, suffix) && len(base) > len(suffix) {
 			stem = base[:len(base)-len(suffix)]
 			matchedCompound = true
@@ -169,12 +169,50 @@ func MediaAffinityKey(filename string) string {
 		ext := path.Ext(base)
 		if ext != "" && len(base) > len(ext) {
 			stem = base[:len(base)-len(ext)]
+			// Strip optional language tag on subtitle/caption sidecars (e.g. "<id>.zh.vtt", "<id>.zh-Hant.srt").
+			switch strings.ToLower(ext) {
+			case ".vtt", ".srt", ".ass", ".ssa", ".lrc", ".ttml", ".srv1", ".srv2", ".srv3", ".json3":
+				if dot := strings.LastIndexByte(stem, '.'); dot > 0 && isSubtitleLangTag(stem[dot+1:]) {
+					stem = stem[:dot]
+				}
+			}
 		}
 	}
 	if dir != "" && dir != "." && dir != "/" {
 		return dir + "/" + stem
 	}
 	return stem
+}
+
+func isSubtitleLangTag(seg string) bool {
+	if len(seg) < 2 || len(seg) > 16 {
+		return false
+	}
+	parts := strings.Split(strings.ToLower(seg), "-")
+	if len(parts) == 0 || len(parts) > 3 {
+		return false
+	}
+	// Primary ISO 639 language code: 2-3 ASCII letters (e.g. zh, en, ja, yue).
+	if len(parts[0]) < 2 || len(parts[0]) > 3 {
+		return false
+	}
+	for i := 0; i < len(parts[0]); i++ {
+		if parts[0][i] < 'a' || parts[0][i] > 'z' {
+			return false
+		}
+	}
+	for _, p := range parts[1:] {
+		if len(p) == 0 || len(p) > 8 {
+			return false
+		}
+		for i := 0; i < len(p); i++ {
+			c := p[i]
+			if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // RendezvousOwner selects the deterministic HRW (Highest Random Weight) owner receiver node

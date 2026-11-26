@@ -24,7 +24,8 @@ type Config struct {
 	StorageDirs          []string            `yaml:"storage_dirs,omitempty"`         // managed disk pool roots: any project lands in <storage_dir>/<project_id>/
 	AwaitDiskSelection   bool                `yaml:"await_disk_selection,omitempty"` // if true, activate online & scan host disks, stay standby until Center assigns storage_dirs
 	ProjectSchedule      string              `yaml:"project_schedule,omitempty"`     // default multi-project schedule: "fifo" | "fair" | "random" (overridable by Center)
-	DiskPolicy           string              `yaml:"disk_policy,omitempty"`          // default disk placement: "affinity_hash" | "most_free" | "round_robin" | "first" | "rolling_window" (overridable by Center)
+	DiskPolicy           string              `yaml:"disk_policy,omitempty"`          // default disk placement: "rolling_window" | "round_robin" | "most_free" | "first" | legacy "affinity_hash" (overridable by Center)
+	DiskAffinity         *bool               `yaml:"disk_affinity,omitempty"`        // default true: keep paired assets (e.g. .m4a + .info.json) on the same disk across ALL disk policies
 	ActiveDiskWindow     int                 `yaml:"active_disk_window,omitempty"`   // concurrent active disks for rolling_window policy (default 10; 1..256)
 	ConcurrencyMode      string              `yaml:"concurrency_mode,omitempty"`     // default concurrency control: "auto" (adaptive BBR/AIMD) | "manual" (overridable by Center)
 	OnlyProject          string              `yaml:"only_project,omitempty"`         // optional: strictly restrict this receiver node locally to download ONLY this single project
@@ -65,6 +66,13 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, err
 	}
 	return &cfg, nil
+}
+
+func (c *Config) DiskAffinityEnabled() bool {
+	if c.DiskAffinity == nil {
+		return true
+	}
+	return *c.DiskAffinity
 }
 
 func (c *Config) ApplyDefaults() {
