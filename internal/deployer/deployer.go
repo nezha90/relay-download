@@ -769,6 +769,16 @@ func RenderAgentBInstallScript(centerPublicURL string, caCertPEM []byte, node pr
 		return "", err
 	}
 	onlyProject := strings.TrimSpace(req.OnlyProject)
+	storageDirs := make([]string, 0, len(req.StorageDirs))
+	for _, d := range req.StorageDirs {
+		d = strings.TrimSpace(d)
+		if d != "" {
+			if err := ValidateAbsDir(d); err != nil {
+				return "", fmt.Errorf("storage_dir: %w", err)
+			}
+			storageDirs = append(storageDirs, d)
+		}
+	}
 	destDirs := make([]string, 0, len(req.DestDirs))
 	for _, d := range req.DestDirs {
 		d = strings.TrimSpace(d)
@@ -783,29 +793,28 @@ func RenderAgentBInstallScript(centerPublicURL string, caCertPEM []byte, node pr
 	projects := req.Projects
 	projectDirs := req.ProjectDirs
 	var destDir string
-	if onlyProject != "" {
-		// Single-project receiver mode: strictly pin only_project with dest_dir / dest_dirs.
+	if len(storageDirs) > 0 && onlyProject == "" {
+		// Managed disk-pool mode (recommended): Center controls projects, scheduling, and disk toggles dynamically.
 		projects = nil
 		projectDirs = nil
-		if len(destDirs) == 0 {
-			destDir = filepath.Join("/data/relay-b/files", onlyProject)
-		} else if len(destDirs) == 1 {
-			destDir = destDirs[0]
+		destDirs = nil
+	} else if onlyProject != "" {
+		// Single-project receiver mode: strictly pin only_project locally with storage_dirs or dest_dir(s).
+		projects = nil
+		projectDirs = nil
+		if len(storageDirs) == 0 {
+			if len(destDirs) == 0 {
+				destDir = filepath.Join("/data/relay-b/files", onlyProject)
+			} else if len(destDirs) == 1 {
+				destDir = destDirs[0]
+				destDirs = nil
+			}
+		} else {
 			destDirs = nil
 		}
 	} else if len(projects) == 0 && len(projectDirs) == 0 {
-		if len(node.Projects) == 1 {
-			onlyProject = node.Projects[0]
-			destDir = filepath.Join("/data/relay-b/files", onlyProject)
-		} else {
-			projects = make(map[string]string)
-			for _, pid := range node.Projects {
-				projects[pid] = filepath.Join("/data/relay-b/files", pid)
-			}
-			if len(projects) == 0 {
-				projects["proj-alpha"] = "/data/relay-b/files/proj-alpha"
-			}
-		}
+		// Default fallback: managed storage pool under /data/relay-b/files so Console can switch projects anytime.
+		storageDirs = []string{"/data/relay-b/files"}
 	}
 	maxConc := req.MaxConcurrent
 	if maxConc <= 0 {
@@ -822,6 +831,7 @@ func RenderAgentBInstallScript(centerPublicURL string, caCertPEM []byte, node pr
 		CenterURL:            centerPublicURL,
 		CenterToken:          tokVal,
 		CACert:               filepath.Join(installDir, "certs", "ca.crt"),
+		StorageDirs:          storageDirs,
 		OnlyProject:          onlyProject,
 		DestDir:              destDir,
 		DestDirs:             destDirs,

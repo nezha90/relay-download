@@ -322,3 +322,130 @@ func TestUpdateReceiverSingleProjectWithoutTokenRotation(t *testing.T) {
 		t.Fatalf("expected 403 for disallowed proj-beta, got %d", dDenyRec.Code)
 	}
 }
+
+func TestAutoCreateProjectsAndReceiverDirectives(t *testing.T) {
+	dir := t.TempDir()
+	caCert := filepath.Join(dir, "ca.crt")
+	caKey := filepath.Join(dir, "ca.key")
+	if err := pki.InitCA(caCert, caKey, "Test CA", 365); err != nil {
+		t.Fatalf("InitCA: %v", err)
+	}
+	srvCert := filepath.Join(dir, "center.crt")
+	srvKey := filepath.Join(dir, "center.key")
+	if err := pki.IssueCert(caCert, caKey, srvCert, srvKey, "center", []string{"127.0.0.1"}, nil, 365); err != nil {
+		t.Fatalf("IssueCert: %v", err)
+	}
+	srv, err := New(&Config{
+		Listen:       "127.0.0.1:0",
+		TLSCert:      srvCert,
+		TLSKey:       srvKey,
+		CACert:       caCert,
+		DBPath:       filepath.Join(dir, "center.db"),
+		ReleasesDir:  filepath.Join(dir, "releases"),
+		JWTSecret:    "jwt-secret",
+		CenterSecret: "center-secret",
+		AdminToken:   "adm-tok",
+	}, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer srv.Shutdown(context.Background())
+
+	h := srv.routes()
+
+	createNode := func(body string) string {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/nodes", strings.NewReader(body))
+		req.Header.Set(protocol.HeaderAdminToken, "adm-tok")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("create node failed: %d %s", rec.Code, rec.Body.String())
+		}
+		var out struct {
+			Token string `json:"token"`
+		}
+		_ = json.Unmarshal(rec.Body.Bytes(), &out)
+		return out.Token
+	}
+
+	tokA := createNode(`{"id":"edge-01","name":"Edge 1","role":"agent_a","public_addr":"https://10.0.0.1:8443","projects":[]}`)
+	tokB := createNode(`{"id":"nas-01","name":"NAS 1","role":"agent_b","projects":[]}`)
+
+	// 1. Dispatch node reports availability for an unseen project -> Center must auto-create it!
+	aHB := `{"node_id":"edge-01","public_addr":"https://10.0.0.1:8443","availability":[{"project_id":"auto-proj-1","ready_count":5,"ready_bytes":10240}]}`
+	aReq := httptest.NewRequest(http.MethodPost, "/api/v1/a/heartbeat", strings.NewReader(aHB))
+	aReq.Header.Set(protocol.HeaderNodeID, "edge-01")
+	aReq.Header.Set(protocol.HeaderNodeToken, tokA)
+	aRec := httptest.NewRecorder()
+	h.ServeHTTP(aRec, aReq)
+	if aRec.Code != http.StatusOK {
+		t.Fatalf("a heartbeat: %d %s", aRec.Code, aRec.Body.String())
+	}
+
+	// Verify auto-proj-1 now exists in /api/v1/admin/projects.
+	pReq := httptest.NewRequest(http.MethodGet, "/api/v1/admin/projects", nil)
+	pReq.Header.Set(protocol.HeaderAdminToken, "adm-tok")
+	pRec := httptest.NewRecorder()
+	h.ServeHTTP(pRec, pReq)
+	var projects []protocol.Project
+	_ = json.Unmarshal(pRec.Body.Bytes(), &projects)
+	if len(projects) != 1 || projects[0].ID != "auto-proj-1" {
+		t.Fatalf("expected auto-created project [auto-proj-1], got %+v", projects)
+	}
+
+	// 2. Admin updates receiver schedule, disk policy, and disabled_disks via PUT.
+	updBody := `{"projects":[],"project_schedule":"fair","disk_policy":"most_free","disabled_disks":["/mnt/sda/relay"]}`
+	uReq := httptest.NewRequest(http.MethodPut, "/api/v1/admin/nodes/nas-01", strings.NewReader(updBody))
+	uReq.Header.Set(protocol.HeaderAdminToken, "adm-tok")
+	uRec := httptest.NewRecorder()
+	h.ServeHTTP(uRec, uReq)
+	if uRec.Code != http.StatusOK {
+		t.Fatalf("update receiver: %d %s", uRec.Code, uRec.Body.String())
+	}
+
+	// 3. Receiver heartbeat reports its storage_dirs & per-disk telemetry and receives full ReceiverDirective.
+	bHB := `{"node_id":"nas-01","storage_dirs":["/mnt/sda/relay","/mnt/sdb/relay"],"disks":[{"path":"/mnt/sda/relay","total_bytes":1000,"free_bytes":400,"used_pct":60,"enabled":false,"writable":true},{"path":"/mnt/sdb/relay","total_bytes":1000,"free_bytes":800,"used_pct":20,"enabled":true,"writable":true}]}`
+	bReq := httptest.NewRequest(http.MethodPost, "/api/v1/b/heartbeat", strings.NewReader(bHB))
+	bReq.Header.Set(protocol.HeaderNodeID, "nas-01")
+	bReq.Header.Set(protocol.HeaderNodeToken, tokB)
+	bRec := httptest.NewRecorder()
+	h.ServeHTTP(bRec, bReq)
+	if bRec.Code != http.StatusOK {
+		t.Fatalf("b heartbeat: %d %s", bRec.Code, bRec.Body.String())
+	}
+	var hbResp protocol.HeartbeatResp
+	_ = json.Unmarshal(bRec.Body.Bytes(), &hbResp)
+	if hbResp.Directive == nil {
+		t.Fatalf("expected ReceiverDirective in HeartbeatResp")
+	}
+	d := hbResp.Directive
+	if d.ProjectMode != "all" || d.ProjectSchedule != "fair" || d.DiskPolicy != "most_free" {
+		t.Fatalf("unexpected directive fields: %+v", d)
+	}
+	if len(d.KnownProjects) != 1 || d.KnownProjects[0] != "auto-proj-1" {
+		t.Fatalf("expected KnownProjects=[auto-proj-1], got %+v", d.KnownProjects)
+	}
+	if len(d.DisabledDisks) != 1 || d.DisabledDisks[0] != "/mnt/sda/relay" {
+		t.Fatalf("expected DisabledDisks=[/mnt/sda/relay], got %+v", d.DisabledDisks)
+	}
+
+	// 4. /api/v1/admin/nodes must expose per-disk telemetry, storage_dirs, schedule & disk policy.
+	nReq := httptest.NewRequest(http.MethodGet, "/api/v1/admin/nodes?hours=24", nil)
+	nReq.Header.Set(protocol.HeaderAdminToken, "adm-tok")
+	nRec := httptest.NewRecorder()
+	h.ServeHTTP(nRec, nReq)
+	var views []protocol.LiveNodeView
+	_ = json.Unmarshal(nRec.Body.Bytes(), &views)
+	var foundB *protocol.LiveNodeView
+	for i := range views {
+		if views[i].ID == "nas-01" {
+			foundB = &views[i]
+		}
+	}
+	if foundB == nil {
+		t.Fatalf("nas-01 not found in admin nodes list")
+	}
+	if foundB.ProjectSchedule != "fair" || foundB.DiskPolicy != "most_free" || len(foundB.Disks) != 2 || len(foundB.StorageDirs) != 2 {
+		t.Fatalf("unexpected LiveNodeView for nas-01: %+v", foundB)
+	}
+}

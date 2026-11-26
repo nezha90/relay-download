@@ -63,8 +63,20 @@ type Agent struct {
 	discMu    sync.Mutex
 	discCache map[string]cachedDiscover
 
-	allowedMu       sync.RWMutex
-	allowedProjects map[string]struct{} // nil = unrestricted by Center; non-nil = Center-enforced subset
+	dirMu           sync.RWMutex
+	directiveMode   string              // "" | "all" | "selected"
+	allowedOrder    []string            // ordered Center-enforced project allowlist when directiveMode=="selected"
+	allowedProjects map[string]struct{} // non-nil when directiveMode=="selected"
+	knownOrder      []string            // Center-reported known projects ordered by created_at ASC
+	projectSchedule string              // "fifo" | "fair" | "random"
+	diskPolicy      string              // "affinity_hash" | "most_free" | "round_robin" | "first"
+	disabledDisks   map[string]struct{} // cleaned root paths disabled via Console
+
+	sseMu     sync.Mutex
+	sseCancel context.CancelFunc
+	readyDirs sync.Map
+	diskRRIdx atomic.Uint64
+	projRRIdx atomic.Uint64
 
 	activeCount     atomic.Int32
 	pendingAckCount atomic.Int64
@@ -91,6 +103,11 @@ func New(cfg *Config, logger *slog.Logger) (*Agent, error) {
 		logger = slog.Default()
 	}
 
+	for _, sd := range cfg.StorageDirs {
+		if err := os.MkdirAll(sd, 0o755); err != nil {
+			return nil, fmt.Errorf("init storage dir %s: %w", sd, err)
+		}
+	}
 	for _, proj := range cfg.ProjectIDs() {
 		for _, dir := range cfg.DestDirsFor(proj) {
 			if err := os.MkdirAll(filepath.Join(dir, ".relay_tmp"), 0o755); err != nil {
@@ -233,21 +250,23 @@ func New(cfg *Config, logger *slog.Logger) (*Agent, error) {
 	}
 
 	ag := &Agent{
-		cfg:           cfg,
-		store:         store,
-		logger:        logger.With("component", "agent-b", "node_id", cfg.NodeID),
-		limiter:       limiter,
-		apiClient:     makeAPIClient(),
-		makeAPICli:    makeAPIClient,
-		sseClient:     makeSSEClient(),
-		streamClients: streamClients,
-		makeStreamCli: makeStreamCli,
-		workSem:       make(chan struct{}, cfg.MaxConcurrent),
-		streamSem:     make(chan struct{}, cfg.MaxTotalStreams),
-		wakeupCh:      make(chan string, 256),
-		ackWakeCh:     make(chan struct{}, 1),
-		hbWakeCh:      make(chan struct{}, 1),
-		discCache:     make(map[string]cachedDiscover),
+		cfg:             cfg,
+		store:           store,
+		logger:          logger.With("component", "agent-b", "node_id", cfg.NodeID),
+		limiter:         limiter,
+		apiClient:       makeAPIClient(),
+		makeAPICli:      makeAPIClient,
+		sseClient:       makeSSEClient(),
+		streamClients:   streamClients,
+		makeStreamCli:   makeStreamCli,
+		workSem:         make(chan struct{}, cfg.MaxConcurrent),
+		streamSem:       make(chan struct{}, cfg.MaxTotalStreams),
+		wakeupCh:        make(chan string, 256),
+		ackWakeCh:       make(chan struct{}, 1),
+		hbWakeCh:        make(chan struct{}, 1),
+		discCache:       make(map[string]cachedDiscover),
+		projectSchedule: cfg.ProjectSchedule,
+		diskPolicy:      cfg.DiskPolicy,
 	}
 	upgradeClient := &http.Client{
 		Transport: &http.Transport{
@@ -458,69 +477,332 @@ func (a *Agent) triggerHeartbeat() {
 	}
 }
 
-func (a *Agent) activeProjectIDs() []string {
-	localIDs := a.cfg.ProjectIDs()
-	a.allowedMu.RLock()
-	allowed := a.allowedProjects
-	a.allowedMu.RUnlock()
-	if allowed == nil {
-		return localIDs
+func equalStringSlices(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
 	}
-	out := make([]string, 0, len(localIDs))
-	for _, id := range localIDs {
-		if _, ok := allowed[id]; ok {
-			out = append(out, id)
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func equalStringSet(a, b map[string]struct{}) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k := range a {
+		if _, ok := b[k]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func (a *Agent) effectiveProjectSchedule() string {
+	a.dirMu.RLock()
+	s := a.projectSchedule
+	a.dirMu.RUnlock()
+	if s == "" {
+		return a.cfg.ProjectSchedule
+	}
+	return s
+}
+
+func (a *Agent) effectiveDiskPolicy() string {
+	a.dirMu.RLock()
+	p := a.diskPolicy
+	a.dirMu.RUnlock()
+	if p == "" {
+		return a.cfg.DiskPolicy
+	}
+	return p
+}
+
+func (a *Agent) isDiskRootDisabledLocked(root string) bool {
+	if len(a.disabledDisks) == 0 {
+		return false
+	}
+	clean := filepath.Clean(strings.TrimSpace(root))
+	_, ok := a.disabledDisks[clean]
+	return ok
+}
+
+func (a *Agent) isDirDisabledLocked(dir string) bool {
+	if len(a.disabledDisks) == 0 {
+		return false
+	}
+	clean := filepath.Clean(strings.TrimSpace(dir))
+	if _, ok := a.disabledDisks[clean]; ok {
+		return true
+	}
+	for dis := range a.disabledDisks {
+		if strings.HasPrefix(clean, dis+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
+}
+
+// enabledDestDirsFor returns destination directories for projectID after filtering out any
+// disk roots disabled from the Center console.
+func (a *Agent) enabledDestDirsFor(projectID string) []string {
+	dirs := a.cfg.DestDirsFor(projectID)
+	if len(dirs) == 0 {
+		return nil
+	}
+	a.dirMu.RLock()
+	defer a.dirMu.RUnlock()
+	if len(a.disabledDisks) == 0 {
+		return dirs
+	}
+	out := make([]string, 0, len(dirs))
+	for _, d := range dirs {
+		if !a.isDirDisabledLocked(d) {
+			out = append(out, d)
 		}
 	}
 	return out
+}
+
+func (a *Agent) ensureDestDirReady(dir string) error {
+	if _, ok := a.readyDirs.Load(dir); ok {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Join(dir, ".relay_tmp"), 0o755); err != nil {
+		return err
+	}
+	a.readyDirs.Store(dir, struct{}{})
+	return nil
+}
+
+// activeProjectIDs returns the ordered effective list of projects this receiver will pull.
+// Order preserves Center's configured allowlist order (selected mode) or project creation order (all mode).
+func (a *Agent) activeProjectIDs() []string {
+	a.dirMu.RLock()
+	mode := a.directiveMode
+	allowedOrder := append([]string(nil), a.allowedOrder...)
+	allowedSet := a.allowedProjects
+	knownOrder := append([]string(nil), a.knownOrder...)
+	a.dirMu.RUnlock()
+
+	if only := strings.TrimSpace(a.cfg.OnlyProject); only != "" {
+		if mode == "selected" && allowedSet != nil {
+			if _, ok := allowedSet[only]; !ok {
+				return nil
+			}
+		}
+		if len(a.cfg.DestDirsFor(only)) > 0 {
+			return []string{only}
+		}
+		return nil
+	}
+
+	localIDs := a.cfg.ProjectIDs()
+	hasPool := len(a.cfg.StorageDirs) > 0
+
+	if hasPool {
+		if mode == "selected" {
+			out := make([]string, 0, len(allowedOrder))
+			for _, p := range allowedOrder {
+				if len(a.cfg.DestDirsFor(p)) > 0 {
+					out = append(out, p)
+				}
+			}
+			return out
+		}
+		seen := make(map[string]struct{}, len(knownOrder)+len(localIDs))
+		out := make([]string, 0, len(knownOrder)+len(localIDs))
+		for _, p := range knownOrder {
+			if len(a.cfg.DestDirsFor(p)) == 0 {
+				continue
+			}
+			if _, dup := seen[p]; !dup {
+				seen[p] = struct{}{}
+				out = append(out, p)
+			}
+		}
+		for _, p := range localIDs {
+			if _, dup := seen[p]; !dup {
+				seen[p] = struct{}{}
+				out = append(out, p)
+			}
+		}
+		return out
+	}
+
+	// Legacy static project mapping mode (no storage_dirs configured).
+	localSet := make(map[string]struct{}, len(localIDs))
+	for _, p := range localIDs {
+		localSet[p] = struct{}{}
+	}
+	if mode == "selected" && allowedSet != nil {
+		out := make([]string, 0, len(allowedOrder))
+		for _, p := range allowedOrder {
+			if _, ok := localSet[p]; ok {
+				out = append(out, p)
+			}
+		}
+		return out
+	}
+	if len(knownOrder) > 0 {
+		seen := make(map[string]struct{}, len(localIDs))
+		out := make([]string, 0, len(localIDs))
+		for _, p := range knownOrder {
+			if _, ok := localSet[p]; ok {
+				if _, dup := seen[p]; !dup {
+					seen[p] = struct{}{}
+					out = append(out, p)
+				}
+			}
+		}
+		for _, p := range localIDs {
+			if _, dup := seen[p]; !dup {
+				seen[p] = struct{}{}
+				out = append(out, p)
+			}
+		}
+		return out
+	}
+	return localIDs
 }
 
 func (a *Agent) isProjectAllowed(projectID string) bool {
 	if len(a.cfg.DestDirsFor(projectID)) == 0 {
 		return false
 	}
-	a.allowedMu.RLock()
+	a.dirMu.RLock()
+	mode := a.directiveMode
 	allowed := a.allowedProjects
-	a.allowedMu.RUnlock()
-	if allowed == nil {
+	a.dirMu.RUnlock()
+	if mode != "selected" || allowed == nil {
 		return true
 	}
 	_, ok := allowed[projectID]
 	return ok
 }
 
-func (a *Agent) updateAllowedProjects(list []string) {
-	var next map[string]struct{}
-	if len(list) > 0 {
-		next = make(map[string]struct{}, len(list))
-		for _, p := range list {
-			p = strings.TrimSpace(p)
-			if p != "" {
-				next[p] = struct{}{}
-			}
-		}
+func (a *Agent) reconnectSSE() {
+	a.sseMu.Lock()
+	cancel := a.sseCancel
+	a.sseMu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
-	a.allowedMu.Lock()
-	changed := (a.allowedProjects == nil) != (next == nil) || len(a.allowedProjects) != len(next)
-	if !changed && next != nil {
-		for k := range next {
-			if _, ok := a.allowedProjects[k]; !ok {
-				changed = true
-				break
-			}
-		}
-	}
-	a.allowedProjects = next
-	a.allowedMu.Unlock()
+}
 
-	if changed {
+func (a *Agent) applyDirective(dir *protocol.ReceiverDirective, legacyAllowed []string) {
+	var (
+		nextMode     string
+		nextAllowed  []string
+		nextAllowSet map[string]struct{}
+		nextKnown    []string
+		nextSched    = a.cfg.ProjectSchedule
+		nextDiskPol  = a.cfg.DiskPolicy
+		nextDisabled map[string]struct{}
+	)
+
+	if dir != nil {
+		nextMode = strings.ToLower(strings.TrimSpace(dir.ProjectMode))
+		if nextMode != "selected" {
+			nextMode = "all"
+		}
+		if nextMode == "selected" {
+			nextAllowSet = make(map[string]struct{}, len(dir.AllowedProjects))
+			for _, p := range dir.AllowedProjects {
+				p = strings.TrimSpace(p)
+				if p == "" {
+					continue
+				}
+				if _, dup := nextAllowSet[p]; !dup {
+					nextAllowSet[p] = struct{}{}
+					nextAllowed = append(nextAllowed, p)
+				}
+			}
+		}
+		seenK := make(map[string]struct{}, len(dir.KnownProjects))
+		for _, p := range dir.KnownProjects {
+			p = strings.TrimSpace(p)
+			if p == "" {
+				continue
+			}
+			if _, dup := seenK[p]; !dup {
+				seenK[p] = struct{}{}
+				nextKnown = append(nextKnown, p)
+			}
+		}
+		switch strings.ToLower(strings.TrimSpace(dir.ProjectSchedule)) {
+		case protocol.ScheduleFIFO, protocol.ScheduleFair, protocol.ScheduleRandom:
+			nextSched = strings.ToLower(strings.TrimSpace(dir.ProjectSchedule))
+		}
+		switch strings.ToLower(strings.TrimSpace(dir.DiskPolicy)) {
+		case protocol.DiskPolicyAffinityHash, protocol.DiskPolicyMostFree, protocol.DiskPolicyRoundRobin, protocol.DiskPolicyFirst:
+			nextDiskPol = strings.ToLower(strings.TrimSpace(dir.DiskPolicy))
+		}
+		if len(dir.DisabledDisks) > 0 {
+			nextDisabled = make(map[string]struct{}, len(dir.DisabledDisks))
+			for _, d := range dir.DisabledDisks {
+				d = strings.TrimSpace(d)
+				if d != "" {
+					nextDisabled[filepath.Clean(d)] = struct{}{}
+				}
+			}
+		}
+	} else if len(legacyAllowed) > 0 {
+		nextMode = "selected"
+		nextAllowSet = make(map[string]struct{}, len(legacyAllowed))
+		for _, p := range legacyAllowed {
+			p = strings.TrimSpace(p)
+			if p == "" {
+				continue
+			}
+			if _, dup := nextAllowSet[p]; !dup {
+				nextAllowSet[p] = struct{}{}
+				nextAllowed = append(nextAllowed, p)
+			}
+		}
+	} else {
+		nextMode = "all"
+	}
+
+	prevActive := a.activeProjectIDs()
+	a.dirMu.Lock()
+	scopeChanged := a.directiveMode != nextMode ||
+		!equalStringSlices(a.allowedOrder, nextAllowed) ||
+		!equalStringSlices(a.knownOrder, nextKnown)
+	policyChanged := a.projectSchedule != nextSched ||
+		a.diskPolicy != nextDiskPol ||
+		!equalStringSet(a.disabledDisks, nextDisabled)
+
+	a.directiveMode = nextMode
+	a.allowedOrder = nextAllowed
+	a.allowedProjects = nextAllowSet
+	a.knownOrder = nextKnown
+	a.projectSchedule = nextSched
+	a.diskPolicy = nextDiskPol
+	a.disabledDisks = nextDisabled
+	a.dirMu.Unlock()
+
+	if scopeChanged || policyChanged {
+		nextActive := a.activeProjectIDs()
 		a.discMu.Lock()
 		a.discCache = make(map[string]cachedDiscover)
 		a.discMu.Unlock()
-		a.logger.Info("updated Center-enforced project scope", "allowed_projects", list, "effective_projects", a.activeProjectIDs())
-		for _, p := range a.activeProjectIDs() {
-			a.triggerWakeup(p)
+		if a.logger != nil {
+			a.logger.Info("applied Center receiver directive",
+				"mode", nextMode,
+				"schedule", nextSched,
+				"disk_policy", nextDiskPol,
+				"disabled_disks", len(nextDisabled),
+				"effective_projects", nextActive,
+			)
 		}
+		if !equalStringSlices(prevActive, nextActive) {
+			a.reconnectSSE()
+		}
+		a.triggerWakeup("")
 	}
 }
 
@@ -571,6 +853,16 @@ func (a *Agent) triggerAckFlush() {
 	}
 }
 
+func (a *Agent) sseProjectsQuery() string {
+	a.dirMu.RLock()
+	mode := a.directiveMode
+	a.dirMu.RUnlock()
+	if len(a.cfg.StorageDirs) > 0 && a.cfg.OnlyProject == "" && (mode == "" || mode == "all") {
+		return "*"
+	}
+	return strings.Join(a.activeProjectIDs(), ",")
+}
+
 func (a *Agent) sseLoop(ctx context.Context) {
 	backoff := 500 * time.Millisecond
 
@@ -578,11 +870,22 @@ func (a *Agent) sseLoop(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		projects := strings.Join(a.activeProjectIDs(), ",")
+		projects := a.sseProjectsQuery()
 		u := strings.TrimRight(a.cfg.CenterURL, "/") + "/api/v1/b/events?projects=" + url.QueryEscape(projects)
-		connected, err := a.consumeSSE(ctx, u)
+		sseCtx, cancel := context.WithCancel(ctx)
+		a.sseMu.Lock()
+		a.sseCancel = cancel
+		a.sseMu.Unlock()
+
+		connected, err := a.consumeSSE(sseCtx, u)
+		restartedByDirective := ctx.Err() == nil && sseCtx.Err() != nil
+		cancel()
 		if ctx.Err() != nil {
 			return
+		}
+		if restartedByDirective {
+			backoff = 500 * time.Millisecond
+			continue
 		}
 		if connected {
 			backoff = 500 * time.Millisecond
@@ -662,10 +965,20 @@ func (a *Agent) dispatchLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case proj := <-a.wakeupCh:
-			if a.isProjectAllowed(proj) {
-				a.scanProject(ctx, proj)
-			} else if proj == "" {
+			if proj == "" {
 				a.scanAllProjects(ctx)
+				continue
+			}
+			if !a.isProjectAllowed(proj) {
+				continue
+			}
+			sched := a.effectiveProjectSchedule()
+			if (sched == protocol.ScheduleFIFO || sched == protocol.ScheduleFair) && len(a.activeProjectIDs()) > 1 {
+				// Enforce strict FIFO priority or fair multi-project sharing instead of letting
+				// one project's wakeup starve earlier or peer projects.
+				a.scanAllProjects(ctx)
+			} else {
+				a.scanProject(ctx, proj)
 			}
 		case <-ticker.C:
 			a.scanAllProjects(ctx)
@@ -675,15 +988,62 @@ func (a *Agent) dispatchLoop(ctx context.Context) {
 
 func (a *Agent) scanAllProjects(ctx context.Context) {
 	ids := a.activeProjectIDs()
-	rand.Shuffle(len(ids), func(i, j int) { ids[i], ids[j] = ids[j], ids[i] })
-	for _, proj := range ids {
-		if ctx.Err() != nil {
-			return
+	if len(ids) == 0 {
+		return
+	}
+	sched := a.effectiveProjectSchedule()
+	if len(ids) == 1 {
+		a.scanProject(ctx, ids[0])
+		return
+	}
+
+	switch sched {
+	case protocol.ScheduleFIFO:
+		// Strict creation / configured order: drain earlier projects first, spilling remaining
+		// concurrency slots into subsequent projects only if earlier projects cannot fill workSem.
+		for _, proj := range ids {
+			if ctx.Err() != nil || len(a.workSem) >= cap(a.workSem) {
+				return
+			}
+			a.scanProject(ctx, proj)
 		}
-		if len(a.workSem) >= cap(a.workSem) {
-			return
+	case protocol.ScheduleFair:
+		// Round-robin balanced slot sharing across all active projects.
+		start := int((a.projRRIdx.Add(1) - 1) % uint64(len(ids)))
+		ordered := make([]string, len(ids))
+		for i := range ids {
+			ordered[i] = ids[(start+i)%len(ids)]
 		}
-		a.scanProject(ctx, proj)
+		for len(a.workSem) < cap(a.workSem) && ctx.Err() == nil {
+			free := cap(a.workSem) - len(a.workSem)
+			quantum := free / len(ordered)
+			if quantum < 1 {
+				quantum = 1
+			}
+			if quantum > a.cfg.ClaimBatchSize {
+				quantum = a.cfg.ClaimBatchSize
+			}
+			roundClaimed := 0
+			for _, proj := range ordered {
+				if ctx.Err() != nil || len(a.workSem) >= cap(a.workSem) {
+					return
+				}
+				roundClaimed += a.scanProjectWithLimit(ctx, proj, quantum)
+			}
+			if roundClaimed == 0 {
+				return
+			}
+		}
+	default:
+		// Legacy randomized order.
+		shuffled := append([]string(nil), ids...)
+		rand.Shuffle(len(shuffled), func(i, j int) { shuffled[i], shuffled[j] = shuffled[j], shuffled[i] })
+		for _, proj := range shuffled {
+			if ctx.Err() != nil || len(a.workSem) >= cap(a.workSem) {
+				return
+			}
+			a.scanProject(ctx, proj)
+		}
 	}
 }
 
@@ -736,7 +1096,7 @@ func mediaAffinityKey(filename string) string {
 }
 
 func (a *Agent) chooseDestDir(projectID, filename string, fileSize int64) string {
-	dirs := a.cfg.DestDirsFor(projectID)
+	dirs := a.enabledDestDirsFor(projectID)
 	if len(dirs) == 0 {
 		return ""
 	}
@@ -744,32 +1104,61 @@ func (a *Agent) chooseDestDir(projectID, filename string, fileSize int64) string
 		return dirs[0]
 	}
 
-	h := fnv.New32a()
-	_, _ = h.Write([]byte(mediaAffinityKey(filename)))
-	primaryIdx := int(h.Sum32() % uint32(len(dirs)))
 	need := uint64(0)
 	if fileSize > 0 {
 		need = uint64(fileSize)
 	}
-	if a.availableDiskFor(dirs[primaryIdx]) >= need && (a.cfg.MinFreeDiskBytes == 0 || a.availableDiskFor(dirs[primaryIdx]) > 0) {
-		return dirs[primaryIdx]
-	}
-	// Spill over to whichever configured disk currently has the most free space.
-	bestDir := dirs[primaryIdx]
-	var bestFree uint64
-	for _, d := range dirs {
+	fits := func(d string) bool {
 		free := a.availableDiskFor(d)
-		if free > bestFree {
-			bestFree = free
-			bestDir = d
-		}
+		return free >= need && (a.cfg.MinFreeDiskBytes == 0 || free > 0)
 	}
-	return bestDir
+	pickMostFree := func() string {
+		bestDir := dirs[0]
+		var bestFree uint64
+		for _, d := range dirs {
+			free := a.availableDiskFor(d)
+			if free > bestFree {
+				bestFree = free
+				bestDir = d
+			}
+		}
+		return bestDir
+	}
+
+	switch a.effectiveDiskPolicy() {
+	case protocol.DiskPolicyMostFree:
+		return pickMostFree()
+	case protocol.DiskPolicyRoundRobin:
+		start := int((a.diskRRIdx.Add(1) - 1) % uint64(len(dirs)))
+		for i := range dirs {
+			cand := dirs[(start+i)%len(dirs)]
+			if fits(cand) {
+				return cand
+			}
+		}
+		return pickMostFree()
+	case protocol.DiskPolicyFirst:
+		for _, cand := range dirs {
+			if fits(cand) {
+				return cand
+			}
+		}
+		return pickMostFree()
+	default:
+		// affinity_hash: paired media + metadata land on the same disk; spill over when full.
+		h := fnv.New32a()
+		_, _ = h.Write([]byte(mediaAffinityKey(filename)))
+		primaryIdx := int(h.Sum32() % uint32(len(dirs)))
+		if fits(dirs[primaryIdx]) {
+			return dirs[primaryIdx]
+		}
+		return pickMostFree()
+	}
 }
 
 func (a *Agent) availableDiskForProject(projectID string) uint64 {
 	var best uint64
-	for _, dir := range a.cfg.DestDirsFor(projectID) {
+	for _, dir := range a.enabledDestDirsFor(projectID) {
 		if free := a.availableDiskFor(dir); free > best {
 			best = free
 		}
@@ -778,35 +1167,49 @@ func (a *Agent) availableDiskForProject(projectID string) uint64 {
 }
 
 func (a *Agent) scanProject(ctx context.Context, projectID string) {
+	a.scanProjectWithLimit(ctx, projectID, 0)
+}
+
+func (a *Agent) scanProjectWithLimit(ctx context.Context, projectID string, maxSlots int) int {
 	if !a.isProjectAllowed(projectID) {
-		return
+		return 0
 	}
-	dirs := a.cfg.DestDirsFor(projectID)
+	dirs := a.enabledDestDirsFor(projectID)
 	if len(dirs) == 0 {
-		return
+		return 0
 	}
 	if len(a.workSem) >= cap(a.workSem) {
-		return
+		return 0
 	}
 
 	disc, err := a.discoverCached(ctx, projectID)
 	if err != nil {
 		a.logger.Warn("discover failed", "project", projectID, "err", err)
-		return
+		return 0
 	}
 	if len(disc.Candidates) == 0 {
-		return
+		return 0
 	}
 
-	claimedAny := false
+	totalClaimed := 0
 	for _, cand := range disc.Candidates {
 		for {
 			if ctx.Err() != nil {
-				return
+				return totalClaimed
 			}
-			// Reserve up to ClaimBatchSize worker slots upfront without blocking.
+			limit := a.cfg.ClaimBatchSize
+			if maxSlots > 0 {
+				rem := maxSlots - totalClaimed
+				if rem <= 0 {
+					return totalClaimed
+				}
+				if rem < limit {
+					limit = rem
+				}
+			}
+			// Reserve up to limit worker slots upfront without blocking.
 			reserved := 0
-			for reserved < a.cfg.ClaimBatchSize {
+			for reserved < limit {
 				select {
 				case a.workSem <- struct{}{}:
 					reserved++
@@ -816,7 +1219,7 @@ func (a *Agent) scanProject(ctx context.Context, projectID string) {
 			}
 		reservedDone:
 			if reserved == 0 {
-				return
+				return totalClaimed
 			}
 			releaseSlots := func(n int) {
 				for i := 0; i < n; i++ {
@@ -828,7 +1231,7 @@ func (a *Agent) scanProject(ctx context.Context, projectID string) {
 			if availDisk == 0 && a.cfg.MinFreeDiskBytes > 0 {
 				releaseSlots(reserved)
 				a.logger.Warn("insufficient local disk space, skipping claim", "project", projectID, "dest_dirs", dirs)
-				return
+				return totalClaimed
 			}
 
 			claimed, status, err := a.claimBatchFromA(ctx, cand, projectID, availDisk, disc.LeaseTTLSec, reserved)
@@ -842,7 +1245,7 @@ func (a *Agent) scanProject(ctx context.Context, projectID string) {
 				select {
 				case <-ctx.Done():
 					timer.Stop()
-					return
+					return totalClaimed
 				case <-timer.C:
 				}
 				break
@@ -862,10 +1265,15 @@ func (a *Agent) scanProject(ctx context.Context, projectID string) {
 				releaseSlots(reserved - len(claimed))
 			}
 
-			claimedAny = true
 			dls := make([]ActiveDownload, 0, len(claimed))
+			var skippedSlots int
 			for _, cr := range claimed {
 				destDir := a.chooseDestDir(projectID, cr.Filename, cr.Size)
+				if destDir == "" {
+					skippedSlots++
+					continue
+				}
+				_ = a.ensureDestDirReady(destDir)
 				partPath := filepath.Join(destDir, ".relay_tmp", cr.FileID+".part")
 				dls = append(dls, ActiveDownload{
 					FileID:         cr.FileID,
@@ -885,6 +1293,12 @@ func (a *Agent) scanProject(ctx context.Context, projectID string) {
 					StartedAt:      time.Now().UTC(),
 				})
 			}
+			if skippedSlots > 0 {
+				releaseSlots(skippedSlots)
+			}
+			if len(dls) == 0 {
+				break
+			}
 
 			if err := a.store.PutActiveBatch(dls); err != nil {
 				releaseSlots(len(dls))
@@ -892,9 +1306,10 @@ func (a *Agent) scanProject(ctx context.Context, projectID string) {
 				for _, dl := range dls {
 					_ = a.sendNack(ctx, dl, "local state persist failed")
 				}
-				return
+				return totalClaimed
 			}
 
+			totalClaimed += len(dls)
 			for _, dl := range dls {
 				a.wg.Add(1)
 				go func(item ActiveDownload) {
@@ -902,7 +1317,11 @@ func (a *Agent) scanProject(ctx context.Context, projectID string) {
 						<-a.workSem
 						a.wg.Done()
 						// Immediately check for more queued files on completion.
-						a.triggerWakeup(item.ProjectID)
+						if a.effectiveProjectSchedule() == protocol.ScheduleRandom {
+							a.triggerWakeup(item.ProjectID)
+						} else {
+							a.triggerWakeup("")
+						}
 					}()
 					a.runDownload(ctx, item)
 				}(dl)
@@ -914,14 +1333,33 @@ func (a *Agent) scanProject(ctx context.Context, projectID string) {
 			}
 		}
 	}
-	if !claimedAny {
+	if totalClaimed == 0 {
 		// All cached candidates were empty -> clear cache so next poll/wakeup sees fresh A nodes.
 		a.invalidateDiscover(projectID)
+	}
+	return totalClaimed
+}
+
+func diskUsageWithParentFallback(dir string) (total, free uint64, usedPct float64, err error) {
+	cur := filepath.Clean(dir)
+	for {
+		total, free, usedPct, err = transfer.DiskUsage(cur)
+		if err == nil {
+			return total, free, usedPct, nil
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return 0, 0, 0, err
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return 0, 0, 0, err
+		}
+		cur = parent
 	}
 }
 
 func (a *Agent) availableDiskFor(dir string) uint64 {
-	_, free, _, err := transfer.DiskUsage(dir)
+	_, free, _, err := diskUsageWithParentFallback(dir)
 	if err != nil {
 		return 0
 	}
@@ -2159,24 +2597,57 @@ func (a *Agent) heartbeatLoop(ctx context.Context) {
 }
 
 func (a *Agent) sendHeartbeat(ctx context.Context) {
+	roots := a.cfg.DiskRoots()
+	disks := make([]protocol.DiskStatus, 0, len(roots))
 	var totalDisk, freeDisk uint64
 	var usedPct float64
-	seenDev := make(map[uint64]struct{})
-	for _, projID := range a.cfg.ProjectIDs() {
-		for _, dir := range a.cfg.DestDirsFor(projID) {
+	seenEnabledDev := make(map[uint64]struct{})
+	seenAllDev := make(map[uint64]struct{})
+	var allTotal, allFree uint64
+
+	a.dirMu.RLock()
+	for _, root := range roots {
+		enabled := !a.isDiskRootDisabledLocked(root)
+		t, f, pct, err := diskUsageWithParentFallback(root)
+		writable := err == nil && unix.Access(root, unix.W_OK) == nil
+		lowSpace := err == nil && a.cfg.MinFreeDiskBytes > 0 && f <= a.cfg.MinFreeDiskBytes
+		disks = append(disks, protocol.DiskStatus{
+			Path:       root,
+			TotalBytes: t,
+			FreeBytes:  f,
+			UsedPct:    pct,
+			Enabled:    enabled,
+			LowSpace:   lowSpace,
+			Writable:   writable,
+		})
+		if err == nil {
 			var st unix.Stat_t
-			if err := unix.Stat(dir, &st); err == nil {
-				dev := uint64(st.Dev)
-				if _, dup := seenDev[dev]; dup {
-					continue
-				}
-				seenDev[dev] = struct{}{}
+			devKey := uint64(0)
+			hasDev := unix.Stat(root, &st) == nil
+			if hasDev {
+				devKey = uint64(st.Dev)
 			}
-			if t, f, _, err := transfer.DiskUsage(dir); err == nil {
+			if !hasDev || func() bool { _, dup := seenAllDev[devKey]; return !dup }() {
+				if hasDev {
+					seenAllDev[devKey] = struct{}{}
+				}
+				allTotal += t
+				allFree += f
+			}
+			if enabled && (!hasDev || func() bool { _, dup := seenEnabledDev[devKey]; return !dup }()) {
+				if hasDev {
+					seenEnabledDev[devKey] = struct{}{}
+				}
 				totalDisk += t
 				freeDisk += f
 			}
 		}
+	}
+	a.dirMu.RUnlock()
+
+	if totalDisk == 0 && allTotal > 0 {
+		totalDisk = allTotal
+		freeDisk = allFree
 	}
 	if totalDisk > 0 {
 		usedPct = (float64(totalDisk-freeDisk) / float64(totalDisk)) * 100.0
@@ -2191,6 +2662,10 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 		NodeID:           a.cfg.NodeID,
 		Name:             a.cfg.NodeName,
 		Projects:         a.activeProjectIDs(),
+		StorageDirs:      append([]string(nil), a.cfg.StorageDirs...),
+		Disks:            disks,
+		ProjectSchedule:  a.effectiveProjectSchedule(),
+		DiskPolicy:       a.effectiveDiskPolicy(),
 		Version:          version.Version,
 		OS:               runtime.GOOS,
 		Arch:             runtime.GOARCH,
@@ -2221,8 +2696,8 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 		return
 	}
 	var hbResp protocol.HeartbeatResp
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 64*1024)).Decode(&hbResp); err == nil {
-		a.updateAllowedProjects(hbResp.AllowedProjects)
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 256*1024)).Decode(&hbResp); err == nil {
+		a.applyDirective(hbResp.Directive, hbResp.AllowedProjects)
 		if hbResp.Upgrade != nil && a.updater != nil {
 			a.updater.HandleDirective(ctx, hbResp.Upgrade)
 		}

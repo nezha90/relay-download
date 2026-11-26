@@ -4,11 +4,14 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"relay-download/internal/protocol"
 )
 
 type Config struct {
@@ -17,11 +20,14 @@ type Config struct {
 	CenterURL            string              `yaml:"center_url"`
 	CenterToken          string              `yaml:"center_token"`
 	CACert               string              `yaml:"ca_cert"`
-	OnlyProject          string              `yaml:"only_project,omitempty"` // optional: strictly restrict this receiver node to download ONLY this single project
-	DestDir              string              `yaml:"dest_dir,omitempty"`     // optional shorthand single destination directory when only_project is set
-	DestDirs             []string            `yaml:"dest_dirs,omitempty"`    // optional shorthand multiple destination directories when only_project is set
-	Projects             map[string]string   `yaml:"projects,omitempty"`     // project_id -> single local dest directory
-	ProjectDirs          map[string][]string `yaml:"project_dirs,omitempty"` // project_id -> multiple local dest directories for balanced multi-disk placement
+	StorageDirs          []string            `yaml:"storage_dirs,omitempty"`     // managed disk pool roots: any project lands in <storage_dir>/<project_id>/
+	ProjectSchedule      string              `yaml:"project_schedule,omitempty"` // default multi-project schedule: "fifo" | "fair" | "random" (overridable by Center)
+	DiskPolicy           string              `yaml:"disk_policy,omitempty"`      // default disk placement: "affinity_hash" | "most_free" | "round_robin" | "first" (overridable by Center)
+	OnlyProject          string              `yaml:"only_project,omitempty"`     // optional: strictly restrict this receiver node locally to download ONLY this single project
+	DestDir              string              `yaml:"dest_dir,omitempty"`         // optional shorthand single destination directory when only_project is set
+	DestDirs             []string            `yaml:"dest_dirs,omitempty"`        // optional shorthand multiple destination directories when only_project is set
+	Projects             map[string]string   `yaml:"projects,omitempty"`         // project_id -> single local dest directory
+	ProjectDirs          map[string][]string `yaml:"project_dirs,omitempty"`     // project_id -> multiple local dest directories for balanced multi-disk placement
 	StateDir             string              `yaml:"state_dir"`
 	MaxConcurrent        int                 `yaml:"max_concurrent"`
 	StreamProtocol       string              `yaml:"stream_protocol,omitempty"`       // "h2" (default, TLS 1.3 HTTP/2) or "h1" (TLS 1.3 HTTP/1.1, removes 4MiB H2 flow-control cap for 10Gbps)
@@ -59,6 +65,30 @@ func LoadConfig(path string) (*Config, error) {
 func (c *Config) ApplyDefaults() {
 	c.OnlyProject = strings.TrimSpace(c.OnlyProject)
 	c.DestDir = strings.TrimSpace(c.DestDir)
+	if len(c.StorageDirs) > 0 {
+		clean := make([]string, 0, len(c.StorageDirs))
+		seen := make(map[string]struct{}, len(c.StorageDirs))
+		for _, d := range c.StorageDirs {
+			d = strings.TrimSpace(d)
+			if d == "" {
+				continue
+			}
+			d = filepath.Clean(d)
+			if _, dup := seen[d]; !dup {
+				seen[d] = struct{}{}
+				clean = append(clean, d)
+			}
+		}
+		c.StorageDirs = clean
+	}
+	c.ProjectSchedule = strings.ToLower(strings.TrimSpace(c.ProjectSchedule))
+	if c.ProjectSchedule == "" {
+		c.ProjectSchedule = protocol.ScheduleFIFO
+	}
+	c.DiskPolicy = strings.ToLower(strings.TrimSpace(c.DiskPolicy))
+	if c.DiskPolicy == "" {
+		c.DiskPolicy = protocol.DiskPolicyAffinityHash
+	}
 	if c.NodeName == "" {
 		c.NodeName = c.NodeID
 	}
@@ -138,17 +168,40 @@ func (c *Config) Validate() error {
 	if c.StreamProtocol != "h2" && c.StreamProtocol != "h1" {
 		return fmt.Errorf("stream_protocol must be 'h2' or 'h1' (got %q)", c.StreamProtocol)
 	}
-	if len(c.ProjectIDs()) == 0 {
+	switch c.ProjectSchedule {
+	case protocol.ScheduleFIFO, protocol.ScheduleFair, protocol.ScheduleRandom:
+	default:
+		return fmt.Errorf("project_schedule must be 'fifo', 'fair', or 'random' (got %q)", c.ProjectSchedule)
+	}
+	switch c.DiskPolicy {
+	case protocol.DiskPolicyAffinityHash, protocol.DiskPolicyMostFree, protocol.DiskPolicyRoundRobin, protocol.DiskPolicyFirst:
+	default:
+		return fmt.Errorf("disk_policy must be 'affinity_hash', 'most_free', 'round_robin', or 'first' (got %q)", c.DiskPolicy)
+	}
+	if len(c.ProjectIDs()) == 0 && len(c.StorageDirs) == 0 {
 		if c.OnlyProject != "" {
-			return fmt.Errorf("only_project %q requires a destination directory (dest_dir, dest_dirs, projects, or project_dirs)", c.OnlyProject)
+			return fmt.Errorf("only_project %q requires a destination directory (storage_dirs, dest_dir, dest_dirs, projects, or project_dirs)", c.OnlyProject)
 		}
-		return errors.New("at least one project destination mapping is required")
+		return errors.New("at least one storage_dirs root or project destination mapping is required")
+	}
+	if c.OnlyProject != "" && len(c.DestDirsFor(c.OnlyProject)) == 0 {
+		return fmt.Errorf("only_project %q requires a valid destination directory", c.OnlyProject)
 	}
 	return nil
 }
 
+// SafeProjectSubdir rejects path traversal characters when dynamically joining <storage_dir>/<project_id>.
+func SafeProjectSubdir(projectID string) bool {
+	p := strings.TrimSpace(projectID)
+	if p == "" || p == "." || p == ".." {
+		return false
+	}
+	return !strings.ContainsAny(p, `/\`) && !strings.Contains(p, "..")
+}
+
 // DestDirsFor returns all configured destination directories for a project (deduplicated, preserving order).
 // When only_project is set, all other projects return nil so this receiver downloads strictly one project.
+// If no explicit per-project directory is mapped, storage_dirs roots expand to <storage_dir>/<project_id>.
 func (c *Config) DestDirsFor(projectID string) []string {
 	only := strings.TrimSpace(c.OnlyProject)
 	if only != "" && projectID != only {
@@ -161,6 +214,7 @@ func (c *Config) DestDirsFor(projectID string) []string {
 		if d == "" {
 			return
 		}
+		d = filepath.Clean(d)
 		if _, ok := seen[d]; !ok {
 			seen[d] = struct{}{}
 			out = append(out, d)
@@ -177,6 +231,77 @@ func (c *Config) DestDirsFor(projectID string) []string {
 			add(d)
 		}
 		add(c.DestDir)
+	}
+	if len(out) == 0 && len(c.StorageDirs) > 0 && SafeProjectSubdir(projectID) {
+		for _, sd := range c.StorageDirs {
+			add(filepath.Join(sd, projectID))
+		}
+	}
+	return out
+}
+
+// DiskRoots returns the ordered list of physical disk roots configured on this receiver
+// (storage_dirs first, plus any standalone explicit project directories outside storage_dirs).
+func (c *Config) DiskRoots() []string {
+	seen := make(map[string]struct{})
+	out := make([]string, 0, len(c.StorageDirs))
+	add := func(d string) {
+		d = strings.TrimSpace(d)
+		if d == "" {
+			return
+		}
+		d = filepath.Clean(d)
+		if _, dup := seen[d]; !dup {
+			seen[d] = struct{}{}
+			out = append(out, d)
+		}
+	}
+	for _, sd := range c.StorageDirs {
+		add(sd)
+	}
+	underStorageRoot := func(dir string) bool {
+		clean := filepath.Clean(dir)
+		for _, sd := range c.StorageDirs {
+			if clean == sd || strings.HasPrefix(clean, sd+string(filepath.Separator)) {
+				return true
+			}
+		}
+		return false
+	}
+	extra := make([]string, 0)
+	for _, d := range c.DestDirs {
+		if d = strings.TrimSpace(d); d != "" && !underStorageRoot(d) {
+			extra = append(extra, d)
+		}
+	}
+	if d := strings.TrimSpace(c.DestDir); d != "" && !underStorageRoot(d) {
+		extra = append(extra, d)
+	}
+	keys := make([]string, 0, len(c.Projects)+len(c.ProjectDirs))
+	keySeen := make(map[string]struct{})
+	for k := range c.Projects {
+		keySeen[k] = struct{}{}
+		keys = append(keys, k)
+	}
+	for k := range c.ProjectDirs {
+		if _, ok := keySeen[k]; !ok {
+			keySeen[k] = struct{}{}
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		for _, d := range c.ProjectDirs[k] {
+			if d = strings.TrimSpace(d); d != "" && !underStorageRoot(d) {
+				extra = append(extra, d)
+			}
+		}
+		if d := strings.TrimSpace(c.Projects[k]); d != "" && !underStorageRoot(d) {
+			extra = append(extra, d)
+		}
+	}
+	for _, d := range extra {
+		add(d)
 	}
 	return out
 }

@@ -27,17 +27,21 @@ type LiveAState struct {
 }
 
 type LiveBState struct {
-	NodeID         string
-	Name           string
-	Projects       []string
-	Version        string
-	OS             string
-	Arch           string
-	DiskTotalBytes uint64
-	DiskFreeBytes  uint64
-	DiskUsedPct    float64
-	ActiveCount    int
-	LastSeen       time.Time
+	NodeID          string
+	Name            string
+	Projects        []string
+	StorageDirs     []string
+	Disks           []protocol.DiskStatus
+	ProjectSchedule string
+	DiskPolicy      string
+	Version         string
+	OS              string
+	Arch            string
+	DiskTotalBytes  uint64
+	DiskFreeBytes   uint64
+	DiskUsedPct     float64
+	ActiveCount     int
+	LastSeen        time.Time
 }
 
 type bSub struct {
@@ -107,17 +111,21 @@ func (h *Hub) UpdateB(hb protocol.AgentBHeartbeatReq) {
 	}
 	h.mu.Lock()
 	h.bNodes[hb.NodeID] = &LiveBState{
-		NodeID:         hb.NodeID,
-		Name:           hb.Name,
-		Projects:       append([]string(nil), hb.Projects...),
-		Version:        hb.Version,
-		OS:             hb.OS,
-		Arch:           hb.Arch,
-		DiskTotalBytes: hb.DiskTotalBytes,
-		DiskFreeBytes:  hb.DiskFreeBytes,
-		DiskUsedPct:    hb.DiskUsedPct,
-		ActiveCount:    activeCnt,
-		LastSeen:       now,
+		NodeID:          hb.NodeID,
+		Name:            hb.Name,
+		Projects:        append([]string(nil), hb.Projects...),
+		StorageDirs:     append([]string(nil), hb.StorageDirs...),
+		Disks:           append([]protocol.DiskStatus(nil), hb.Disks...),
+		ProjectSchedule: hb.ProjectSchedule,
+		DiskPolicy:      hb.DiskPolicy,
+		Version:         hb.Version,
+		OS:              hb.OS,
+		Arch:            hb.Arch,
+		DiskTotalBytes:  hb.DiskTotalBytes,
+		DiskFreeBytes:   hb.DiskFreeBytes,
+		DiskUsedPct:     hb.DiskUsedPct,
+		ActiveCount:     activeCnt,
+		LastSeen:        now,
 	}
 	h.mu.Unlock()
 }
@@ -200,27 +208,39 @@ func (h *Hub) UpdateNodeProjects(nodeID string, projects []string) {
 	h.DisconnectSSE(nodeID)
 }
 
-// WakeupB wakes up at most readyCount+1 subscribed B nodes for projectID,
-// preferring currently idle B nodes to prevent thundering herd.
+// WakeupB wakes up at most readyCount+1 subscribed B nodes for projectID (including wildcard "*"
+// subscribers running in all-projects mode), preferring currently idle B nodes to prevent thundering herd.
 func (h *Hub) WakeupB(projectID string, readyCount int) {
-	h.mu.RLock()
-	subsMap := h.bSubs[projectID]
-	if len(subsMap) == 0 {
-		h.mu.RUnlock()
-		return
-	}
 	type subInfo struct {
 		bNodeID string
 		active  int
 		ch      chan string
 	}
-	subs := make([]subInfo, 0, len(subsMap))
-	for bID, sub := range subsMap {
+	h.mu.RLock()
+	subsMap := h.bSubs[projectID]
+	wildMap := h.bSubs["*"]
+	if len(subsMap) == 0 && len(wildMap) == 0 {
+		h.mu.RUnlock()
+		return
+	}
+	seen := make(map[string]struct{}, len(subsMap)+len(wildMap))
+	subs := make([]subInfo, 0, len(subsMap)+len(wildMap))
+	addSub := func(bID string, sub *bSub) {
+		if _, dup := seen[bID]; dup {
+			return
+		}
+		seen[bID] = struct{}{}
 		active := 0
 		if st, ok := h.bNodes[bID]; ok {
 			active = st.ActiveCount
 		}
 		subs = append(subs, subInfo{bNodeID: bID, active: active, ch: sub.ch})
+	}
+	for bID, sub := range subsMap {
+		addSub(bID, sub)
+	}
+	for bID, sub := range wildMap {
+		addSub(bID, sub)
 	}
 	h.mu.RUnlock()
 
@@ -303,6 +323,9 @@ func (h *Hub) Snapshot() (map[string]*LiveAState, map[string]*LiveBState) {
 	bOut := make(map[string]*LiveBState, len(h.bNodes))
 	for k, st := range h.bNodes {
 		cp := *st
+		cp.Projects = append([]string(nil), st.Projects...)
+		cp.StorageDirs = append([]string(nil), st.StorageDirs...)
+		cp.Disks = append([]protocol.DiskStatus(nil), st.Disks...)
 		bOut[k] = &cp
 	}
 	return aOut, bOut

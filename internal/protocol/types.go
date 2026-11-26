@@ -39,6 +39,38 @@ const (
 	EventFailed    = "failed"
 )
 
+const (
+	ScheduleFIFO   = "fifo"   // drain projects sequentially in creation / configured order
+	ScheduleFair   = "fair"   // share concurrency and bandwidth evenly across projects
+	ScheduleRandom = "random" // legacy randomized scan
+)
+
+const (
+	DiskPolicyAffinityHash = "affinity_hash" // media-stem FNV hash (paired files on same disk) + auto spillover
+	DiskPolicyMostFree     = "most_free"     // always prefer disk with the most available free space
+	DiskPolicyRoundRobin   = "round_robin"   // strict per-file round-robin across enabled disks
+	DiskPolicyFirst        = "first"         // fill first enabled disk in order before spilling to next
+)
+
+type DiskStatus struct {
+	Path       string  `json:"path"`
+	TotalBytes uint64  `json:"total_bytes"`
+	FreeBytes  uint64  `json:"free_bytes"`
+	UsedPct    float64 `json:"used_pct"`
+	Enabled    bool    `json:"enabled"`
+	LowSpace   bool    `json:"low_space,omitempty"`
+	Writable   bool    `json:"writable"`
+}
+
+type ReceiverDirective struct {
+	ProjectMode     string   `json:"project_mode,omitempty"`     // "all" | "selected"
+	AllowedProjects []string `json:"allowed_projects,omitempty"` // explicit ordered allowlist when project_mode=="selected"
+	KnownProjects   []string `json:"known_projects,omitempty"`   // all projects ordered by created_at ASC
+	ProjectSchedule string   `json:"project_schedule,omitempty"` // "fifo" | "fair" | "random"
+	DiskPolicy      string   `json:"disk_policy,omitempty"`      // "affinity_hash" | "most_free" | "round_robin" | "first"
+	DisabledDisks   []string `json:"disabled_disks,omitempty"`   // storage root dirs disabled via console
+}
+
 type Project struct {
 	ID             string    `json:"id"`
 	Name           string    `json:"name"`
@@ -49,12 +81,15 @@ type Project struct {
 }
 
 type NodeRecord struct {
-	ID         string    `json:"id"`
-	Name       string    `json:"name"`
-	Role       string    `json:"role"`
-	Projects   []string  `json:"projects"`
-	PublicAddr string    `json:"public_addr,omitempty"`
-	CreatedAt  time.Time `json:"created_at"`
+	ID              string    `json:"id"`
+	Name            string    `json:"name"`
+	Role            string    `json:"role"`
+	Projects        []string  `json:"projects"`
+	ProjectSchedule string    `json:"project_schedule,omitempty"`
+	DiskPolicy      string    `json:"disk_policy,omitempty"`
+	DisabledDisks   []string  `json:"disabled_disks,omitempty"`
+	PublicAddr      string    `json:"public_addr,omitempty"`
+	CreatedAt       time.Time `json:"created_at"`
 }
 
 type ProjectAvailability struct {
@@ -102,6 +137,10 @@ type AgentBHeartbeatReq struct {
 	NodeID                string            `json:"node_id"`
 	Name                  string            `json:"name"`
 	Projects              []string          `json:"projects"`
+	StorageDirs           []string          `json:"storage_dirs,omitempty"`
+	Disks                 []DiskStatus      `json:"disks,omitempty"`
+	ProjectSchedule       string            `json:"project_schedule,omitempty"`
+	DiskPolicy            string            `json:"disk_policy,omitempty"`
 	Version               string            `json:"version,omitempty"`
 	OS                    string            `json:"os,omitempty"`
 	Arch                  string            `json:"arch,omitempty"`
@@ -124,8 +163,9 @@ type UpgradeDirective struct {
 }
 
 type HeartbeatResp struct {
-	Upgrade         *UpgradeDirective `json:"upgrade,omitempty"`
-	AllowedProjects []string          `json:"allowed_projects,omitempty"`
+	Upgrade         *UpgradeDirective  `json:"upgrade,omitempty"`
+	AllowedProjects []string           `json:"allowed_projects,omitempty"`
+	Directive       *ReceiverDirective `json:"directive,omitempty"`
 }
 
 type DiscoverCandidate struct {
@@ -362,6 +402,11 @@ type LiveNodeView struct {
 	Name              string                `json:"name"`
 	Role              string                `json:"role"`
 	Projects          []string              `json:"projects"`
+	ProjectSchedule   string                `json:"project_schedule,omitempty"`
+	DiskPolicy        string                `json:"disk_policy,omitempty"`
+	DisabledDisks     []string              `json:"disabled_disks,omitempty"`
+	StorageDirs       []string              `json:"storage_dirs,omitempty"`
+	Disks             []DiskStatus          `json:"disks,omitempty"`
 	PublicAddr        string                `json:"public_addr,omitempty"`
 	Online            bool                  `json:"online"`
 	Version           string                `json:"version,omitempty"`
@@ -543,6 +588,7 @@ type AgentBScriptReq struct {
 	RotateToken        bool                `json:"rotate_token,omitempty"`
 	InstallDir         string              `json:"install_dir,omitempty"`
 	StateDir           string              `json:"state_dir,omitempty"`
+	StorageDirs        []string            `json:"storage_dirs,omitempty"`
 	OnlyProject        string              `json:"only_project,omitempty"`
 	DestDirs           []string            `json:"dest_dirs,omitempty"`
 	Projects           map[string]string   `json:"projects,omitempty"`

@@ -669,11 +669,12 @@ function renderProjects(projects, winHours) {
       </span>
     `).join('') || '<span class="muted">当前无待传输积压</span>';
 
+    const autoBadge = p.description === '上传自动发现创建' ? '<span class="badge">自动发现</span>' : '';
     return `
       <div class="card">
         <div class="card-head">
           <div>
-            <h3>${esc(p.name)} <span class="mono muted">(${esc(p.id)})</span></h3>
+            <h3>${esc(p.name)} <span class="mono muted">(${esc(p.id)})</span> ${autoBadge}</h3>
             <div class="muted">${esc(p.description || '无描述')} · 策略: ${esc(p.conflict_policy)} · 租约: ${p.lease_ttl_sec}s</div>
           </div>
           <div style="display:flex;gap:6px">
@@ -725,9 +726,34 @@ function renderUpgradeBadge(n) {
   return `<span class="badge ${info.cls}"${title}>${esc(info.txt)}</span>`;
 }
 
-function renderProjectScope(projects) {
+function scheduleLabel(sched) {
+  switch (sched) {
+    case 'fair': return '公平轮询';
+    case 'random': return '随机抢占';
+    case 'fifo':
+    default: return '按顺序逐个';
+  }
+}
+
+function diskPolicyLabel(pol) {
+  switch (pol) {
+    case 'most_free': return '最大余量优先';
+    case 'round_robin': return '逐文件轮询';
+    case 'first': return '首盘写满再切';
+    case 'affinity_hash':
+    default: return '同源均匀';
+  }
+}
+
+function renderProjectScope(projects, schedule) {
   if (!projects || !projects.length) {
-    return '<span class="badge">全部项目</span>';
+    return `
+      <div style="display:flex;gap:4px;flex-wrap:wrap">
+        <span class="badge online">全部项目</span>
+        <span class="badge">${esc(scheduleLabel(schedule))}</span>
+      </div>
+      <div class="muted" style="margin-top:3px">自动同步新建项目</div>
+    `;
   }
   if (projects.length === 1) {
     return `
@@ -736,8 +762,48 @@ function renderProjectScope(projects) {
     `;
   }
   return `
-    <div><span class="badge">多项目 (${projects.length})</span></div>
+    <div style="display:flex;gap:4px;flex-wrap:wrap">
+      <span class="badge">多项目 (${projects.length})</span>
+      <span class="badge">${esc(scheduleLabel(schedule))}</span>
+    </div>
     <div class="mono muted" style="margin-top:3px">${esc(projects.join(', '))}</div>
+  `;
+}
+
+function renderReceiverDisks(n) {
+  const polBadge = `<span class="badge">${esc(diskPolicyLabel(n.disk_policy))}</span>`;
+  const disks = n.disks || [];
+  if (!disks.length) {
+    return `
+      <div>${fmtBytes(n.disk_free_bytes)} <span class="muted">(${(n.disk_used_pct || 0).toFixed(1)}% 已用)</span></div>
+      <div style="margin-top:4px">${polBadge}</div>
+    `;
+  }
+  const disabledSet = new Set(n.disabled_disks || []);
+  const items = disks.map(d => {
+    const enabled = d.enabled !== false && !disabledSet.has(d.path);
+    const pct = Number(d.used_pct || 0);
+    const barCls = !enabled ? '' : (d.low_space || pct >= 90 ? 'red' : 'green');
+    const stTag = !enabled
+      ? '<span class="badge offline">已停用</span>'
+      : (d.low_space ? '<span class="badge alarm">低空间</span>' : '<span class="badge online">启用</span>');
+    return `
+      <div class="disk-mini-item${enabled ? '' : ' disabled'}">
+        <div class="disk-mini-head">
+          <span class="mono" title="${esc(d.path)}">${esc(d.path)}</span>
+          ${stTag}
+        </div>
+        <div class="bar-wrap"><div class="bar-fill ${barCls}" style="width:${Math.min(100, pct).toFixed(1)}%"></div></div>
+        <div class="muted">剩 ${fmtBytes(d.free_bytes)} / ${fmtBytes(d.total_bytes)} (${pct.toFixed(1)}%)</div>
+      </div>
+    `;
+  }).join('');
+  return `
+    <div style="margin-bottom:5px;display:flex;gap:4px;flex-wrap:wrap;align-items:center">
+      ${polBadge}
+      ${n.storage_dirs && n.storage_dirs.length ? '<span class="badge online">磁盘池托管</span>' : ''}
+    </div>
+    <div class="disk-mini-list">${items}</div>
   `;
 }
 
@@ -812,8 +878,8 @@ function renderNodes(nodes, winHours) {
           </div>
           <div class="mono muted" style="margin-top:3px">${esc(verStr)}</div>
         </td>
-        <td>${renderProjectScope(n.projects)}</td>
-        <td>${fmtBytes(n.disk_free_bytes)} <span class="muted">(${(n.disk_used_pct || 0).toFixed(1)}% 已用)</span></td>
+        <td>${renderProjectScope(n.projects, n.project_schedule)}</td>
+        <td>${renderReceiverDisks(n)}</td>
         <td>
           <div>${fmtNum(n.window_completed)} 文件</div>
           <div class="muted">${fmtBytes(n.window_bytes)} · 失败 ${fmtNum(n.window_failed)}</div>
@@ -824,7 +890,7 @@ function renderNodes(nodes, winHours) {
         </td>
         <td>
           <div class="btn-row">
-            <button class="btn sm" data-action="edit-node-projects" data-id="${esc(n.id)}">配置项目</button>
+            <button class="btn sm primary" data-action="edit-node-projects" data-id="${esc(n.id)}">配置项目与磁盘</button>
             <button class="btn sm" data-action="open-b-script" data-id="${esc(n.id)}">安装脚本</button>
             <button class="btn sm danger" data-action="delete-node" data-id="${esc(n.id)}">删除</button>
           </div>
@@ -1094,8 +1160,9 @@ function syncCreateNodeProjectMode() {
   const mode = form.elements.project_mode.value || 'single';
   document.getElementById('node-project-mode-wrap').classList.toggle('hidden', !isReceiver);
   const useSingle = isReceiver && mode === 'single';
+  const useMultiInput = !isReceiver || mode === 'multi';
   document.getElementById('node-single-project-wrap').classList.toggle('hidden', !useSingle);
-  document.getElementById('node-multi-projects-wrap').classList.toggle('hidden', useSingle);
+  document.getElementById('node-multi-projects-wrap').classList.toggle('hidden', !useMultiInput);
   const selVal = document.getElementById('node-single-project-select').value;
   document.getElementById('node-single-project-custom-wrap').classList.toggle('hidden', !(useSingle && selVal === '__custom__'));
 }
@@ -1104,10 +1171,71 @@ function syncEditNodeProjectMode() {
   const form = document.getElementById('edit-node-form');
   const mode = form.elements.edit_project_mode.value || 'single';
   const useSingle = mode === 'single';
+  const useMulti = mode === 'multi';
   document.getElementById('edit-single-project-wrap').classList.toggle('hidden', !useSingle);
-  document.getElementById('edit-multi-projects-wrap').classList.toggle('hidden', useSingle);
+  document.getElementById('edit-multi-projects-wrap').classList.toggle('hidden', !useMulti);
+  document.getElementById('edit-schedule-wrap').classList.toggle('hidden', useSingle);
   const selVal = document.getElementById('edit-single-project-select').value;
   document.getElementById('edit-single-project-custom-wrap').classList.toggle('hidden', !(useSingle && selVal === '__custom__'));
+}
+
+function renderEditProjectChecks(selectedList) {
+  const wrap = document.getElementById('edit-project-checks');
+  if (!wrap) return;
+  const selSet = new Set(selectedList || []);
+  if (!cachedProjects.length) {
+    wrap.innerHTML = '<div class="muted">暂无已有项目，可在下方手动输入项目 ID</div>';
+    return;
+  }
+  wrap.innerHTML = cachedProjects.map(ps => {
+    const p = ps.project;
+    const chk = selSet.has(p.id) ? 'checked' : '';
+    return `
+      <label class="proj-check-item">
+        <input type="checkbox" class="edit-proj-chk" value="${esc(p.id)}" ${chk} />
+        <span class="mono">${esc(p.id)}</span>
+      </label>
+    `;
+  }).join('');
+}
+
+function renderEditDisksList(node) {
+  const sec = document.getElementById('edit-disks-section');
+  const wrap = document.getElementById('edit-disks-list');
+  const tip = document.getElementById('edit-storage-pool-tip');
+  const disks = node.disks || [];
+  const disabledSet = new Set(node.disabled_disks || []);
+
+  if (tip) {
+    const hasPool = !!(node.storage_dirs && node.storage_dirs.length);
+    tip.classList.toggle('hidden', !node.online || hasPool);
+  }
+  if (!disks.length) {
+    sec.classList.remove('hidden');
+    wrap.innerHTML = '<div class="muted">等待接收节点上报磁盘信息（升级至 v1.8.0 后自动展示每块挂载盘容量与启停开关）</div>';
+    return;
+  }
+  sec.classList.remove('hidden');
+  wrap.innerHTML = disks.map(d => {
+    const enabled = !disabledSet.has(d.path);
+    const pct = Number(d.used_pct || 0);
+    const barCls = !enabled ? '' : (d.low_space || pct >= 90 ? 'red' : 'green');
+    return `
+      <label class="disk-toggle-row">
+        <div class="disk-toggle-left">
+          <input type="checkbox" class="edit-disk-chk" value="${esc(d.path)}" ${enabled ? 'checked' : ''} />
+          <div>
+            <div class="mono"><strong>${esc(d.path)}</strong></div>
+            <div class="muted">${enabled ? '启用中 · 允许落盘' : '已停用 · 不再写入新文件'}${d.low_space ? ' · 低于安全余量水位' : ''}${d.writable === false ? ' · 目录不可写' : ''}</div>
+          </div>
+        </div>
+        <div class="disk-toggle-right">
+          <div class="bar-wrap" style="width:140px"><div class="bar-fill ${barCls}" style="width:${Math.min(100, pct).toFixed(1)}%"></div></div>
+          <div class="muted">剩余 ${fmtBytes(d.free_bytes)} / ${fmtBytes(d.total_bytes)} (${pct.toFixed(1)}%)</div>
+        </div>
+      </label>
+    `;
+  }).join('');
 }
 
 function openEditNodeProjectsModal(nodeId) {
@@ -1117,27 +1245,34 @@ function openEditNodeProjectsModal(nodeId) {
   form.reset();
   form.elements.node_id.value = node.id;
   form.elements.name.value = node.name || node.id;
-  document.getElementById('edit-node-title').textContent = `配置接收节点下载项目: ${node.name || node.id}`;
+  form.elements.project_schedule.value = node.project_schedule || 'fifo';
+  form.elements.disk_policy.value = node.disk_policy || 'affinity_hash';
+  document.getElementById('edit-node-title').textContent = `配置接收节点: ${node.name || node.id}`;
 
   const projs = node.projects || [];
   const defaultSingle = projs.length === 1 ? projs[0] : (cachedProjects[0]?.project?.id || '');
   populateProjectSelect(document.getElementById('edit-single-project-select'), defaultSingle, true);
 
-  if (projs.length === 1 || (projs.length === 0 && cachedProjects.length === 1)) {
+  if (projs.length === 1) {
     form.elements.edit_project_mode.value = 'single';
-  } else {
+  } else if (projs.length > 1) {
     form.elements.edit_project_mode.value = 'multi';
+  } else {
+    form.elements.edit_project_mode.value = 'all';
   }
   form.elements.projects.value = projs.join(',');
+  renderEditProjectChecks(projs);
+  renderEditDisksList(node);
   syncEditNodeProjectMode();
   openModal('edit-node-modal');
 }
 
 function syncBScriptMode() {
   const form = document.getElementById('b-script-form');
-  const isSingle = (form.elements.script_mode.value || 'single') === 'single';
-  document.getElementById('b-script-single-wrap').classList.toggle('hidden', !isSingle);
-  document.getElementById('b-script-multi-wrap').classList.toggle('hidden', isSingle);
+  const mode = form.elements.script_mode.value || 'pool';
+  document.getElementById('b-script-pool-wrap').classList.toggle('hidden', mode !== 'pool');
+  document.getElementById('b-script-single-wrap').classList.toggle('hidden', mode !== 'single');
+  document.getElementById('b-script-multi-wrap').classList.toggle('hidden', mode !== 'multi');
 }
 
 function openBScriptModal(nodeId, presetToken = '') {
@@ -1154,7 +1289,10 @@ function openBScriptModal(nodeId, presetToken = '') {
   const nodeProjs = (node && node.projects) || [];
   const defaultProj = nodeProjs.length === 1 ? nodeProjs[0] : (cachedProjects[0]?.project?.id || '');
   populateProjectSelect(document.getElementById('b-script-single-project'), defaultProj, false);
-  form.elements.script_mode.value = nodeProjs.length > 1 ? 'multi' : 'single';
+  form.elements.script_mode.value = 'pool';
+  form.elements.storage_dirs.value = (node && node.storage_dirs && node.storage_dirs.length)
+    ? node.storage_dirs.join('\n')
+    : '/mnt/sda/relay-delivery\n/mnt/sdb/relay-delivery';
   if (defaultProj) {
     form.elements.single_dest_dirs.value = `/data/relay-b/files/${defaultProj}`;
   }
@@ -1323,35 +1461,58 @@ function setupEvents() {
     el.addEventListener('change', syncBScriptMode);
   });
 
+  document.getElementById('edit-project-checks').addEventListener('change', (e) => {
+    const chk = e.target.closest('input.edit-proj-chk');
+    if (!chk) return;
+    const form = document.getElementById('edit-node-form');
+    const cur = String(form.elements.projects.value || '').split(',').map(s => s.trim()).filter(Boolean);
+    const val = chk.value;
+    let next = cur.filter(x => x !== val);
+    if (chk.checked) next.push(val);
+    form.elements.projects.value = next.join(',');
+  });
+
   document.getElementById('create-node-form').addEventListener('submit', async (e) => {
     e.preventDefault();
     const fd = new FormData(e.target);
     const role = fd.get('role');
     let projs = [];
-    if (role === 'agent_b' && fd.get('project_mode') === 'single') {
-      let chosen = String(fd.get('single_project') || '').trim();
-      if (chosen === '__custom__') {
-        chosen = String(fd.get('single_project_custom') || '').trim();
+    if (role === 'agent_b') {
+      const pmode = String(fd.get('project_mode') || 'single');
+      if (pmode === 'single') {
+        let chosen = String(fd.get('single_project') || '').trim();
+        if (chosen === '__custom__') {
+          chosen = String(fd.get('single_project_custom') || '').trim();
+        }
+        if (!chosen) {
+          alert('请选择或输入该接收节点要专享下载的项目 ID');
+          return;
+        }
+        projs = [chosen];
+      } else if (pmode === 'all') {
+        projs = [];
+      } else {
+        projs = String(fd.get('projects') || '').split(',').map(s => s.trim()).filter(Boolean);
       }
-      if (!chosen) {
-        alert('请选择或输入该接收节点要专享下载的项目 ID');
-        return;
-      }
-      projs = [chosen];
     } else {
       projs = String(fd.get('projects') || '').split(',').map(s => s.trim()).filter(Boolean);
     }
 
     try {
+      const payload = {
+        id: fd.get('id'),
+        name: fd.get('name'),
+        role,
+        public_addr: fd.get('public_addr'),
+        projects: projs,
+      };
+      if (role === 'agent_b') {
+        payload.project_schedule = String(fd.get('project_schedule') || 'fifo');
+        payload.disk_policy = String(fd.get('disk_policy') || 'affinity_hash');
+      }
       const res = await api('/api/v1/admin/nodes', {
         method: 'POST',
-        body: JSON.stringify({
-          id: fd.get('id'),
-          name: fd.get('name'),
-          role,
-          public_addr: fd.get('public_addr'),
-          projects: projs,
-        }),
+        body: JSON.stringify(payload),
       });
       const box = document.getElementById('node-token-result');
       const extraBtn = role === 'agent_b'
@@ -1371,13 +1532,16 @@ function setupEvents() {
     }
   });
 
-  // Edit node projects modal
+  // Edit receiver node projects, scheduling & disk pool modal
   document.getElementById('edit-node-form').addEventListener('submit', async (e) => {
     e.preventDefault();
     const fd = new FormData(e.target);
     const nodeId = String(fd.get('node_id') || '').trim();
     const name = String(fd.get('name') || '').trim();
     const mode = String(fd.get('edit_project_mode') || 'single');
+    const projectSchedule = String(fd.get('project_schedule') || 'fifo');
+    const diskPolicy = String(fd.get('disk_policy') || 'affinity_hash');
+
     let projs = [];
     if (mode === 'single') {
       let chosen = String(fd.get('single_project') || '').trim();
@@ -1389,18 +1553,42 @@ function setupEvents() {
         return;
       }
       projs = [chosen];
-    } else {
+    } else if (mode === 'multi') {
       projs = String(fd.get('projects') || '').split(',').map(s => s.trim()).filter(Boolean);
+      if (!projs.length) {
+        alert('请至少勾选或输入一个项目，或切换为「全部项目」模式');
+        return;
+      }
+    } else {
+      projs = [];
     }
+
+    const diskChks = Array.from(document.querySelectorAll('#edit-disks-list input.edit-disk-chk'));
+    const body = {
+      name,
+      projects: projs,
+      project_schedule: projectSchedule,
+      disk_policy: diskPolicy,
+    };
+    if (diskChks.length > 0) {
+      const disabledDisks = diskChks.filter(el => !el.checked).map(el => el.value);
+      if (disabledDisks.length === diskChks.length) {
+        if (!confirm('你已停用该节点的全部磁盘，保存后该节点将暂停下载直到重新启用至少一块磁盘。确认保存吗？')) {
+          return;
+        }
+      }
+      body.disabled_disks = disabledDisks;
+    }
+
     try {
       await api(`/api/v1/admin/nodes/${encodeURIComponent(nodeId)}`, {
         method: 'PUT',
-        body: JSON.stringify({ name, projects: projs }),
+        body: JSON.stringify(body),
       });
       closeModal('edit-node-modal');
       refreshAll();
     } catch (err) {
-      if (err.message !== 'unauthorized') alert(`更新节点项目配置失败: ${err.message}`);
+      if (err.message !== 'unauthorized') alert(`更新节点配置失败: ${err.message}`);
     }
   });
 
@@ -1491,7 +1679,7 @@ function setupEvents() {
   document.getElementById('b-script-form').addEventListener('submit', async (e) => {
     e.preventDefault();
     const fd = new FormData(e.target);
-    const scriptMode = String(fd.get('script_mode') || 'single');
+    const scriptMode = String(fd.get('script_mode') || 'pool');
     const body = {
       node_id: fd.get('node_id'),
       node_token: fd.get('node_token'),
@@ -1500,7 +1688,17 @@ function setupEvents() {
       state_dir: fd.get('state_dir'),
       release_id: fd.get('release_id'),
     };
-    if (scriptMode === 'single') {
+    if (scriptMode === 'pool') {
+      const storageDirs = String(fd.get('storage_dirs') || '')
+        .split(/[\n,]/)
+        .map(s => s.trim())
+        .filter(Boolean);
+      if (!storageDirs.length) {
+        alert('请至少填写一个物理磁盘根目录 (storage_dirs)');
+        return;
+      }
+      body.storage_dirs = storageDirs;
+    } else if (scriptMode === 'single') {
       const onlyProj = String(fd.get('only_project') || '').trim();
       if (!onlyProj || onlyProj === '__custom__') {
         alert('请选择要绑定的单个项目');

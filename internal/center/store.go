@@ -99,6 +99,9 @@ CREATE TABLE IF NOT EXISTS nodes (
 	name TEXT NOT NULL,
 	role TEXT NOT NULL,
 	projects_json TEXT NOT NULL DEFAULT '[]',
+	project_schedule TEXT NOT NULL DEFAULT 'fifo',
+	disk_policy TEXT NOT NULL DEFAULT 'affinity_hash',
+	disabled_disks_json TEXT NOT NULL DEFAULT '[]',
 	public_addr TEXT NOT NULL DEFAULT '',
 	token_hash TEXT NOT NULL,
 	created_at TIMESTAMP NOT NULL
@@ -168,8 +171,74 @@ CREATE TABLE IF NOT EXISTS node_upgrades (
 	updated_at TIMESTAMP NOT NULL
 );
 `
-	_, err := db.Exec(schema)
-	return err
+	if _, err := db.Exec(schema); err != nil {
+		return err
+	}
+	// Idempotent schema migrations for pre-v1.8.0 databases.
+	migrations := []string{
+		`ALTER TABLE nodes ADD COLUMN project_schedule TEXT NOT NULL DEFAULT 'fifo'`,
+		`ALTER TABLE nodes ADD COLUMN disk_policy TEXT NOT NULL DEFAULT 'affinity_hash'`,
+		`ALTER TABLE nodes ADD COLUMN disabled_disks_json TEXT NOT NULL DEFAULT '[]'`,
+	}
+	for _, stmt := range migrations {
+		if _, err := db.Exec(stmt); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
+			return err
+		}
+	}
+	return nil
+}
+
+// EnsureProjects idempotently inserts newly discovered project IDs so projects uploaded to
+// dispatch nodes automatically appear in the console and in receiver scheduling queues.
+func (s *Store) EnsureProjects(ctx context.Context, ids []string) (int, error) {
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	now := time.Now().UTC()
+	inserted := 0
+	for _, raw := range ids {
+		id := strings.TrimSpace(raw)
+		if id == "" {
+			continue
+		}
+		res, err := tx.ExecContext(ctx, `
+INSERT OR IGNORE INTO projects (id, name, description, conflict_policy, lease_ttl_sec, created_at)
+VALUES (?, ?, '上传自动发现创建', 'overwrite', 300, ?)
+`, id, id, now)
+		if err != nil {
+			return 0, err
+		}
+		if n, _ := res.RowsAffected(); n > 0 {
+			inserted++
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return inserted, nil
+}
+
+func (s *Store) ListProjectIDs(ctx context.Context) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id FROM projects ORDER BY created_at ASC, id ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	ids := make([]string, 0)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
 }
 
 func (s *Store) UpsertProject(ctx context.Context, p protocol.Project) error {
@@ -241,32 +310,80 @@ func (s *Store) DeleteProject(ctx context.Context, id string) error {
 	return nil
 }
 
+func normalizeProjectSchedule(v string) string {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case protocol.ScheduleFair:
+		return protocol.ScheduleFair
+	case protocol.ScheduleRandom:
+		return protocol.ScheduleRandom
+	case protocol.ScheduleFIFO, "":
+		return protocol.ScheduleFIFO
+	default:
+		return ""
+	}
+}
+
+func normalizeDiskPolicy(v string) string {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case protocol.DiskPolicyMostFree:
+		return protocol.DiskPolicyMostFree
+	case protocol.DiskPolicyRoundRobin:
+		return protocol.DiskPolicyRoundRobin
+	case protocol.DiskPolicyFirst:
+		return protocol.DiskPolicyFirst
+	case protocol.DiskPolicyAffinityHash, "":
+		return protocol.DiskPolicyAffinityHash
+	default:
+		return ""
+	}
+}
+
 func (s *Store) UpsertNode(ctx context.Context, n protocol.NodeRecord, rawToken string) error {
 	if n.CreatedAt.IsZero() {
 		n.CreatedAt = time.Now().UTC()
 	}
+	if sched := normalizeProjectSchedule(n.ProjectSchedule); sched != "" {
+		n.ProjectSchedule = sched
+	} else {
+		n.ProjectSchedule = protocol.ScheduleFIFO
+	}
+	if dp := normalizeDiskPolicy(n.DiskPolicy); dp != "" {
+		n.DiskPolicy = dp
+	} else {
+		n.DiskPolicy = protocol.DiskPolicyAffinityHash
+	}
 	projJSON, _ := json.Marshal(n.Projects)
+	if n.Projects == nil {
+		projJSON = []byte("[]")
+	}
+	disDisksJSON, _ := json.Marshal(n.DisabledDisks)
+	if n.DisabledDisks == nil {
+		disDisksJSON = []byte("[]")
+	}
 	tokHash := auth.HashToken(rawToken)
 	_, err := s.db.ExecContext(ctx, `
-INSERT INTO nodes (id, name, role, projects_json, public_addr, token_hash, created_at)
-VALUES (?, ?, ?, ?, ?, ?, ?)
+INSERT INTO nodes (id, name, role, projects_json, project_schedule, disk_policy, disabled_disks_json, public_addr, token_hash, created_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
 	name=excluded.name,
 	role=excluded.role,
 	projects_json=excluded.projects_json,
+	project_schedule=excluded.project_schedule,
+	disk_policy=excluded.disk_policy,
+	disabled_disks_json=excluded.disabled_disks_json,
 	public_addr=excluded.public_addr,
 	token_hash=CASE WHEN ? != '' THEN excluded.token_hash ELSE nodes.token_hash END
-`, n.ID, n.Name, n.Role, string(projJSON), n.PublicAddr, tokHash, n.CreatedAt, rawToken)
+`, n.ID, n.Name, n.Role, string(projJSON), n.ProjectSchedule, n.DiskPolicy, string(disDisksJSON), n.PublicAddr, tokHash, n.CreatedAt, rawToken)
 	return err
 }
 
 func (s *Store) AuthenticateNode(ctx context.Context, id, rawToken, expectedRole string) (*StoredNode, error) {
 	var sn StoredNode
-	var projJSON string
+	var projJSON, disDisksJSON string
 	err := s.db.QueryRowContext(ctx, `
-SELECT id, name, role, projects_json, public_addr, token_hash, created_at
+SELECT id, name, role, projects_json, project_schedule, disk_policy, disabled_disks_json, public_addr, token_hash, created_at
 FROM nodes WHERE id = ?
-`, id).Scan(&sn.ID, &sn.Name, &sn.Role, &projJSON, &sn.PublicAddr, &sn.TokenHash, &sn.CreatedAt)
+`, id).Scan(&sn.ID, &sn.Name, &sn.Role, &projJSON, &sn.ProjectSchedule, &sn.DiskPolicy, &disDisksJSON, &sn.PublicAddr, &sn.TokenHash, &sn.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -280,12 +397,19 @@ FROM nodes WHERE id = ?
 		return nil, errors.New("invalid node token")
 	}
 	_ = json.Unmarshal([]byte(projJSON), &sn.Projects)
+	_ = json.Unmarshal([]byte(disDisksJSON), &sn.DisabledDisks)
+	if sn.ProjectSchedule == "" {
+		sn.ProjectSchedule = protocol.ScheduleFIFO
+	}
+	if sn.DiskPolicy == "" {
+		sn.DiskPolicy = protocol.DiskPolicyAffinityHash
+	}
 	return &sn, nil
 }
 
 func (s *Store) ListNodes(ctx context.Context) ([]protocol.NodeRecord, error) {
 	rows, err := s.db.QueryContext(ctx, `
-SELECT id, name, role, projects_json, public_addr, created_at
+SELECT id, name, role, projects_json, project_schedule, disk_policy, disabled_disks_json, public_addr, created_at
 FROM nodes ORDER BY role ASC, created_at ASC
 `)
 	if err != nil {
@@ -295,11 +419,18 @@ FROM nodes ORDER BY role ASC, created_at ASC
 	list := make([]protocol.NodeRecord, 0)
 	for rows.Next() {
 		var n protocol.NodeRecord
-		var projJSON string
-		if err := rows.Scan(&n.ID, &n.Name, &n.Role, &projJSON, &n.PublicAddr, &n.CreatedAt); err != nil {
+		var projJSON, disDisksJSON string
+		if err := rows.Scan(&n.ID, &n.Name, &n.Role, &projJSON, &n.ProjectSchedule, &n.DiskPolicy, &disDisksJSON, &n.PublicAddr, &n.CreatedAt); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(projJSON), &n.Projects)
+		_ = json.Unmarshal([]byte(disDisksJSON), &n.DisabledDisks)
+		if n.ProjectSchedule == "" {
+			n.ProjectSchedule = protocol.ScheduleFIFO
+		}
+		if n.DiskPolicy == "" {
+			n.DiskPolicy = protocol.DiskPolicyAffinityHash
+		}
 		list = append(list, n)
 	}
 	return list, rows.Err()
@@ -307,11 +438,11 @@ FROM nodes ORDER BY role ASC, created_at ASC
 
 func (s *Store) GetNode(ctx context.Context, id string) (*protocol.NodeRecord, error) {
 	var n protocol.NodeRecord
-	var projJSON string
+	var projJSON, disDisksJSON string
 	err := s.db.QueryRowContext(ctx, `
-SELECT id, name, role, projects_json, public_addr, created_at
+SELECT id, name, role, projects_json, project_schedule, disk_policy, disabled_disks_json, public_addr, created_at
 FROM nodes WHERE id = ?
-`, id).Scan(&n.ID, &n.Name, &n.Role, &projJSON, &n.PublicAddr, &n.CreatedAt)
+`, id).Scan(&n.ID, &n.Name, &n.Role, &projJSON, &n.ProjectSchedule, &n.DiskPolicy, &disDisksJSON, &n.PublicAddr, &n.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -319,6 +450,13 @@ FROM nodes WHERE id = ?
 		return nil, err
 	}
 	_ = json.Unmarshal([]byte(projJSON), &n.Projects)
+	_ = json.Unmarshal([]byte(disDisksJSON), &n.DisabledDisks)
+	if n.ProjectSchedule == "" {
+		n.ProjectSchedule = protocol.ScheduleFIFO
+	}
+	if n.DiskPolicy == "" {
+		n.DiskPolicy = protocol.DiskPolicyAffinityHash
+	}
 	return &n, nil
 }
 

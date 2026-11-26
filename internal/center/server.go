@@ -47,10 +47,44 @@ type Server struct {
 	trustedAdmin []netip.Prefix
 	httpServer   *http.Server
 	ln           net.Listener
-	deployMu     sync.RWMutex
-	deployTasks  map[string]*protocol.DeployTask
-	deployOrder  []string
-	closeOnce    sync.Once
+	deployMu      sync.RWMutex
+	deployTasks   map[string]*protocol.DeployTask
+	deployOrder   []string
+	knownProjects sync.Map // project_id -> struct{}, caches DB-persisted projects to avoid hot-path SQLite writes
+	closeOnce     sync.Once
+}
+
+func (s *Server) ensureKnownProjects(ctx context.Context, ids []string) {
+	var missing []string
+	seen := make(map[string]struct{})
+	for _, raw := range ids {
+		id := strings.TrimSpace(raw)
+		if id == "" || !validIDRe.MatchString(id) {
+			continue
+		}
+		if _, ok := s.knownProjects.Load(id); ok {
+			continue
+		}
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		missing = append(missing, id)
+	}
+	if len(missing) == 0 {
+		return
+	}
+	inserted, err := s.store.EnsureProjects(ctx, missing)
+	if err != nil {
+		s.logger.Warn("auto-create projects failed", "projects", missing, "err", err)
+		return
+	}
+	for _, id := range missing {
+		s.knownProjects.Store(id, struct{}{})
+	}
+	if inserted > 0 {
+		s.logger.Info("auto-created projects from dispatch activity", "count", inserted, "projects", missing)
+	}
 }
 
 func New(cfg *Config, logger *slog.Logger) (*Server, error) {
@@ -302,6 +336,13 @@ func (s *Server) handleAHeartbeat(w http.ResponseWriter, r *http.Request, node *
 		}
 		req.Availability = filtered
 	}
+	if len(req.Availability) > 0 {
+		availIDs := make([]string, 0, len(req.Availability))
+		for _, av := range req.Availability {
+			availIDs = append(availIDs, av.ProjectID)
+		}
+		s.ensureKnownProjects(r.Context(), availIDs)
+	}
 	s.hub.UpdateA(req)
 	hbResp := s.processNodeHeartbeatUpgrade(r.Context(), node.ID, req.Version, req.UpgradeAttemptID, req.UpgradeStatus, req.UpgradeError)
 	protocol.WriteJSON(w, http.StatusOK, hbResp)
@@ -314,12 +355,17 @@ func (s *Server) handleAEvents(w http.ResponseWriter, r *http.Request, node *Sto
 		return
 	}
 	validEvents := make([]protocol.SummaryEvent, 0, len(req.Events))
+	evProjects := make([]string, 0, len(req.Events))
 	for _, ev := range req.Events {
 		if !nodeAllowsProject(node.Projects, ev.ProjectID) || ev.Bytes < 0 || ev.DurationMs < 0 {
 			continue
 		}
 		ev.ANodeID = node.ID
 		validEvents = append(validEvents, ev)
+		evProjects = append(evProjects, ev.ProjectID)
+	}
+	if len(evProjects) > 0 {
+		s.ensureKnownProjects(r.Context(), evProjects)
 	}
 	applied, err := s.store.RecordSummaryEvents(r.Context(), validEvents)
 	if err != nil {
@@ -350,9 +396,21 @@ func (s *Server) handleBHeartbeat(w http.ResponseWriter, r *http.Request, node *
 	}
 	s.hub.UpdateB(req)
 	hbResp := s.processNodeHeartbeatUpgrade(r.Context(), node.ID, req.Version, req.UpgradeAttemptID, req.UpgradeStatus, req.UpgradeError)
+
+	knownIDs, _ := s.store.ListProjectIDs(r.Context())
+	dir := &protocol.ReceiverDirective{
+		ProjectMode:     "all",
+		KnownProjects:   knownIDs,
+		ProjectSchedule: node.ProjectSchedule,
+		DiskPolicy:      node.DiskPolicy,
+		DisabledDisks:   append([]string(nil), node.DisabledDisks...),
+	}
 	if len(node.Projects) > 0 {
+		dir.ProjectMode = "selected"
+		dir.AllowedProjects = append([]string(nil), node.Projects...)
 		hbResp.AllowedProjects = append([]string(nil), node.Projects...)
 	}
+	hbResp.Directive = dir
 	protocol.WriteJSON(w, http.StatusOK, hbResp)
 }
 
@@ -364,15 +422,27 @@ func (s *Server) handleBEventsSSE(w http.ResponseWriter, r *http.Request, node *
 	}
 	projectsParam := strings.TrimSpace(r.URL.Query().Get("projects"))
 	var projects []string
-	if projectsParam != "" {
+	wildcard := false
+	if projectsParam == "*" && len(node.Projects) == 0 {
+		wildcard = true
+		projects = []string{"*"}
+	} else if projectsParam != "" {
 		for _, p := range strings.Split(projectsParam, ",") {
 			p = strings.TrimSpace(p)
+			if p == "*" && len(node.Projects) == 0 {
+				wildcard = true
+				projects = []string{"*"}
+				break
+			}
 			if p != "" && nodeAllowsProject(node.Projects, p) {
 				projects = append(projects, p)
 			}
 		}
-	} else {
+	} else if len(node.Projects) > 0 {
 		projects = node.Projects
+	} else {
+		wildcard = true
+		projects = []string{"*"}
 	}
 
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -389,10 +459,29 @@ func (s *Server) handleBEventsSSE(w http.ResponseWriter, r *http.Request, node *
 	defer unsub()
 
 	// Immediately notify if any subscribed project already has ready files.
-	for _, p := range projects {
-		if len(s.hub.DiscoverCandidates(p)) > 0 {
-			_, _ = fmt.Fprintf(w, "event: wakeup\ndata: %s\n\n", p)
-			flusher.Flush()
+	if wildcard {
+		aSnap, _ := s.hub.Snapshot()
+		notified := make(map[string]struct{})
+		for _, aSt := range aSnap {
+			if !s.hub.IsOnline(aSt.LastSeen) {
+				continue
+			}
+			for pid, av := range aSt.Availability {
+				if av.ReadyCount > 0 {
+					if _, dup := notified[pid]; !dup {
+						notified[pid] = struct{}{}
+						_, _ = fmt.Fprintf(w, "event: wakeup\ndata: %s\n\n", pid)
+						flusher.Flush()
+					}
+				}
+			}
+		}
+	} else {
+		for _, p := range projects {
+			if len(s.hub.DiscoverCandidates(p)) > 0 {
+				_, _ = fmt.Fprintf(w, "event: wakeup\ndata: %s\n\n", p)
+				flusher.Flush()
+			}
 		}
 	}
 
@@ -681,6 +770,7 @@ func (s *Server) handleAdminUpsertProject(w http.ResponseWriter, r *http.Request
 		protocol.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	s.knownProjects.Store(p.ID, struct{}{})
 	if saved, err := s.store.GetProject(r.Context(), p.ID); err == nil {
 		p = *saved
 	}
@@ -688,7 +778,8 @@ func (s *Server) handleAdminUpsertProject(w http.ResponseWriter, r *http.Request
 }
 
 func (s *Server) handleAdminDeleteProject(w http.ResponseWriter, r *http.Request) {
-	if err := s.store.DeleteProject(r.Context(), r.PathValue("id")); err != nil {
+	id := r.PathValue("id")
+	if err := s.store.DeleteProject(r.Context(), id); err != nil {
 		if errors.Is(err, ErrNotFound) {
 			protocol.WriteError(w, http.StatusNotFound, "project not found")
 			return
@@ -696,6 +787,7 @@ func (s *Server) handleAdminDeleteProject(w http.ResponseWriter, r *http.Request
 		protocol.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	s.knownProjects.Delete(id)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -722,12 +814,15 @@ func (s *Server) handleAdminListNodes(w http.ResponseWriter, r *http.Request) {
 	views := make([]protocol.LiveNodeView, 0, len(nodes))
 	for _, n := range nodes {
 		v := protocol.LiveNodeView{
-			ID:          n.ID,
-			Name:        n.Name,
-			Role:        n.Role,
-			Projects:    n.Projects,
-			PublicAddr:  n.PublicAddr,
-			WindowHours: hours,
+			ID:              n.ID,
+			Name:            n.Name,
+			Role:            n.Role,
+			Projects:        n.Projects,
+			ProjectSchedule: n.ProjectSchedule,
+			DiskPolicy:      n.DiskPolicy,
+			DisabledDisks:   n.DisabledDisks,
+			PublicAddr:      n.PublicAddr,
+			WindowHours:     hours,
 		}
 		if upg, ok := upgrades[n.ID]; ok {
 			v.TargetVersion = upg.TargetVersion
@@ -778,6 +873,8 @@ func (s *Server) handleAdminListNodes(w http.ResponseWriter, r *http.Request) {
 				v.Version = st.Version
 				v.OS = st.OS
 				v.Arch = st.Arch
+				v.StorageDirs = st.StorageDirs
+				v.Disks = st.Disks
 				v.DiskTotalBytes = st.DiskTotalBytes
 				v.DiskFreeBytes = st.DiskFreeBytes
 				v.DiskUsedPct = st.DiskUsedPct
@@ -789,12 +886,31 @@ func (s *Server) handleAdminListNodes(w http.ResponseWriter, r *http.Request) {
 }
 
 type createNodeReq struct {
-	ID         string   `json:"id"`
-	Name       string   `json:"name"`
-	Role       string   `json:"role"`
-	Projects   []string `json:"projects"`
-	PublicAddr string   `json:"public_addr"`
-	Token      string   `json:"token,omitempty"`
+	ID              string   `json:"id"`
+	Name            string   `json:"name"`
+	Role            string   `json:"role"`
+	Projects        []string `json:"projects"`
+	ProjectSchedule string   `json:"project_schedule,omitempty"`
+	DiskPolicy      string   `json:"disk_policy,omitempty"`
+	DisabledDisks   []string `json:"disabled_disks,omitempty"`
+	PublicAddr      string   `json:"public_addr"`
+	Token           string   `json:"token,omitempty"`
+}
+
+func cleanDiskPathList(raw []string) []string {
+	out := make([]string, 0, len(raw))
+	seen := make(map[string]struct{}, len(raw))
+	for _, p := range raw {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if _, dup := seen[p]; !dup {
+			seen[p] = struct{}{}
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func (s *Server) handleAdminCreateNode(w http.ResponseWriter, r *http.Request) {
@@ -824,6 +940,16 @@ func (s *Server) handleAdminCreateNode(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	sched := normalizeProjectSchedule(req.ProjectSchedule)
+	if sched == "" {
+		protocol.WriteError(w, http.StatusBadRequest, "project_schedule must be fifo, fair, or random")
+		return
+	}
+	dp := normalizeDiskPolicy(req.DiskPolicy)
+	if dp == "" {
+		protocol.WriteError(w, http.StatusBadRequest, "disk_policy must be affinity_hash, most_free, round_robin, or first")
+		return
+	}
 	if req.Name == "" {
 		req.Name = req.ID
 	}
@@ -832,12 +958,15 @@ func (s *Server) handleAdminCreateNode(w http.ResponseWriter, r *http.Request) {
 		rawToken = auth.GenerateRandomToken(24)
 	}
 	rec := protocol.NodeRecord{
-		ID:         req.ID,
-		Name:       req.Name,
-		Role:       req.Role,
-		Projects:   req.Projects,
-		PublicAddr: req.PublicAddr,
-		CreatedAt:  time.Now().UTC(),
+		ID:              req.ID,
+		Name:            req.Name,
+		Role:            req.Role,
+		Projects:        req.Projects,
+		ProjectSchedule: sched,
+		DiskPolicy:      dp,
+		DisabledDisks:   cleanDiskPathList(req.DisabledDisks),
+		PublicAddr:      req.PublicAddr,
+		CreatedAt:       time.Now().UTC(),
 	}
 	if err := s.store.UpsertNode(r.Context(), rec, rawToken); err != nil {
 		protocol.WriteError(w, http.StatusInternalServerError, err.Error())
@@ -852,9 +981,12 @@ func (s *Server) handleAdminCreateNode(w http.ResponseWriter, r *http.Request) {
 }
 
 type updateNodeReq struct {
-	Name       string   `json:"name,omitempty"`
-	Projects   []string `json:"projects"`
-	PublicAddr string   `json:"public_addr,omitempty"`
+	Name            string    `json:"name,omitempty"`
+	Projects        *[]string `json:"projects,omitempty"`
+	ProjectSchedule string    `json:"project_schedule,omitempty"`
+	DiskPolicy      string    `json:"disk_policy,omitempty"`
+	DisabledDisks   *[]string `json:"disabled_disks,omitempty"`
+	PublicAddr      string    `json:"public_addr,omitempty"`
 }
 
 func (s *Server) handleAdminUpdateNode(w http.ResponseWriter, r *http.Request) {
@@ -887,24 +1019,44 @@ func (s *Server) handleAdminUpdateNode(w http.ResponseWriter, r *http.Request) {
 		}
 		rec.PublicAddr = addr
 	}
-
-	cleanProjects := make([]string, 0, len(req.Projects))
-	seen := make(map[string]struct{}, len(req.Projects))
-	for _, p := range req.Projects {
-		p = strings.TrimSpace(p)
-		if p == "" {
-			continue
-		}
-		if !validIDRe.MatchString(p) {
-			protocol.WriteError(w, http.StatusBadRequest, "invalid project id: "+p)
+	if req.ProjectSchedule != "" {
+		sched := normalizeProjectSchedule(req.ProjectSchedule)
+		if sched == "" {
+			protocol.WriteError(w, http.StatusBadRequest, "project_schedule must be fifo, fair, or random")
 			return
 		}
-		if _, dup := seen[p]; !dup {
-			seen[p] = struct{}{}
-			cleanProjects = append(cleanProjects, p)
-		}
+		rec.ProjectSchedule = sched
 	}
-	rec.Projects = cleanProjects
+	if req.DiskPolicy != "" {
+		dp := normalizeDiskPolicy(req.DiskPolicy)
+		if dp == "" {
+			protocol.WriteError(w, http.StatusBadRequest, "disk_policy must be affinity_hash, most_free, round_robin, or first")
+			return
+		}
+		rec.DiskPolicy = dp
+	}
+	if req.DisabledDisks != nil {
+		rec.DisabledDisks = cleanDiskPathList(*req.DisabledDisks)
+	}
+	if req.Projects != nil {
+		cleanProjects := make([]string, 0, len(*req.Projects))
+		seen := make(map[string]struct{}, len(*req.Projects))
+		for _, p := range *req.Projects {
+			p = strings.TrimSpace(p)
+			if p == "" {
+				continue
+			}
+			if !validIDRe.MatchString(p) {
+				protocol.WriteError(w, http.StatusBadRequest, "invalid project id: "+p)
+				return
+			}
+			if _, dup := seen[p]; !dup {
+				seen[p] = struct{}{}
+				cleanProjects = append(cleanProjects, p)
+			}
+		}
+		rec.Projects = cleanProjects
+	}
 
 	// Empty rawToken tells Store.UpsertNode to keep the existing token_hash untouched.
 	if err := s.store.UpsertNode(r.Context(), rec, ""); err != nil {

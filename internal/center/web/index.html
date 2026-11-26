@@ -87,7 +87,10 @@
     <!-- Projects Tab -->
     <section id="tab-projects" class="tab-panel">
       <div class="section-bar">
-        <h2>项目隔离管理</h2>
+        <div>
+          <h2>项目隔离管理</h2>
+          <div class="muted" style="margin-top:3px">业务方 PUT 上传新项目时将自动发现并建档；也可手动提前创建并自定义同名冲突策略</div>
+        </div>
         <button id="open-create-project" class="btn primary">+ 新建项目</button>
       </div>
       <div id="projects-grid" class="card-grid"></div>
@@ -130,7 +133,7 @@
     <!-- Receiver (Destination/Intranet) Nodes Tab -->
     <section id="tab-nodes-b" class="tab-panel">
       <div class="section-bar">
-        <h2>内网接收节点列表 (目标落盘 · 支持单项目专享)</h2>
+        <h2>内网接收节点列表 (目标落盘 · 项目/调度/磁盘全托管)</h2>
         <button id="open-create-node-b" class="btn primary">+ 注册接收节点</button>
       </div>
       <div class="batch-bar">
@@ -146,8 +149,8 @@
               <th style="width:32px"><input id="chk-all-b" type="checkbox" /></th>
               <th>节点 ID / 名称</th>
               <th>状态 / 版本</th>
-              <th>下载项目范围</th>
-              <th>本地磁盘可用</th>
+              <th>下载项目与调度</th>
+              <th>本地磁盘池与选盘策略</th>
               <th id="th-b-completed">阶段完成汇总</th>
               <th id="th-b-speed">阶段平均速率</th>
               <th>操作</th>
@@ -311,11 +314,15 @@
           <div class="radio-row">
             <label class="radio-opt">
               <input type="radio" name="project_mode" value="single" checked />
-              <span>仅下载单个项目 (推荐)</span>
+              <span>单项目专享</span>
+            </label>
+            <label class="radio-opt">
+              <input type="radio" name="project_mode" value="all" />
+              <span>全部项目 (自动发现)</span>
             </label>
             <label class="radio-opt">
               <input type="radio" name="project_mode" value="multi" />
-              <span>多个 / 全部项目</span>
+              <span>指定多项目</span>
             </label>
           </div>
           <label id="node-single-project-wrap">选择专享项目 (该节点只下载这一个项目)
@@ -324,6 +331,23 @@
           <label id="node-single-project-custom-wrap" class="hidden">自定义项目 ID
             <input name="single_project_custom" placeholder="输入项目 ID" autocomplete="off" />
           </label>
+          <div class="form-grid-2">
+            <label>多项目调度策略
+              <select name="project_schedule">
+                <option value="fifo" selected>按顺序逐个下完 (FIFO)</option>
+                <option value="fair">多项目公平轮询 (均衡)</option>
+                <option value="random">随机抢占</option>
+              </select>
+            </label>
+            <label>多磁盘落盘策略
+              <select name="disk_policy">
+                <option value="affinity_hash" selected>同源亲和均匀 (推荐)</option>
+                <option value="most_free">最大剩余空间优先</option>
+                <option value="round_robin">逐文件轮询均匀</option>
+                <option value="first">首盘写满再切下盘</option>
+              </select>
+            </label>
+          </div>
         </div>
         <label id="node-multi-projects-wrap">绑定项目 (逗号分隔，留空表示允许全部项目)
           <input name="projects" placeholder="proj-alpha,proj-beta" autocomplete="off" />
@@ -334,13 +358,13 @@
     </div>
   </div>
 
-  <!-- Edit Node Project Scope Modal (No Token Rotation) -->
+  <!-- Edit Receiver Node Projects, Scheduling & Disk Pool Modal (No Token Rotation) -->
   <div id="edit-node-modal" class="overlay hidden">
-    <div class="modal-card">
+    <div class="modal-card wide">
       <div class="modal-head">
         <div>
-          <h3 id="edit-node-title">配置节点下载项目</h3>
-          <p class="muted">修改后立即生效（中心下发限制并刷新订阅，无需更换节点密钥）</p>
+          <h3 id="edit-node-title">配置接收节点项目与磁盘</h3>
+          <p class="muted">保存后 2 秒内自动下发至接收节点热生效（无需 SSH、无需改配置文件、无需更换密钥）</p>
         </div>
         <button class="btn ghost" onclick="closeModal('edit-node-modal')">关闭</button>
       </div>
@@ -349,26 +373,66 @@
         <label>显示名称
           <input name="name" autocomplete="off" />
         </label>
-        <div class="radio-row">
-          <label class="radio-opt">
-            <input type="radio" name="edit_project_mode" value="single" checked />
-            <span>仅下载单个项目 (专享模式)</span>
+
+        <div class="config-section">
+          <div class="config-section-title">1. 下载项目范围与调度策略</div>
+          <div class="radio-row">
+            <label class="radio-opt">
+              <input type="radio" name="edit_project_mode" value="single" checked />
+              <span>仅下载单个项目 (专享模式)</span>
+            </label>
+            <label class="radio-opt">
+              <input type="radio" name="edit_project_mode" value="multi" />
+              <span>指定多个项目</span>
+            </label>
+            <label class="radio-opt">
+              <input type="radio" name="edit_project_mode" value="all" />
+              <span>全部项目 (自动拉取新建项目)</span>
+            </label>
+          </div>
+          <label id="edit-single-project-wrap">目标项目 (该接收服务器将仅下载此项目)
+            <select id="edit-single-project-select" name="single_project"></select>
           </label>
-          <label class="radio-opt">
-            <input type="radio" name="edit_project_mode" value="multi" />
-            <span>多个 / 全部项目</span>
+          <label id="edit-single-project-custom-wrap" class="hidden">自定义项目 ID
+            <input name="single_project_custom" placeholder="输入项目 ID" autocomplete="off" />
           </label>
+          <div id="edit-multi-projects-wrap" class="form-stack hidden">
+            <div id="edit-project-checks" class="proj-check-grid"></div>
+            <label>已选项目列表 (逗号分隔，按先后顺序生效；可手动补充项目 ID)
+              <input name="projects" placeholder="proj-alpha,proj-beta" autocomplete="off" />
+            </label>
+          </div>
+          <div id="edit-schedule-wrap">
+            <label>多项目调度策略
+              <select name="project_schedule">
+                <option value="fifo">按顺序逐个下完 (FIFO · 按项目创建/配置顺序依次抽干)</option>
+                <option value="fair">多项目公平轮询 (多项目均衡分摊并发与带宽)</option>
+                <option value="random">随机抢占 (兼容旧策略)</option>
+              </select>
+            </label>
+          </div>
         </div>
-        <label id="edit-single-project-wrap">目标项目 (该接收服务器将仅下载此项目)
-          <select id="edit-single-project-select" name="single_project"></select>
-        </label>
-        <label id="edit-single-project-custom-wrap" class="hidden">自定义项目 ID
-          <input name="single_project_custom" placeholder="输入项目 ID" autocomplete="off" />
-        </label>
-        <label id="edit-multi-projects-wrap" class="hidden">绑定项目列表 (逗号分隔，留空表示全部项目)
-          <input name="projects" placeholder="proj-alpha,proj-beta" autocomplete="off" />
-        </label>
-        <button type="submit" class="btn primary full">保存并立即生效</button>
+
+        <div class="config-section">
+          <div class="config-section-title">2. 落盘磁盘池与选盘策略</div>
+          <label>多磁盘选盘策略
+            <select name="disk_policy">
+              <option value="affinity_hash">同源亲和均匀 (推荐：音视频与 .info.json 同盘，满盘自动溢出)</option>
+              <option value="most_free">最大剩余空间优先 (始终写入最空闲的磁盘)</option>
+              <option value="round_robin">逐文件轮询均匀 (按文件依次轮询各启用磁盘)</option>
+              <option value="first">首盘写满再切下盘 (按顺序优先写满第一块启用盘)</option>
+            </select>
+          </label>
+          <div id="edit-disks-section">
+            <div class="muted" style="margin-bottom:6px">磁盘启停控制（取消勾选将立即暂停写入该磁盘，自动切至其余启用盘）：</div>
+            <div id="edit-disks-list" class="disk-toggle-list"></div>
+          </div>
+          <div id="edit-storage-pool-tip" class="banner warn hidden" style="margin-top:6px;margin-bottom:0">
+            提示：该接收节点当前未配置通用磁盘池 (<code>storage_dirs</code>)，切换到未在本地 YAML 映射过的新项目可能无法自动建目录；建议升级至 v1.8.0 并配置 <code>storage_dirs</code> 实现彻底免 SSH 切换。
+          </div>
+        </div>
+
+        <button type="submit" class="btn primary full">保存配置并立即下发</button>
       </form>
     </div>
   </div>
@@ -476,15 +540,24 @@
         </div>
         <div class="radio-row">
           <label class="radio-opt">
-            <input type="radio" name="script_mode" value="single" checked />
-            <span>仅下载单个项目 (生成 only_project 专享配置)</span>
+            <input type="radio" name="script_mode" value="pool" checked />
+            <span>磁盘池全托管 (推荐：前端随时切换任意项目免 SSH)</span>
+          </label>
+          <label class="radio-opt">
+            <input type="radio" name="script_mode" value="single" />
+            <span>本地强锁单项目 (only_project)</span>
           </label>
           <label class="radio-opt">
             <input type="radio" name="script_mode" value="multi" />
-            <span>多项目映射配置</span>
+            <span>手动多项目目录映射</span>
           </label>
         </div>
-        <div id="b-script-single-wrap" class="form-stack">
+        <div id="b-script-pool-wrap" class="form-stack">
+          <label>物理磁盘根目录池 storage_dirs (每行一个挂载目录，任意项目自动落盘至 <code>&lt;盘目录&gt;/&lt;项目ID&gt;/</code>)
+            <textarea name="storage_dirs" rows="2" placeholder="/mnt/sda/relay-delivery&#10;/mnt/sdb/relay-delivery"></textarea>
+          </label>
+        </div>
+        <div id="b-script-single-wrap" class="form-stack hidden">
           <label>绑定单个项目
             <select id="b-script-single-project" name="only_project"></select>
           </label>
