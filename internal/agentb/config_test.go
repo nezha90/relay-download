@@ -1,7 +1,9 @@
 package agentb
 
 import (
+	"fmt"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"slices"
 	"testing"
@@ -157,5 +159,89 @@ func TestStorageDirsPoolDirectiveAndDiskPolicies(t *testing.T) {
 	}
 	if chosen := ag.chooseDestDir("proj-2", "clip.opus", 1024); chosen != filepath.Join(root2, "proj-2") {
 		t.Fatalf("expected disabled disk1 to be skipped, got %q", chosen)
+	}
+}
+
+func TestRollingWindowSlidingDiskSelection(t *testing.T) {
+	base := t.TempDir()
+	roots := make([]string, 12)
+	for i := range roots {
+		roots[i] = filepath.Join(base, fmt.Sprintf("disk%d", i+1))
+		if err := os.MkdirAll(roots[i], 0o755); err != nil {
+			t.Fatalf("mkdir disk%d: %v", i+1, err)
+		}
+	}
+
+	cfg := Config{
+		NodeID:           "rx-100disk",
+		CenterURL:        "https://127.0.0.1:8440",
+		CenterToken:      "tok",
+		StorageDirs:      roots,
+		DiskPolicy:       protocol.DiskPolicyRollingWindow,
+		ActiveDiskWindow: 3,
+	}
+	cfg.ApplyDefaults()
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("rolling_window config should validate: %v", err)
+	}
+
+	ag := &Agent{
+		cfg:              &cfg,
+		logger:           slog.Default(),
+		discCache:        make(map[string]cachedDiscover),
+		wakeupCh:         make(chan string, 16),
+		projectSchedule:  cfg.ProjectSchedule,
+		diskPolicy:       cfg.DiskPolicy,
+		activeDiskWindow: cfg.ActiveDiskWindow,
+		diskHealth:       transfer.NewDiskHealthTracker(),
+	}
+
+	// 1. With active_disk_window=3 across 12 disks, ALL writes must stay strictly within disks 1..3
+	//    and paired media+metadata with the same stem must land on the exact same disk.
+	seenPhase1 := make(map[string]int)
+	for i := 0; i < 60; i++ {
+		d := ag.chooseDestDir("proj-tw", fmt.Sprintf("vid_%03d.opus", i), 1024)
+		seenPhase1[d]++
+		dMeta := ag.chooseDestDir("proj-tw", fmt.Sprintf("vid_%03d.info.json", i), 256)
+		if d != dMeta {
+			t.Fatalf("paired files must share same disk inside rolling window: %s vs %s", d, dMeta)
+		}
+	}
+	for i := 3; i < 12; i++ {
+		if seenPhase1[filepath.Join(roots[i], "proj-tw")] > 0 {
+			t.Fatalf("standby disk%d must NOT receive writes while disks 1..3 are healthy", i+1)
+		}
+	}
+	if len(seenPhase1) != 3 {
+		t.Fatalf("expected all 3 disks in initial active window to receive writes, got %d: %v", len(seenPhase1), seenPhase1)
+	}
+
+	// 2. When disk1 fills up / is disabled (e.g. preparing to eject), disk4 MUST automatically slide
+	//    into the 3-disk active window (disks 2, 3, 4), while disks 5..12 stay standby!
+	ag.applyDirective(&protocol.ReceiverDirective{
+		ProjectMode:      "selected",
+		AllowedProjects:  []string{"proj-tw"},
+		DiskPolicy:       protocol.DiskPolicyRollingWindow,
+		ActiveDiskWindow: 3,
+		StorageDirs:      roots,
+		DisabledDisks:    []string{roots[0]},
+		DiskGen:          1,
+	}, nil)
+
+	seenPhase2 := make(map[string]int)
+	for i := 0; i < 60; i++ {
+		d := ag.chooseDestDir("proj-tw", fmt.Sprintf("batch2_%03d.opus", i), 1024)
+		seenPhase2[d]++
+	}
+	if seenPhase2[filepath.Join(roots[0], "proj-tw")] > 0 {
+		t.Fatalf("disabled disk1 must not receive writes")
+	}
+	if seenPhase2[filepath.Join(roots[3], "proj-tw")] == 0 {
+		t.Fatalf("expected disk4 to slide into active window automatically after disk1 disabled, got %v", seenPhase2)
+	}
+	for i := 4; i < 12; i++ {
+		if seenPhase2[filepath.Join(roots[i], "proj-tw")] > 0 {
+			t.Fatalf("standby disk%d must remain idle until earlier disks fill/disable", i+1)
+		}
 	}
 }

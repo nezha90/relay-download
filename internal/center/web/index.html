@@ -588,14 +588,17 @@
         <button class="btn ghost" type="button" data-close-modal="project-modal">关闭</button>
       </div>
       <form id="create-project-form" class="form-stack">
-        <label>项目 ID (英文/数字)
-          <input name="id" required placeholder="e.g. proj-video" autocomplete="off" />
+        <label>项目内部 ID (底层目录与接口唯一标识，创建后不可改)
+          <div class="input-with-btn">
+            <input name="id" required placeholder="e.g. proj-8f3k2a" autocomplete="off" />
+            <button type="button" id="btn-gen-project-id" class="btn sm" data-gen-id="proj" data-gen-target="#create-project-form input[name='id']">自动生成</button>
+          </div>
         </label>
-        <label>项目名称
-          <input name="name" required placeholder="视频分发项目" autocomplete="off" />
+        <label>项目显示名称 / 简称 * (如 tw-audio，全站与客户授权列表优先展示此名)
+          <input name="name" required placeholder="例如：tw-audio" autocomplete="off" />
         </label>
-        <label>描述
-          <input name="description" placeholder="可选描述" autocomplete="off" />
+        <label>项目备注说明 (可选，便于多项目区分)
+          <input name="description" placeholder="例如：台湾音频采集落盘项目" autocomplete="off" />
         </label>
         <div class="form-grid-2">
           <label>同名冲突策略
@@ -640,11 +643,19 @@
       <div id="node-modal-explainer" class="concept-box" style="margin-bottom:12px"></div>
       <form id="create-node-form" class="form-stack">
         <input type="hidden" name="role" />
-        <label>节点 ID
-          <input name="id" required placeholder="e.g. edge-01 / nas-01" autocomplete="off" />
+        <label>节点 ID *
+          <div class="input-with-btn">
+            <input name="id" required placeholder="e.g. edge-7q2n8r / nas-4m9x1p" autocomplete="off" />
+            <button type="button" id="btn-gen-node-id" class="btn sm" data-gen-id="node" data-gen-target="#create-node-form input[name='id']">自动生成</button>
+          </div>
         </label>
         <label>显示名称
           <input name="name" placeholder="例如：目标机房接收节点 01" autocomplete="off" />
+        </label>
+        <label id="create-node-owner-wrap" data-admin-only="1">归属客户账号 (可选，留空仅管理员可见；指定后仅该客户可运维)
+          <select id="create-node-owner-select" name="owner_account_id">
+            <option value="">仅管理员托管（不归属客户）</option>
+          </select>
         </label>
         <label id="node-public-addr-wrap">公网地址 (仅分发节点)
           <input name="public_addr" placeholder="https://1.2.3.4:8443" autocomplete="off" />
@@ -679,14 +690,18 @@
               </select>
             </label>
             <label>多磁盘落盘策略
-              <select name="disk_policy">
+              <select name="disk_policy" id="create-disk-policy-select">
                 <option value="affinity_hash" selected>同源亲和均匀 (推荐)</option>
+                <option value="rolling_window">分批滚动窗口 (超多盘先写 N 块，写满自动顶上)</option>
                 <option value="most_free">最大剩余空间优先</option>
                 <option value="round_robin">逐文件轮询均匀</option>
                 <option value="first">首盘写满再切下盘</option>
               </select>
             </label>
           </div>
+          <label id="create-disk-window-wrap" class="hidden">分批滚动并发盘数 N (同时写前 N 块，任意 1 块写满或拔出，第 N+1 块自动顶上)
+            <input name="active_disk_window" type="number" value="10" min="1" max="256" />
+          </label>
         </div>
         <label id="node-multi-projects-wrap">绑定项目 (逗号分隔，留空表示允许全部项目)
           <input name="projects" placeholder="proj-alpha,proj-beta" autocomplete="off" />
@@ -714,6 +729,11 @@
         <input type="hidden" name="node_id" />
         <label>显示名称
           <input name="name" autocomplete="off" />
+        </label>
+        <label id="edit-node-owner-wrap" data-admin-only="1">归属客户账号 (指定后仅该客户可见并运维此接收机)
+          <select id="edit-node-owner-select" name="owner_account_id">
+            <option value="">仅管理员托管（不归属客户）</option>
+          </select>
         </label>
 
         <div class="config-section">
@@ -763,16 +783,30 @@
               <span>刷新物理盘</span>
             </button>
           </div>
-          <label>多磁盘选盘策略
-            <select name="disk_policy">
-              <option value="affinity_hash">同源亲和均匀 (推荐：音视频与 .info.json 同盘，满盘自动溢出)</option>
-              <option value="most_free">最大剩余空间优先 (始终写入最空闲的磁盘)</option>
-              <option value="round_robin">逐文件轮询均匀 (按文件依次轮询各启用磁盘)</option>
-              <option value="first">首盘写满再切下盘 (按顺序优先写满第一块启用盘)</option>
-            </select>
-          </label>
+          <div class="form-grid-2">
+            <label>多磁盘选盘策略
+              <select name="disk_policy" id="edit-disk-policy-select">
+                <option value="affinity_hash">同源亲和均匀 (音视频与 .info.json 同盘，满盘溢出)</option>
+                <option value="rolling_window">分批滚动窗口 (推荐超多盘：同时写前 N 块，写满自动顶上)</option>
+                <option value="most_free">最大剩余空间优先 (始终写入最空闲的磁盘)</option>
+                <option value="round_robin">逐文件轮询均匀 (按文件依次轮询各启用磁盘)</option>
+                <option value="first">首盘写满再切下盘 (按顺序优先写满第一块启用盘)</option>
+              </select>
+            </label>
+            <label id="edit-disk-window-wrap" class="hidden">同时写入盘数 N (1~256，满 1 块自动滚下一块)
+              <input name="active_disk_window" type="number" value="10" min="1" max="256" />
+            </label>
+          </div>
           <div id="edit-disks-section">
             <div class="muted" style="margin-bottom:6px">勾选即可自动创建统一目录 <code>&lt;挂载点&gt;/relay-delivery</code> 并开启多盘并发落盘；<strong>准备拔盘</strong>时先关闭开关等在途写入归零再卸载，<strong>直接拔盘</strong>也会自动锁定防穿透写进系统盘（重插后需人工勾选确认启用）。</div>
+            <div class="disk-picker-toolbar">
+              <input type="text" id="edit-b-disk-search" class="disk-search-input" data-disk-filter="edit-disks-list" placeholder="搜索挂载点/设备名（如 /mnt/disk）..." autocomplete="off" />
+              <div class="btn-row">
+                <button type="button" class="btn sm" data-disk-select-all="edit-disks-list">全选数据盘</button>
+                <button type="button" class="btn sm ghost" data-disk-clear-all="edit-disks-list">清空勾选</button>
+              </div>
+              <span id="edit-b-disk-counter" class="muted"></span>
+            </div>
             <div id="edit-disks-list" class="disk-toggle-list"></div>
           </div>
           <div id="edit-storage-pool-tip" class="banner warn hidden" style="margin-top:6px;margin-bottom:0">
@@ -832,6 +866,14 @@
             </button>
           </div>
           <div class="muted">勾选即可自动创建 <code>&lt;挂载点&gt;/relay-cache</code>（系统盘自动建 <code>/data/relay-cache</code>）并开启多盘并发缓存；停用等待在途排空可安全拔盘，直接拔盘自动锁定防穿透写系统盘，重插后需人工勾选确认启用。</div>
+          <div class="disk-picker-toolbar">
+            <input type="text" id="edit-a-disk-search" class="disk-search-input" data-disk-filter="edit-a-disks-list" placeholder="搜索挂载点/设备名..." autocomplete="off" />
+            <div class="btn-row">
+              <button type="button" class="btn sm" data-disk-select-all="edit-a-disks-list">全选数据盘</button>
+              <button type="button" class="btn sm ghost" data-disk-clear-all="edit-a-disks-list">清空勾选</button>
+            </div>
+            <span id="edit-a-disk-counter" class="muted"></span>
+          </div>
           <div id="edit-a-disks-list" class="disk-toggle-list"></div>
         </div>
         <button type="submit" id="edit-a-submit-btn" class="btn primary full">保存数据盘配置并热生效</button>
@@ -864,7 +906,10 @@
         </div>
         <div class="form-grid-3">
           <label>节点 ID *
-            <input name="node_id" required placeholder="e.g. edge-01" autocomplete="off" />
+            <div class="input-with-btn">
+              <input name="node_id" required placeholder="e.g. edge-7q2n8r" autocomplete="off" />
+              <button type="button" class="btn sm" data-gen-id="edge" data-gen-target="#deploy-a-form input[name='node_id']">自动生成</button>
+            </div>
           </label>
           <label>节点显示名称
             <input name="node_name" placeholder="公网分发节点 01" autocomplete="off" />
@@ -1061,36 +1106,48 @@
       </div>
       <form id="account-form" class="form-stack">
         <input type="hidden" name="mode" value="create" />
-        <label>账号 ID (选填，留空自动生成)
-          <input name="id" placeholder="e.g. cust-shenfei" autocomplete="off" />
+        <label>账号 ID (留空或点自动生成)
+          <div class="input-with-btn">
+            <input name="id" placeholder="e.g. cust-6w3e9t" autocomplete="off" />
+            <button type="button" id="btn-gen-account-id" class="btn sm" data-gen-id="cust" data-gen-target="#account-form input[name='id']">自动生成</button>
+          </div>
         </label>
         <label>客户名称 / 备注 *
-          <input name="name" required placeholder="例如：下游接收运维客户" autocomplete="off" />
+          <input name="name" required placeholder="例如：台湾音频接收客户" autocomplete="off" />
         </label>
         <div class="config-section">
-          <div class="config-section-title">项目授权范围 (均禁止访问分发节点)</div>
-          <div class="radio-row">
-            <label class="radio-opt">
-              <input type="radio" name="account_scope" value="all" checked />
-              <span>全部项目 (可运维全部接收节点)</span>
-            </label>
-            <label class="radio-opt">
-              <input type="radio" name="account_scope" value="selected" />
-              <span>仅限指定项目</span>
-            </label>
-          </div>
-          <div id="account-projects-wrap" class="form-stack hidden">
+          <div class="config-section-title">授权可见项目（默认全部不可见 · 需显式勾选分配）</div>
+          <div class="muted">HTTP PUT 新自动创建的项目默认不对任何客户可见；取消全部勾选后该客户将不可见任何项目，仅可管理归属自己的接收节点。</div>
+          <div id="account-projects-wrap" class="form-stack">
             <div id="account-project-checks" class="proj-check-grid"></div>
-            <label>授权项目 ID (逗号分隔)
-              <input name="projects" placeholder="proj-alpha,proj-beta" autocomplete="off" />
+            <label>已授权项目 ID (逗号分隔，可手动补充尚未建档的项目 ID)
+              <input name="projects" placeholder="选择上方项目自动填入，留空表示暂不分配任何项目" autocomplete="off" />
             </label>
           </div>
         </div>
         <label id="account-enabled-wrap" class="toggle hidden">
           <input type="checkbox" name="enabled" checked />
-          <span>启用该客户账号 (取消勾选后该 Token 将立即失效)</span>
+          <span>启用该客户账号 (取消勾选后该 Token 将立即失效，且名下接收机自动暂停拉取)</span>
         </label>
         <button type="submit" class="btn primary full">保存客户账号</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- Assign Project to Customer Accounts Modal (Admin Only) -->
+  <div id="assign-project-modal" class="overlay hidden">
+    <div class="modal-card">
+      <div class="modal-head">
+        <div>
+          <h3 id="assign-project-title">分配项目给客户</h3>
+          <p id="assign-project-sub" class="muted">勾选可见并可下载该项目的客户账号（未勾选客户将完全不可见）</p>
+        </div>
+        <button class="btn ghost" type="button" data-close-modal="assign-project-modal">关闭</button>
+      </div>
+      <form id="assign-project-form" class="form-stack">
+        <input type="hidden" name="project_id" />
+        <div id="assign-project-accounts-list" class="proj-check-grid"></div>
+        <button type="submit" class="btn primary full">保存项目归属分配</button>
       </form>
     </div>
   </div>

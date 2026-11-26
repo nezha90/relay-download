@@ -1492,3 +1492,93 @@ input[type="checkbox"], input[type="radio"] {
   font-size: 12px;
   color: var(--text-soft);
 }
+
+/* ---------------- Auto-ID Input, 100-Disk Picker & Rolling Window ---------------- */
+.input-with-btn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.input-with-btn input {
+  flex: 1;
+  min-width: 0;
+}
+.disk-picker-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+.disk-search-input {
+  flex: 1;
+  min-width: 180px;
+  background: rgba(15, 23, 42, 0.86);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 5px 10px;
+  color: var(--text);
+  font-size: 12px;
+}
+.disk-search-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.disk-toggle-list {
+  max-height: 360px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+.badge.standby {
+  background: rgba(148, 163, 184, 0.14);
+  color: var(--text-soft);
+  border-color: rgba(148, 163, 184, 0.32);
+}
+.badge.full-disk {
+  background: rgba(245, 158, 11, 0.2);
+  color: #fde68a;
+  border-color: rgba(245, 158, 11, 0.55);
+}
+.disk-summary-strip {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+.proj-check-card {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px 10px;
+  background: rgba(8, 12, 20, 0.72);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  cursor: pointer;
+  transition: border-color 0.16s ease, background 0.16s ease;
+}
+.proj-check-card:hover {
+  border-color: rgba(96, 165, 250, 0.45);
+  background: rgba(15, 23, 42, 0.9);
+}
+.proj-check-card input {
+  margin-top: 3px;
+  flex-shrink: 0;
+}
+.proj-check-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.proj-check-title {
+  font-weight: 600;
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.3;
+}
+.proj-check-sub {
+  font-size: 11px;
+  color: var(--muted);
+  word-break: break-all;
+}

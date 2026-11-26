@@ -35,6 +35,7 @@ type IntervalQuery struct {
 	BucketMinutes   int
 	ProjectID       string
 	AllowedProjects []string
+	ScopeRestricted bool // true for customer accounts: empty AllowedProjects returns zero data (default-deny)
 	ANodeID         string
 	BNodeID         string
 }
@@ -202,6 +203,8 @@ CREATE TABLE IF NOT EXISTS accounts (
 		`ALTER TABLE nodes ADD COLUMN storage_dirs_json TEXT NOT NULL DEFAULT '[]'`,
 		`ALTER TABLE nodes ADD COLUMN unplug_locked_disks_json TEXT NOT NULL DEFAULT '[]'`,
 		`ALTER TABLE nodes ADD COLUMN disk_gen INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE nodes ADD COLUMN active_disk_window INTEGER NOT NULL DEFAULT 10`,
+		`ALTER TABLE nodes ADD COLUMN owner_account_id TEXT NOT NULL DEFAULT ''`,
 	}
 	for _, stmt := range migrations {
 		if _, err := db.Exec(stmt); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
@@ -373,6 +376,8 @@ func normalizeDiskPolicy(v string) string {
 		return protocol.DiskPolicyRoundRobin
 	case protocol.DiskPolicyFirst:
 		return protocol.DiskPolicyFirst
+	case protocol.DiskPolicyRollingWindow:
+		return protocol.DiskPolicyRollingWindow
 	case protocol.DiskPolicyAffinityHash, "":
 		return protocol.DiskPolicyAffinityHash
 	default:
@@ -416,6 +421,12 @@ func (s *Store) UpsertNode(ctx context.Context, n protocol.NodeRecord, rawToken 
 	if n.RateLimitMBps < 0 {
 		n.RateLimitMBps = 0
 	}
+	if n.ActiveDiskWindow <= 0 {
+		n.ActiveDiskWindow = 10
+	}
+	if n.ActiveDiskWindow > 256 {
+		n.ActiveDiskWindow = 256
+	}
 	projJSON, _ := json.Marshal(n.Projects)
 	if n.Projects == nil {
 		projJSON = []byte("[]")
@@ -438,14 +449,16 @@ func (s *Store) UpsertNode(ctx context.Context, n protocol.NodeRecord, rawToken 
 	}
 	tokHash := auth.HashToken(rawToken)
 	_, err := s.db.ExecContext(ctx, `
-INSERT INTO nodes (id, name, role, projects_json, project_schedule, disk_policy, storage_dirs_json, disabled_disks_json, unplug_locked_disks_json, disk_gen, concurrency_mode, max_concurrent_override, rate_limit_mbps, paused, public_addr, token_hash, created_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO nodes (id, name, role, owner_account_id, projects_json, project_schedule, disk_policy, active_disk_window, storage_dirs_json, disabled_disks_json, unplug_locked_disks_json, disk_gen, concurrency_mode, max_concurrent_override, rate_limit_mbps, paused, public_addr, token_hash, created_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
 	name=excluded.name,
 	role=excluded.role,
+	owner_account_id=excluded.owner_account_id,
 	projects_json=excluded.projects_json,
 	project_schedule=excluded.project_schedule,
 	disk_policy=excluded.disk_policy,
+	active_disk_window=excluded.active_disk_window,
 	storage_dirs_json=excluded.storage_dirs_json,
 	disabled_disks_json=excluded.disabled_disks_json,
 	unplug_locked_disks_json=excluded.unplug_locked_disks_json,
@@ -456,7 +469,7 @@ ON CONFLICT(id) DO UPDATE SET
 	paused=excluded.paused,
 	public_addr=excluded.public_addr,
 	token_hash=CASE WHEN ? != '' THEN excluded.token_hash ELSE nodes.token_hash END
-`, n.ID, n.Name, n.Role, string(projJSON), n.ProjectSchedule, n.DiskPolicy, string(storageDirsJSON), string(disDisksJSON), string(unplugLockedJSON), n.DiskGen, n.ConcurrencyMode, n.MaxConcurrentOverride, n.RateLimitMBps, pausedInt, n.PublicAddr, tokHash, n.CreatedAt, rawToken)
+`, n.ID, n.Name, n.Role, strings.TrimSpace(n.OwnerAccountID), string(projJSON), n.ProjectSchedule, n.DiskPolicy, n.ActiveDiskWindow, string(storageDirsJSON), string(disDisksJSON), string(unplugLockedJSON), n.DiskGen, n.ConcurrencyMode, n.MaxConcurrentOverride, n.RateLimitMBps, pausedInt, n.PublicAddr, tokHash, n.CreatedAt, rawToken)
 	return err
 }
 
@@ -536,9 +549,9 @@ func (s *Store) AuthenticateNode(ctx context.Context, id, rawToken, expectedRole
 	var projJSON, storageDirsJSON, disDisksJSON, unplugLockedJSON string
 	var pausedInt int
 	err := s.db.QueryRowContext(ctx, `
-SELECT id, name, role, projects_json, project_schedule, disk_policy, storage_dirs_json, disabled_disks_json, unplug_locked_disks_json, disk_gen, concurrency_mode, max_concurrent_override, rate_limit_mbps, paused, public_addr, token_hash, created_at
+SELECT id, name, role, owner_account_id, projects_json, project_schedule, disk_policy, active_disk_window, storage_dirs_json, disabled_disks_json, unplug_locked_disks_json, disk_gen, concurrency_mode, max_concurrent_override, rate_limit_mbps, paused, public_addr, token_hash, created_at
 FROM nodes WHERE id = ?
-`, id).Scan(&sn.ID, &sn.Name, &sn.Role, &projJSON, &sn.ProjectSchedule, &sn.DiskPolicy, &storageDirsJSON, &disDisksJSON, &unplugLockedJSON, &sn.DiskGen, &sn.ConcurrencyMode, &sn.MaxConcurrentOverride, &sn.RateLimitMBps, &pausedInt, &sn.PublicAddr, &sn.TokenHash, &sn.CreatedAt)
+`, id).Scan(&sn.ID, &sn.Name, &sn.Role, &sn.OwnerAccountID, &projJSON, &sn.ProjectSchedule, &sn.DiskPolicy, &sn.ActiveDiskWindow, &storageDirsJSON, &disDisksJSON, &unplugLockedJSON, &sn.DiskGen, &sn.ConcurrencyMode, &sn.MaxConcurrentOverride, &sn.RateLimitMBps, &pausedInt, &sn.PublicAddr, &sn.TokenHash, &sn.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -562,6 +575,9 @@ FROM nodes WHERE id = ?
 	if sn.DiskPolicy == "" {
 		sn.DiskPolicy = protocol.DiskPolicyAffinityHash
 	}
+	if sn.ActiveDiskWindow <= 0 {
+		sn.ActiveDiskWindow = 10
+	}
 	if sn.ConcurrencyMode == "" {
 		sn.ConcurrencyMode = protocol.ConcurrencyAuto
 	}
@@ -570,7 +586,7 @@ FROM nodes WHERE id = ?
 
 func (s *Store) ListNodes(ctx context.Context) ([]protocol.NodeRecord, error) {
 	rows, err := s.db.QueryContext(ctx, `
-SELECT id, name, role, projects_json, project_schedule, disk_policy, storage_dirs_json, disabled_disks_json, unplug_locked_disks_json, disk_gen, concurrency_mode, max_concurrent_override, rate_limit_mbps, paused, public_addr, created_at
+SELECT id, name, role, owner_account_id, projects_json, project_schedule, disk_policy, active_disk_window, storage_dirs_json, disabled_disks_json, unplug_locked_disks_json, disk_gen, concurrency_mode, max_concurrent_override, rate_limit_mbps, paused, public_addr, created_at
 FROM nodes ORDER BY role ASC, created_at ASC
 `)
 	if err != nil {
@@ -582,7 +598,7 @@ FROM nodes ORDER BY role ASC, created_at ASC
 		var n protocol.NodeRecord
 		var projJSON, storageDirsJSON, disDisksJSON, unplugLockedJSON string
 		var pausedInt int
-		if err := rows.Scan(&n.ID, &n.Name, &n.Role, &projJSON, &n.ProjectSchedule, &n.DiskPolicy, &storageDirsJSON, &disDisksJSON, &unplugLockedJSON, &n.DiskGen, &n.ConcurrencyMode, &n.MaxConcurrentOverride, &n.RateLimitMBps, &pausedInt, &n.PublicAddr, &n.CreatedAt); err != nil {
+		if err := rows.Scan(&n.ID, &n.Name, &n.Role, &n.OwnerAccountID, &projJSON, &n.ProjectSchedule, &n.DiskPolicy, &n.ActiveDiskWindow, &storageDirsJSON, &disDisksJSON, &unplugLockedJSON, &n.DiskGen, &n.ConcurrencyMode, &n.MaxConcurrentOverride, &n.RateLimitMBps, &pausedInt, &n.PublicAddr, &n.CreatedAt); err != nil {
 			return nil, err
 		}
 		n.Paused = pausedInt != 0
@@ -595,6 +611,9 @@ FROM nodes ORDER BY role ASC, created_at ASC
 		}
 		if n.DiskPolicy == "" {
 			n.DiskPolicy = protocol.DiskPolicyAffinityHash
+		}
+		if n.ActiveDiskWindow <= 0 {
+			n.ActiveDiskWindow = 10
 		}
 		if n.ConcurrencyMode == "" {
 			n.ConcurrencyMode = protocol.ConcurrencyAuto
@@ -609,9 +628,9 @@ func (s *Store) GetNode(ctx context.Context, id string) (*protocol.NodeRecord, e
 	var projJSON, storageDirsJSON, disDisksJSON, unplugLockedJSON string
 	var pausedInt int
 	err := s.db.QueryRowContext(ctx, `
-SELECT id, name, role, projects_json, project_schedule, disk_policy, storage_dirs_json, disabled_disks_json, unplug_locked_disks_json, disk_gen, concurrency_mode, max_concurrent_override, rate_limit_mbps, paused, public_addr, created_at
+SELECT id, name, role, owner_account_id, projects_json, project_schedule, disk_policy, active_disk_window, storage_dirs_json, disabled_disks_json, unplug_locked_disks_json, disk_gen, concurrency_mode, max_concurrent_override, rate_limit_mbps, paused, public_addr, created_at
 FROM nodes WHERE id = ?
-`, id).Scan(&n.ID, &n.Name, &n.Role, &projJSON, &n.ProjectSchedule, &n.DiskPolicy, &storageDirsJSON, &disDisksJSON, &unplugLockedJSON, &n.DiskGen, &n.ConcurrencyMode, &n.MaxConcurrentOverride, &n.RateLimitMBps, &pausedInt, &n.PublicAddr, &n.CreatedAt)
+`, id).Scan(&n.ID, &n.Name, &n.Role, &n.OwnerAccountID, &projJSON, &n.ProjectSchedule, &n.DiskPolicy, &n.ActiveDiskWindow, &storageDirsJSON, &disDisksJSON, &unplugLockedJSON, &n.DiskGen, &n.ConcurrencyMode, &n.MaxConcurrentOverride, &n.RateLimitMBps, &pausedInt, &n.PublicAddr, &n.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -628,6 +647,9 @@ FROM nodes WHERE id = ?
 	}
 	if n.DiskPolicy == "" {
 		n.DiskPolicy = protocol.DiskPolicyAffinityHash
+	}
+	if n.ActiveDiskWindow <= 0 {
+		n.ActiveDiskWindow = 10
 	}
 	if n.ConcurrencyMode == "" {
 		n.ConcurrencyMode = protocol.ConcurrencyAuto
@@ -937,15 +959,18 @@ func (s *Store) QueryIntervalStats(ctx context.Context, q IntervalQuery) (*proto
 
 	where := []string{"bucket_ts >= ?", "bucket_ts < ?"}
 	args := []any{bucketSec, bucketSec, firstSlot, lastSlot + bucketSec}
-	if q.ProjectID != "" {
-		where = append(where, "project_id = ?")
-		args = append(args, q.ProjectID)
-	}
-	if len(q.AllowedProjects) > 0 {
+	if q.ScopeRestricted && len(q.AllowedProjects) == 0 {
+		// Customer with zero assigned projects: default-deny returns empty zeroed buckets cleanly.
+		where = append(where, "1 = 0")
+	} else if len(q.AllowedProjects) > 0 {
 		where = append(where, "project_id IN ("+sqlPlaceholders(len(q.AllowedProjects))+")")
 		for _, pid := range q.AllowedProjects {
 			args = append(args, pid)
 		}
+	}
+	if q.ProjectID != "" {
+		where = append(where, "project_id = ?")
+		args = append(args, q.ProjectID)
 	}
 	if q.ANodeID != "" {
 		where = append(where, "a_node_id = ?")
@@ -1421,6 +1446,82 @@ func (s *Store) DeleteAccount(ctx context.Context, id string) error {
 		return ErrNotFound
 	}
 	return nil
+}
+
+// SetProjectCustomerAccounts atomically updates which customer accounts are authorized to access
+// projectID (adding projectID to accounts in targetAccountIDs and removing it from all others).
+// Returns the list of account IDs whose project permissions changed.
+func (s *Store) SetProjectCustomerAccounts(ctx context.Context, projectID string, targetAccountIDs []string) ([]string, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	targetSet := make(map[string]struct{}, len(targetAccountIDs))
+	for _, id := range targetAccountIDs {
+		id = strings.TrimSpace(id)
+		if id != "" {
+			targetSet[id] = struct{}{}
+		}
+	}
+
+	rows, err := tx.QueryContext(ctx, `SELECT id, projects_json FROM accounts`)
+	if err != nil {
+		return nil, err
+	}
+	type accRow struct {
+		id       string
+		projects []string
+	}
+	var all []accRow
+	for rows.Next() {
+		var id, projJSON string
+		if err := rows.Scan(&id, &projJSON); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		var projs []string
+		_ = json.Unmarshal([]byte(projJSON), &projs)
+		all = append(all, accRow{id: id, projects: projs})
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+
+	var changed []string
+	for _, a := range all {
+		_, want := targetSet[a.id]
+		has := false
+		filtered := make([]string, 0, len(a.projects)+1)
+		for _, p := range a.projects {
+			if p == projectID {
+				has = true
+				if want {
+					filtered = append(filtered, p)
+				}
+			} else {
+				filtered = append(filtered, p)
+			}
+		}
+		if want && !has {
+			filtered = append(filtered, projectID)
+		}
+		if want == has {
+			continue
+		}
+		b, _ := json.Marshal(filtered)
+		if _, err := tx.ExecContext(ctx, `UPDATE accounts SET projects_json = ? WHERE id = ?`, string(b), a.id); err != nil {
+			return nil, err
+		}
+		changed = append(changed, a.id)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return changed, nil
 }
 
 func scanAccountRow(scanner interface{ Scan(dest ...any) error }) (*protocol.AccountRecord, string, error) {

@@ -23,7 +23,8 @@ type Config struct {
 	StorageDirs          []string            `yaml:"storage_dirs,omitempty"`         // managed disk pool roots: any project lands in <storage_dir>/<project_id>/
 	AwaitDiskSelection   bool                `yaml:"await_disk_selection,omitempty"` // if true, activate online & scan host disks, stay standby until Center assigns storage_dirs
 	ProjectSchedule      string              `yaml:"project_schedule,omitempty"`     // default multi-project schedule: "fifo" | "fair" | "random" (overridable by Center)
-	DiskPolicy           string              `yaml:"disk_policy,omitempty"`          // default disk placement: "affinity_hash" | "most_free" | "round_robin" | "first" (overridable by Center)
+	DiskPolicy           string              `yaml:"disk_policy,omitempty"`          // default disk placement: "affinity_hash" | "most_free" | "round_robin" | "first" | "rolling_window" (overridable by Center)
+	ActiveDiskWindow     int                 `yaml:"active_disk_window,omitempty"`   // concurrent active disks for rolling_window policy (default 10; 1..256)
 	ConcurrencyMode      string              `yaml:"concurrency_mode,omitempty"`     // default concurrency control: "auto" (adaptive BBR/AIMD) | "manual" (overridable by Center)
 	OnlyProject          string              `yaml:"only_project,omitempty"`         // optional: strictly restrict this receiver node locally to download ONLY this single project
 	DestDir              string              `yaml:"dest_dir,omitempty"`             // optional shorthand single destination directory when only_project is set
@@ -91,6 +92,12 @@ func (c *Config) ApplyDefaults() {
 	c.DiskPolicy = strings.ToLower(strings.TrimSpace(c.DiskPolicy))
 	if c.DiskPolicy == "" {
 		c.DiskPolicy = protocol.DiskPolicyAffinityHash
+	}
+	if c.ActiveDiskWindow <= 0 {
+		c.ActiveDiskWindow = 10
+	}
+	if c.ActiveDiskWindow > 256 {
+		c.ActiveDiskWindow = 256
 	}
 	c.ConcurrencyMode = strings.ToLower(strings.TrimSpace(c.ConcurrencyMode))
 	if c.ConcurrencyMode == "" {
@@ -187,9 +194,9 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("project_schedule must be 'fifo', 'fair', or 'random' (got %q)", c.ProjectSchedule)
 	}
 	switch c.DiskPolicy {
-	case protocol.DiskPolicyAffinityHash, protocol.DiskPolicyMostFree, protocol.DiskPolicyRoundRobin, protocol.DiskPolicyFirst:
+	case protocol.DiskPolicyAffinityHash, protocol.DiskPolicyMostFree, protocol.DiskPolicyRoundRobin, protocol.DiskPolicyFirst, protocol.DiskPolicyRollingWindow:
 	default:
-		return fmt.Errorf("disk_policy must be 'affinity_hash', 'most_free', 'round_robin', or 'first' (got %q)", c.DiskPolicy)
+		return fmt.Errorf("disk_policy must be 'affinity_hash', 'most_free', 'round_robin', 'first', or 'rolling_window' (got %q)", c.DiskPolicy)
 	}
 	switch c.ConcurrencyMode {
 	case protocol.ConcurrencyAuto, protocol.ConcurrencyManual:

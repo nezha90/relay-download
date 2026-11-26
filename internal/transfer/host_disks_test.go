@@ -47,3 +47,21 @@ func TestIsSafeStorageDir(t *testing.T) {
 		}
 	}
 }
+
+func TestNaturalLess(t *testing.T) {
+	cases := [][2]string{
+		{"/mnt/disk1", "/mnt/disk2"},
+		{"/mnt/disk2", "/mnt/disk10"},
+		{"/mnt/disk9", "/mnt/disk10"},
+		{"/mnt/disk10", "/mnt/disk100"},
+		{"/mnt/sda", "/mnt/sdb"},
+	}
+	for _, tc := range cases {
+		if !NaturalLess(tc[0], tc[1]) {
+			t.Fatalf("expected NaturalLess(%q, %q) == true", tc[0], tc[1])
+		}
+		if NaturalLess(tc[1], tc[0]) {
+			t.Fatalf("expected NaturalLess(%q, %q) == false", tc[1], tc[0])
+		}
+	}
+}

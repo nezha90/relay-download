@@ -61,10 +61,11 @@ const (
 )
 
 const (
-	DiskPolicyAffinityHash = "affinity_hash" // media-stem FNV hash (paired files on same disk) + auto spillover
-	DiskPolicyMostFree     = "most_free"     // always prefer disk with the most available free space
-	DiskPolicyRoundRobin   = "round_robin"   // strict per-file round-robin across enabled disks
-	DiskPolicyFirst        = "first"         // fill first enabled disk in order before spilling to next
+	DiskPolicyAffinityHash  = "affinity_hash"  // media-stem FNV hash (paired files on same disk) + auto spillover
+	DiskPolicyMostFree      = "most_free"      // always prefer disk with the most available free space
+	DiskPolicyRoundRobin    = "round_robin"    // strict per-file round-robin across enabled disks
+	DiskPolicyFirst         = "first"          // fill first enabled disk in order before spilling to next
+	DiskPolicyRollingWindow = "rolling_window" // sliding window of first N non-full disks; full/detached disk auto-rolls to N+1
 )
 
 const (
@@ -85,6 +86,7 @@ type DiskStatus struct {
 	LatchedGen    int64   `json:"latched_gen,omitempty"`    // node disk_gen when UnplugLatched was recorded
 	InFlight      int     `json:"in_flight,omitempty"`      // active writes/reads currently targeting this disk
 	SafeToEject   bool    `json:"safe_to_eject,omitempty"`  // true: disabled, still mounted, and zero in-flight/pending I/O
+	DiskRole      string  `json:"disk_role,omitempty"`      // "active" | "standby" | "full" | "disabled" | "detached" | "locked"
 	StatusReason  string  `json:"status_reason,omitempty"`  // human-readable disk health status
 }
 
@@ -106,7 +108,8 @@ type ReceiverDirective struct {
 	AllowedProjects    []string `json:"allowed_projects,omitempty"`     // explicit ordered allowlist when project_mode=="selected"
 	KnownProjects      []string `json:"known_projects,omitempty"`       // all projects ordered by created_at ASC
 	ProjectSchedule    string   `json:"project_schedule,omitempty"`     // "fifo" | "fair" | "random"
-	DiskPolicy         string   `json:"disk_policy,omitempty"`          // "affinity_hash" | "most_free" | "round_robin" | "first"
+	DiskPolicy         string   `json:"disk_policy,omitempty"`          // "affinity_hash" | "most_free" | "round_robin" | "first" | "rolling_window"
+	ActiveDiskWindow   int      `json:"active_disk_window,omitempty"`   // >0 concurrent active disk window size for rolling_window policy (default 10)
 	StorageDirs        []string `json:"storage_dirs,omitempty"`         // optional Center-managed data disk pool roots (overrides local storage_dirs when non-empty)
 	DisabledDisks      []string `json:"disabled_disks,omitempty"`       // storage root dirs disabled via console or auto-locked on unplug
 	DiskGen            int64    `json:"disk_gen,omitempty"`             // monotonic operator disk-config generation (clears prior unplug latch on re-enable)
@@ -139,9 +142,11 @@ type NodeRecord struct {
 	ID                    string    `json:"id"`
 	Name                  string    `json:"name"`
 	Role                  string    `json:"role"`
+	OwnerAccountID        string    `json:"owner_account_id,omitempty"`
 	Projects              []string  `json:"projects"`
 	ProjectSchedule       string    `json:"project_schedule,omitempty"`
 	DiskPolicy            string    `json:"disk_policy,omitempty"`
+	ActiveDiskWindow      int       `json:"active_disk_window,omitempty"`
 	StorageDirs           []string  `json:"storage_dirs,omitempty"`
 	DisabledDisks         []string  `json:"disabled_disks,omitempty"`
 	UnplugLockedDisks     []string  `json:"unplug_locked_disks,omitempty"`
@@ -210,6 +215,7 @@ type AgentBHeartbeatReq struct {
 	HostDisks             []HostDisk        `json:"host_disks,omitempty"`
 	ProjectSchedule       string            `json:"project_schedule,omitempty"`
 	DiskPolicy            string            `json:"disk_policy,omitempty"`
+	ActiveDiskWindow      int               `json:"active_disk_window,omitempty"`
 	ConcurrencyMode       string            `json:"concurrency_mode,omitempty"`
 	EffectiveConcurrent   int               `json:"effective_concurrent,omitempty"`
 	MaxConcurrentCap      int               `json:"max_concurrent_cap,omitempty"`
@@ -485,9 +491,11 @@ type LiveNodeView struct {
 	ID                    string                `json:"id"`
 	Name                  string                `json:"name"`
 	Role                  string                `json:"role"`
+	OwnerAccountID        string                `json:"owner_account_id,omitempty"`
 	Projects              []string              `json:"projects"`
 	ProjectSchedule       string                `json:"project_schedule,omitempty"`
 	DiskPolicy            string                `json:"disk_policy,omitempty"`
+	ActiveDiskWindow      int                   `json:"active_disk_window,omitempty"`
 	DisabledDisks         []string              `json:"disabled_disks,omitempty"`
 	UnplugLockedDisks     []string              `json:"unplug_locked_disks,omitempty"`
 	DiskGen               int64                 `json:"disk_gen,omitempty"`

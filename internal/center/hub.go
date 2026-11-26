@@ -42,6 +42,7 @@ type LiveBState struct {
 	HostDisks           []protocol.HostDisk
 	ProjectSchedule     string
 	DiskPolicy          string
+	ActiveDiskWindow    int
 	ConcurrencyMode     string
 	EffectiveConcurrent int
 	MaxConcurrentCap    int
@@ -145,6 +146,7 @@ func (h *Hub) UpdateB(hb protocol.AgentBHeartbeatReq) {
 		HostDisks:           append([]protocol.HostDisk(nil), hb.HostDisks...),
 		ProjectSchedule:     hb.ProjectSchedule,
 		DiskPolicy:          hb.DiskPolicy,
+		ActiveDiskWindow:    hb.ActiveDiskWindow,
 		ConcurrencyMode:     hb.ConcurrencyMode,
 		EffectiveConcurrent: hb.EffectiveConcurrent,
 		MaxConcurrentCap:    hb.MaxConcurrentCap,

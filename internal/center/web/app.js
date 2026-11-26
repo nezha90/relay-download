@@ -115,6 +115,63 @@ function esc(s) {
   return String(s ?? '').replace(/[&<>"']/g, m => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[m]));
 }
 
+function generateShortId(prefix) {
+  const alphabet = 'abcdefghijklmnopqrstuvwxyz0123456789';
+  const bytes = new Uint8Array(6);
+  if (window.crypto && window.crypto.getRandomValues) {
+    window.crypto.getRandomValues(bytes);
+  } else {
+    for (let i = 0; i < bytes.length; i++) bytes[i] = Math.floor(Math.random() * 256);
+  }
+  let suffix = '';
+  for (let i = 0; i < bytes.length; i++) {
+    suffix += alphabet[bytes[i] % alphabet.length];
+  }
+  return `${prefix}-${suffix}`;
+}
+
+function shortId(id) {
+  const s = String(id || '');
+  return s.length > 14 ? `${s.slice(0, 8)}…` : s;
+}
+
+function getProjectMeta(projectId) {
+  const pid = String(projectId || '');
+  const found = cachedProjects.find(ps => ps.project && ps.project.id === pid)?.project;
+  const name = (found && found.name) || pid;
+  const desc = (found && found.description) || '';
+  return { id: pid, name, desc, shortId: shortId(pid), hasDistinctName: name !== pid };
+}
+
+function formatProjectOption(p) {
+  if (!p) return '';
+  if (p.name && p.name !== p.id) {
+    const descPart = p.description ? ` · ${p.description.slice(0, 24)}` : '';
+    return `${p.name} (${shortId(p.id)})${descPart}`;
+  }
+  return p.id;
+}
+
+function getAccountName(accId) {
+  if (!accId) return '';
+  const acc = cachedAccounts.find(a => a.id === accId);
+  return acc ? (acc.name || acc.id) : accId;
+}
+
+function populateOwnerAccountSelect(selectEl, currentOwner = '') {
+  if (!selectEl) return;
+  const opts = ['<option value="">仅管理员托管（不归属客户）</option>'];
+  for (const a of cachedAccounts) {
+    const st = a.enabled === false ? ' [已停用]' : '';
+    opts.push(`<option value="${esc(a.id)}">${esc(a.name || a.id)} (${esc(a.id)})${st}</option>`);
+  }
+  if (currentOwner && !cachedAccounts.some(a => a.id === currentOwner)) {
+    opts.push(`<option value="${esc(currentOwner)}">${esc(currentOwner)}</option>`);
+  }
+  selectEl.innerHTML = opts.join('');
+  selectEl.value = currentOwner || '';
+}
+
 async function copyText(text, okMsg = '已复制到剪贴板') {
   if (!text) return false;
   try {
@@ -200,7 +257,8 @@ function isCustomer() {
 }
 
 function isScopedCustomer() {
-  return isCustomer() && Array.isArray(authProjects) && authProjects.length > 0;
+  // All customer accounts are strictly default-deny (no wildcard all-projects access).
+  return isCustomer();
 }
 
 function updateAuthControls() {
@@ -212,9 +270,10 @@ function updateAuthControls() {
     if (isCustomer()) {
       const label = authAccountName || authAccountID || '客户账号';
       roleBadge.textContent = `客户 · ${label}`;
-      roleBadge.title = isScopedCustomer()
-        ? `客户受限账号（仅限接收节点 · 授权项目: ${authProjects.join(', ')}）`
-        : '客户受限账号（仅限运维接收节点，不可访问分发节点）';
+      const projNames = (authProjects || []).map(pid => getProjectMeta(pid).name);
+      roleBadge.title = projNames.length
+        ? `客户受限账号（仅限自有接收节点 · 授权项目: ${projNames.join(', ')}）`
+        : '客户受限账号（暂未分配项目，请联系管理员授权）';
       roleBadge.classList.remove('hidden');
     } else {
       roleBadge.classList.add('hidden');
@@ -283,7 +342,7 @@ function populateProjectSelect(selectEl, currentValue = '', includeCustomOption 
   const opts = [];
   for (const ps of cachedProjects) {
     const p = ps.project;
-    opts.push(`<option value="${esc(p.id)}">${esc(p.name)} (${esc(p.id)})</option>`);
+    opts.push(`<option value="${esc(p.id)}">${esc(formatProjectOption(p))}</option>`);
   }
   if (currentValue && !cachedProjects.some(ps => ps.project.id === currentValue)) {
     opts.unshift(`<option value="${esc(currentValue)}">${esc(currentValue)}</option>`);
@@ -292,7 +351,7 @@ function populateProjectSelect(selectEl, currentValue = '', includeCustomOption 
     opts.push('<option value="__custom__">手动输入项目 ID...</option>');
   }
   if (!opts.length) {
-    opts.push('<option value="__custom__">暂无项目，请手动输入项目 ID</option>');
+    opts.push('<option value="">暂无已授权项目（请联系管理员分配）</option>');
   }
   selectEl.innerHTML = opts.join('');
   if (currentValue) {
@@ -389,10 +448,10 @@ async function refreshCurveOnly() {
 function syncProjectFilterOptions(projects) {
   const sel = document.getElementById('curve-project-filter');
   if (!sel) return;
-  const opts = ['<option value="">全部项目</option>'];
+  const opts = ['<option value="">全部可见项目</option>'];
   for (const ps of projects) {
     const p = ps.project;
-    opts.push(`<option value="${esc(p.id)}">${esc(p.name)} (${esc(p.id)})</option>`);
+    opts.push(`<option value="${esc(p.id)}">${esc(formatProjectOption(p))}</option>`);
   }
   sel.innerHTML = opts.join('');
   if (selectedProjectFilter && projects.some(ps => ps.project.id === selectedProjectFilter)) {
@@ -547,7 +606,8 @@ function renderSpeedCurve(data) {
   const titleEl = document.getElementById('curve-title');
   const subEl = document.getElementById('curve-subtitle');
   if (titleEl) {
-    titleEl.textContent = `${winLbl}平均速度曲线${selectedProjectFilter ? ` · ${selectedProjectFilter}` : ''}`;
+    const projLbl = selectedProjectFilter ? getProjectMeta(selectedProjectFilter).name : '';
+    titleEl.textContent = `${winLbl}平均速度曲线${projLbl ? ` · ${projLbl}` : ''}`;
   }
   if (subEl) {
     const gran = bucketMinutes >= 60 ? `${bucketMinutes / 60} 小时` : `${bucketMinutes} 分钟`;
@@ -810,9 +870,10 @@ function syncProjectGuideSelect(projects) {
   const sel = document.getElementById('guide-p-project-select');
   const inp = document.getElementById('guide-p-project-input');
   if (!sel || !inp) return;
-  const ids = (projects || []).map(ps => ps.project?.id).filter(Boolean);
+  const list = (projects || []).map(ps => ps.project).filter(Boolean);
+  const ids = list.map(p => p.id);
   const prev = sel.value;
-  const opts = ids.map(id => `<option value="${esc(id)}">${esc(id)}</option>`);
+  const opts = list.map(p => `<option value="${esc(p.id)}">${esc(formatProjectOption(p))}</option>`);
   opts.push('<option value="__custom__">自定义新项目 ID...</option>');
   sel.innerHTML = opts.join('');
   if (prev && (ids.includes(prev) || prev === '__custom__')) {
@@ -953,8 +1014,8 @@ function renderProjects(projects, winHours) {
   const cust = isCustomer();
   if (!projects.length) {
     el.innerHTML = cust
-      ? '<div class="empty">当前账号暂无已授权的项目</div>'
-      : '<div class="empty">还没有项目，点击右上角「新建项目」开始。</div>';
+      ? '<div class="empty">当前账号暂未分配可见项目（默认全不可见），请联系管理员在控制台为您分配项目后即可查看数据并接入接收节点。</div>'
+      : '<div class="empty">还没有项目，点击右上角「+ 新建项目」或通过 HTTP PUT 推送自动发现创建。</div>';
     return;
   }
   el.innerHTML = projects.map(ps => {
@@ -975,8 +1036,19 @@ function renderProjects(projects, winHours) {
     if (p.max_total_concurrent > 0) quotaParts.push(`总并发 ≤ ${p.max_total_concurrent}`);
     if (p.max_total_rate_mbps > 0) quotaParts.push(`总限速 ${p.max_total_rate_mbps} MB/s`);
     const quotaBadge = quotaParts.length ? `<span class="badge alarm">${esc(quotaParts.join(' · '))}</span>` : '';
+
+    const assignedAccs = cust ? [] : (cachedAccounts || []).filter(a => Array.isArray(a.projects) && a.projects.includes(p.id));
+    const ownerRowHtml = cust ? '' : `
+      <div style="margin-top:6px;display:flex;gap:5px;flex-wrap:wrap;align-items:center">
+        <span class="muted" style="font-size:12px">可见客户:</span>
+        ${assignedAccs.length
+          ? assignedAccs.map(a => `<span class="badge online" title="${esc(a.id)}">${esc(a.name || a.id)}</span>`).join('')
+          : '<span class="badge alarm">未分配客户（仅管理员可见）</span>'}
+      </div>
+    `;
     const actionsHtml = cust ? '' : `
-          <div style="display:flex;gap:6px">
+          <div style="display:flex;gap:6px;flex-wrap:wrap">
+            <button class="btn sm primary" data-action="assign-project-accounts" data-id="${esc(p.id)}">分配客户</button>
             <button class="btn sm" data-action="quick-integrate-project" data-id="${esc(p.id)}">HTTP 接入</button>
             <button class="btn sm" data-action="edit-project" data-id="${esc(p.id)}">编辑策略</button>
             <button class="btn sm danger" data-action="delete-project" data-id="${esc(p.id)}">删除</button>
@@ -995,8 +1067,13 @@ function renderProjects(projects, winHours) {
       <div class="card">
         <div class="card-head">
           <div>
-            <h3>${esc(p.name)} <span class="mono muted">(${esc(p.id)})</span> ${autoBadge} ${affBadge} ${quotaBadge}</h3>
-            <div class="muted">${esc(p.description || '无描述')} · 策略: ${esc(p.conflict_policy)} · 租约: ${p.lease_ttl_sec}s</div>
+            <h3>${esc(p.name || p.id)} ${autoBadge} ${affBadge} ${quotaBadge}</h3>
+            <div class="muted" style="margin-top:2px">
+              ${esc(p.description || '无备注')} · 内部 ID: <span class="mono" title="${esc(p.id)}">${esc(p.id)}</span>
+              <button type="button" class="btn sm ghost" style="padding:1px 6px;font-size:11px" data-copy-text="${esc(p.id)}">复制ID</button>
+            </div>
+            <div class="muted" style="margin-top:2px">冲突策略: ${esc(p.conflict_policy)} · 租约: ${p.lease_ttl_sec}s</div>
+            ${ownerRowHtml}
           </div>
           ${actionsHtml}
         </div>
@@ -1051,8 +1128,9 @@ function scheduleLabel(sched) {
   }
 }
 
-function diskPolicyLabel(pol) {
+function diskPolicyLabel(pol, activeWin = 10) {
   switch (pol) {
+    case 'rolling_window': return `分批滚动 (${activeWin || 10}盘并发)`;
     case 'most_free': return '最大余量优先';
     case 'round_robin': return '逐文件轮询';
     case 'first': return '首盘写满再切';
@@ -1086,29 +1164,45 @@ function renderAdaptiveBadge(n) {
 
 function renderProjectScope(projects, schedule, node) {
   const adaptHtml = node ? renderAdaptiveBadge(node) : '';
+  const ownerBadge = (!isCustomer() && node && node.owner_account_id)
+    ? `<span class="badge accent" title="归属客户ID: ${esc(node.owner_account_id)}">客户: ${esc(getAccountName(node.owner_account_id))}</span>`
+    : '';
   if (!projects || !projects.length) {
     return `
       <div style="display:flex;gap:4px;flex-wrap:wrap">
         <span class="badge online">全部项目</span>
         <span class="badge">${esc(scheduleLabel(schedule))}</span>
+        ${ownerBadge}
       </div>
       <div class="muted" style="margin-top:3px">自动同步新建项目</div>
       ${adaptHtml}
     `;
   }
   if (projects.length === 1) {
+    const meta = getProjectMeta(projects[0]);
     return `
-      <div><span class="badge online">单项目专享</span></div>
-      <div class="mono muted" style="margin-top:3px">${esc(projects[0])}</div>
+      <div style="display:flex;gap:4px;flex-wrap:wrap">
+        <span class="badge online">单项目专享</span>
+        ${ownerBadge}
+      </div>
+      <div style="margin-top:3px" title="ID: ${esc(meta.id)}${meta.desc ? ' · ' + esc(meta.desc) : ''}">
+        <strong>${esc(meta.name)}</strong>
+        ${meta.hasDistinctName ? `<span class="mono muted" style="font-size:11px;margin-left:4px">${esc(meta.shortId)}</span>` : ''}
+      </div>
       ${adaptHtml}
     `;
   }
+  const namesHtml = projects.map(pid => {
+    const meta = getProjectMeta(pid);
+    return `<span class="badge" title="ID: ${esc(meta.id)}${meta.desc ? ' · ' + esc(meta.desc) : ''}">${esc(meta.name)}</span>`;
+  }).join('');
   return `
     <div style="display:flex;gap:4px;flex-wrap:wrap">
       <span class="badge">多项目 (${projects.length})</span>
       <span class="badge">${esc(scheduleLabel(schedule))}</span>
+      ${ownerBadge}
     </div>
-    <div class="mono muted" style="margin-top:3px">${esc(projects.join(', '))}</div>
+    <div style="margin-top:4px;display:flex;gap:4px;flex-wrap:wrap">${namesHtml}</div>
     ${adaptHtml}
   `;
 }
@@ -1192,11 +1286,24 @@ function renderDiskMiniItem(d, disabledSet, lockedSet, watermarkPct) {
       <div class="bar-wrap"><div class="bar-fill" style="width:${Math.min(100, pct).toFixed(1)}%"></div></div>
       <div class="muted">${esc(d.status_reason || '已停用')} · 剩 ${fmtBytes(d.free_bytes)} / ${fmtBytes(d.total_bytes)}</div>
     `;
+  } else if (d.disk_role === 'full' || d.low_space) {
+    barCls = 'red';
+    stTag = '<span class="badge full-disk">已写满 · 可停用拔盘</span>';
+    detailHtml = `
+      <div class="bar-wrap"><div class="bar-fill red" style="width:${Math.min(100, pct).toFixed(1)}%"></div></div>
+      <div class="muted">${esc(d.status_reason || '触达强制安全水位')} · 剩 ${fmtBytes(d.free_bytes)} (${pct.toFixed(1)}%)</div>
+    `;
+  } else if (d.disk_role === 'standby') {
+    barCls = '';
+    stTag = '<span class="badge standby">候补排队</span>';
+    detailHtml = `
+      <div class="bar-wrap"><div class="bar-fill" style="width:${Math.min(100, pct).toFixed(1)}%"></div></div>
+      <div class="muted">剩 ${fmtBytes(d.free_bytes)} / ${fmtBytes(d.total_bytes)} (${pct.toFixed(1)}%) · 前序盘满自动顶上</div>
+    `;
   } else {
-    barCls = d.low_space || pct >= watermarkPct ? 'red' : 'green';
-    stTag = d.low_space
-      ? '<span class="badge alarm">触达水位</span>'
-      : `<span class="badge online">启用${(d.in_flight || 0) > 0 ? ` · 在途 ${d.in_flight}` : ''}</span>`;
+    barCls = pct >= watermarkPct ? 'red' : 'green';
+    const actLbl = d.status_reason && d.status_reason.startsWith('写入窗口') ? d.status_reason : '启用';
+    stTag = `<span class="badge online">${esc(actLbl)}${(d.in_flight || 0) > 0 ? ` · 在途 ${d.in_flight}` : ''}</span>`;
     detailHtml = `
       <div class="bar-wrap"><div class="bar-fill ${barCls}" style="width:${Math.min(100, pct).toFixed(1)}%"></div></div>
       <div class="muted">剩 ${fmtBytes(d.free_bytes)} / ${fmtBytes(d.total_bytes)} (${pct.toFixed(1)}%)</div>
@@ -1221,7 +1328,7 @@ function renderReceiverDisks(n) {
       <div class="muted" style="margin-top:4px">${foundCnt > 0 ? `已扫描到 ${foundCnt} 块物理盘，请点右侧「选择数据盘并激活」` : '请点右侧「选择数据盘并激活」'}</div>
     `;
   }
-  const polBadge = `<span class="badge">${esc(diskPolicyLabel(n.disk_policy))}</span>`;
+  const polBadge = `<span class="badge">${esc(diskPolicyLabel(n.disk_policy, n.active_disk_window))}</span>`;
   const disks = n.disks || [];
   if (!disks.length) {
     return `
@@ -1231,14 +1338,40 @@ function renderReceiverDisks(n) {
   }
   const disabledSet = new Set(n.disabled_disks || []);
   const lockedSet = new Set(n.unplug_locked_disks || []);
-  const activeCnt = disks.filter(d => d.enabled !== false && !disabledSet.has(d.path) && !d.detached && !d.unplug_latched && !lockedSet.has(d.path)).length;
-  const items = disks.map(d => renderDiskMiniItem(d, disabledSet, lockedSet, 90)).join('');
+  let activeCnt = 0, standbyCnt = 0, fullCnt = 0, detachedCnt = 0;
+  for (const d of disks) {
+    if (d.detached) detachedCnt++;
+    else if (d.disk_role === 'full' || d.low_space) fullCnt++;
+    else if (d.disk_role === 'standby') standbyCnt++;
+    else if (d.enabled !== false && !disabledSet.has(d.path) && !d.unplug_latched && !lockedSet.has(d.path)) activeCnt++;
+  }
+  // For ultra-high-density servers (e.g. 20~100+ disks), show a compact role summary strip
+  // and prioritize alert/full/active disks in the table cell so rows stay clean and scannable.
+  let displayDisks = disks;
+  let hiddenCount = 0;
+  if (disks.length > 6) {
+    const priority = disks.filter(d => d.detached || d.unplug_latched || lockedSet.has(d.path) || d.safe_to_eject || d.disk_role === 'full' || d.low_space || d.disk_role === 'active');
+    displayDisks = (priority.length ? priority : disks).slice(0, 6);
+    hiddenCount = disks.length - displayDisks.length;
+  }
+  const items = displayDisks.map(d => renderDiskMiniItem(d, disabledSet, lockedSet, 90)).join('');
+  const summaryHtml = disks.length > 6 ? `
+    <div class="disk-summary-strip">
+      <span class="badge online">写入 ${activeCnt}</span>
+      ${standbyCnt > 0 ? `<span class="badge standby">候补 ${standbyCnt}</span>` : ''}
+      ${fullCnt > 0 ? `<span class="badge full-disk">已满 ${fullCnt}</span>` : ''}
+      ${detachedCnt > 0 ? `<span class="badge detached">拔出 ${detachedCnt}</span>` : ''}
+      <span class="muted" style="font-size:11px">共 ${disks.length} 块盘</span>
+    </div>
+  ` : '';
   return `
     <div style="margin-bottom:5px;display:flex;gap:4px;flex-wrap:wrap;align-items:center">
       ${polBadge}
       ${activeCnt > 1 ? `<span class="badge accent">${activeCnt} 盘并发</span>` : ''}
     </div>
+    ${summaryHtml}
     <div class="disk-mini-list">${items}</div>
+    ${hiddenCount > 0 ? `<div class="muted" style="margin-top:4px;font-size:11px">+ 其余 ${hiddenCount} 块候补/已配置盘（点「配置项目与磁盘」查看全部）</div>` : ''}
   `;
 }
 
@@ -1454,9 +1587,13 @@ function renderAccounts(list) {
   const tbody = document.getElementById('accounts-tbody');
   if (!tbody) return;
   tbody.innerHTML = list.length ? list.map(a => {
-    const scopeHtml = (!a.projects || !a.projects.length)
-      ? '<span class="badge online">全部项目</span> <span class="muted">仅限接收节点</span>'
-      : `<span class="badge accent">指定项目 (${a.projects.length})</span><div class="mono muted" style="margin-top:3px">${esc(a.projects.join(', '))}</div>`;
+    const projs = a.projects || [];
+    const scopeHtml = !projs.length
+      ? '<span class="badge alarm">未分配项目</span> <span class="muted">默认全不可见</span>'
+      : `<div style="display:flex;gap:4px;flex-wrap:wrap">${projs.map(pid => {
+          const meta = getProjectMeta(pid);
+          return `<span class="badge accent" title="内部 ID: ${esc(meta.id)}${meta.desc ? ' · ' + esc(meta.desc) : ''}">${esc(meta.name)}${meta.hasDistinctName ? ` <span style="opacity:0.7;font-size:10px">(${esc(meta.shortId)})</span>` : ''}</span>`;
+        }).join('')}</div>`;
     const lastUsed = a.last_used_at ? fmtTimeShort(a.last_used_at, true) : '未使用';
     const created = a.created_at ? fmtTimeShort(a.created_at, true) : '-';
     return `
@@ -1468,7 +1605,7 @@ function renderAccounts(list) {
         <td class="muted">${esc(created)}</td>
         <td>
           <div class="btn-row">
-            <button class="btn sm" data-action="edit-account" data-id="${esc(a.id)}">编辑</button>
+            <button class="btn sm" data-action="edit-account" data-id="${esc(a.id)}">编辑 / 分配项目</button>
             <button class="btn sm primary" data-action="rotate-account" data-id="${esc(a.id)}">重置密钥</button>
             <button class="btn sm danger" data-action="delete-account" data-id="${esc(a.id)}">删除</button>
           </div>
@@ -1478,28 +1615,26 @@ function renderAccounts(list) {
   }).join('') : '<tr><td colspan="6" class="empty">暂无客户账号，点击右上角「+ 新建客户账号」创建</td></tr>';
 }
 
-function syncAccountScopeUI() {
-  const form = document.getElementById('account-form');
-  if (!form) return;
-  const scope = form.elements.account_scope.value || 'all';
-  document.getElementById('account-projects-wrap').classList.toggle('hidden', scope !== 'selected');
-}
-
 function renderAccountProjectChecks(selectedList) {
   const wrap = document.getElementById('account-project-checks');
   if (!wrap) return;
   const selSet = new Set(selectedList || []);
   if (!cachedProjects.length) {
-    wrap.innerHTML = '<div class="muted">暂无已有项目，可在下方手动输入项目 ID</div>';
+    wrap.innerHTML = '<div class="muted">暂无已有项目，可先在「项目视图」新建项目或下方手动输入项目 ID</div>';
     return;
   }
   wrap.innerHTML = cachedProjects.map(ps => {
     const p = ps.project;
     const chk = selSet.has(p.id) ? 'checked' : '';
+    const subParts = [shortId(p.id)];
+    if (p.description) subParts.push(p.description);
     return `
-      <label class="proj-check-item">
+      <label class="proj-check-card" title="内部 ID: ${esc(p.id)}">
         <input type="checkbox" class="account-proj-chk" value="${esc(p.id)}" ${chk} />
-        <span class="mono">${esc(p.id)}</span>
+        <span class="proj-check-meta">
+          <span class="proj-check-title">${esc(p.name || p.id)}</span>
+          <span class="proj-check-sub mono">${esc(subParts.join(' · '))}</span>
+        </span>
       </label>
     `;
   }).join('');
@@ -1511,6 +1646,7 @@ function openAccountModal(accountId = '') {
   const existing = accountId ? cachedAccounts.find(a => a.id === accountId) : null;
   form.elements.mode.value = existing ? 'edit' : 'create';
   form.elements.id.readOnly = !!existing;
+  document.getElementById('btn-gen-account-id')?.classList.toggle('hidden', !!existing);
   document.getElementById('account-modal-title').textContent = existing ? `编辑客户账号: ${existing.name || existing.id}` : '新建客户账号';
   document.getElementById('account-enabled-wrap').classList.toggle('hidden', !existing);
   if (existing) {
@@ -1518,17 +1654,42 @@ function openAccountModal(accountId = '') {
     form.elements.name.value = existing.name || existing.id;
     form.elements.enabled.checked = existing.enabled !== false;
     const projs = existing.projects || [];
-    form.elements.account_scope.value = projs.length ? 'selected' : 'all';
     form.elements.projects.value = projs.join(',');
     renderAccountProjectChecks(projs);
   } else {
-    form.elements.account_scope.value = 'all';
     form.elements.projects.value = '';
     form.elements.enabled.checked = true;
     renderAccountProjectChecks([]);
   }
-  syncAccountScopeUI();
   openModal('account-modal');
+}
+
+function openAssignProjectModal(projectId) {
+  const form = document.getElementById('assign-project-form');
+  const wrap = document.getElementById('assign-project-accounts-list');
+  if (!form || !wrap) return;
+  const meta = getProjectMeta(projectId);
+  form.elements.project_id.value = projectId;
+  document.getElementById('assign-project-title').textContent = `分配项目给客户: ${meta.name}`;
+  document.getElementById('assign-project-sub').textContent = `内部 ID: ${meta.id}${meta.desc ? ' · ' + meta.desc : ''}（仅勾选客户可见并下载）`;
+  if (!cachedAccounts.length) {
+    wrap.innerHTML = '<div class="empty" style="padding:14px">暂无客户账号，请先在「客户账号」标签页新建客户。</div>';
+  } else {
+    wrap.innerHTML = cachedAccounts.map(a => {
+      const checked = Array.isArray(a.projects) && a.projects.includes(projectId);
+      const st = a.enabled === false ? ' · 已停用' : '';
+      return `
+        <label class="proj-check-card">
+          <input type="checkbox" class="assign-acc-chk" value="${esc(a.id)}" ${checked ? 'checked' : ''} />
+          <span class="proj-check-meta">
+            <span class="proj-check-title">${esc(a.name || a.id)}</span>
+            <span class="proj-check-sub mono">${esc(a.id)}${st}</span>
+          </span>
+        </label>
+      `;
+    }).join('');
+  }
+  openModal('assign-project-modal');
 }
 
 function showAccountTokenModal(account, rawToken, titleText) {
@@ -1817,13 +1978,36 @@ function renderEditProjectChecks(selectedList) {
   wrap.innerHTML = cachedProjects.map(ps => {
     const p = ps.project;
     const chk = selSet.has(p.id) ? 'checked' : '';
+    const subParts = [shortId(p.id)];
+    if (p.description) subParts.push(p.description);
     return `
-      <label class="proj-check-item">
+      <label class="proj-check-card" title="内部 ID: ${esc(p.id)}">
         <input type="checkbox" class="edit-proj-chk" value="${esc(p.id)}" ${chk} />
-        <span class="mono">${esc(p.id)}</span>
+        <span class="proj-check-meta">
+          <span class="proj-check-title">${esc(p.name || p.id)}</span>
+          <span class="proj-check-sub mono">${esc(subParts.join(' · '))}</span>
+        </span>
       </label>
     `;
   }).join('');
+}
+
+function syncDiskPolicyWindowUI(selectId, wrapId) {
+  const sel = document.getElementById(selectId);
+  const wrap = document.getElementById(wrapId);
+  if (sel && wrap) {
+    wrap.classList.toggle('hidden', sel.value !== 'rolling_window');
+  }
+}
+
+function updateDiskPickerCounter(listEl) {
+  if (!listEl) return;
+  const counterId = listEl.id === 'edit-disks-list' ? 'edit-b-disk-counter' : 'edit-a-disk-counter';
+  const el = document.getElementById(counterId);
+  if (!el) return;
+  const all = Array.from(listEl.querySelectorAll('input.edit-disk-chk'));
+  const enabled = all.filter(c => c.checked && c.closest('[data-disk-row]')?.dataset.removed !== '1').length;
+  el.textContent = all.length ? `已勾选 ${enabled} / 共 ${all.length} 块` : '';
 }
 
 function matchConfiguredDirForHostDisk(hd, configuredList, allHostDisks) {
@@ -1893,10 +2077,18 @@ function renderHostDiskPicker(wrap, node, watermarkPct) {
           subText = (dStat && dStat.status_reason) || '已停用 · 不再写入新文件';
         }
       } else if (checked) {
-        if (dStat && (dStat.in_flight || 0) > 0) {
-          stateBadge = `<span class="badge online">启用中 · 在途 ${dStat.in_flight}</span>`;
+        if (dStat && dStat.disk_role === 'full') {
+          stateBadge = '<span class="badge full-disk">已写满水位 · 可停用拔盘</span>';
+        } else if (dStat && dStat.disk_role === 'standby') {
+          stateBadge = '<span class="badge standby">候补排队</span>';
+        } else if (dStat && (dStat.in_flight || 0) > 0) {
+          stateBadge = `<span class="badge online">${esc(dStat.status_reason || '启用中')} · 在途 ${dStat.in_flight}</span>`;
+        } else if (dStat && dStat.status_reason && dStat.status_reason.startsWith('写入窗口')) {
+          stateBadge = `<span class="badge online">${esc(dStat.status_reason)}</span>`;
         }
-        subText = '启用中 · 允许并发写入（关闭开关可进入安全排空准备拔盘）';
+        subText = (dStat && dStat.disk_role === 'standby')
+          ? '候补排队中 · 前序盘写满后自动顶上（关闭开关可移出或停用）'
+          : '启用中 · 允许并发写入（关闭开关可进入安全排空准备拔盘）';
       } else {
         if (!hd.is_system && !node.awaiting_disk) {
           stateBadge = '<span class="badge new-disk">✨ 新发现物理盘</span>';
@@ -1908,10 +2100,11 @@ function renderHostDiskPicker(wrap, node, watermarkPct) {
         ? `<button type="button" class="btn sm ghost" data-toggle-remove-disk="1">移出磁盘池</button>`
         : '';
 
+      const searchHaystack = `${hd.mount_point} ${hd.device} ${hd.fs_type} ${targetPath}`.toLowerCase();
       return `
-        <div class="disk-toggle-row${rowCls}" data-disk-row="1">
+        <div class="disk-toggle-row${rowCls}" data-disk-row="1" data-search="${esc(searchHaystack)}">
           <label class="disk-toggle-left" style="cursor:pointer;flex:1">
-            <input type="checkbox" class="edit-disk-chk" data-source="host" data-configured="${isConfigured ? '1' : '0'}" data-dir="${esc(targetPath)}" value="${esc(targetPath)}" ${checked ? 'checked' : ''} />
+            <input type="checkbox" class="edit-disk-chk" data-source="host" data-is-system="${hd.is_system ? '1' : '0'}" data-writable="${hd.writable === false ? '0' : '1'}" data-configured="${isConfigured ? '1' : '0'}" data-dir="${esc(targetPath)}" value="${esc(targetPath)}" ${checked ? 'checked' : ''} />
             <div>
               <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
                 <strong class="mono">${esc(hd.mount_point)}</strong>
@@ -1959,6 +2152,7 @@ function renderHostDiskPicker(wrap, node, watermarkPct) {
       });
 
     wrap.innerHTML = [...missingRows, ...hostRows].join('');
+    updateDiskPickerCounter(wrap);
     return;
   }
 
@@ -2123,8 +2317,17 @@ function openEditNodeProjectsModal(nodeId) {
   form.reset();
   form.elements.node_id.value = node.id;
   form.elements.name.value = node.name || node.id;
+  if (!isCustomer()) {
+    populateOwnerAccountSelect(document.getElementById('edit-node-owner-select'), node.owner_account_id || '');
+  }
   form.elements.project_schedule.value = node.project_schedule || 'fifo';
   form.elements.disk_policy.value = node.disk_policy || 'affinity_hash';
+  if (form.elements.active_disk_window) {
+    form.elements.active_disk_window.value = node.active_disk_window || 10;
+  }
+  syncDiskPolicyWindowUI('edit-disk-policy-select', 'edit-disk-window-wrap');
+  const bSearch = document.getElementById('edit-b-disk-search');
+  if (bSearch) bSearch.value = '';
   form.elements.concurrency_mode.value = node.concurrency_mode || 'auto';
   form.elements.max_concurrent_override.value = node.max_concurrent_override || 0;
   form.elements.rate_limit_mbps.value = node.rate_limit_mbps || 0;
@@ -2309,10 +2512,53 @@ function setupEvents() {
       document.getElementById(trigBtn.dataset.triggerClick)?.click();
       return;
     }
+    const genIdBtn = e.target.closest('button[data-gen-id]');
+    if (genIdBtn) {
+      let pfx = genIdBtn.dataset.genId || 'id';
+      if (pfx === 'node') {
+        const roleVal = document.querySelector('#create-node-form input[name="role"]')?.value;
+        pfx = roleVal === 'agent_a' ? 'edge' : 'nas';
+      }
+      const target = genIdBtn.dataset.genTarget ? document.querySelector(genIdBtn.dataset.genTarget) : null;
+      if (target && !target.readOnly) {
+        target.value = generateShortId(pfx);
+        target.dispatchEvent(new Event('input', { bubbles: true }));
+      }
+      return;
+    }
+    const selAllBtn = e.target.closest('button[data-disk-select-all]');
+    if (selAllBtn) {
+      const listEl = document.getElementById(selAllBtn.dataset.diskSelectAll);
+      if (listEl) {
+        listEl.querySelectorAll('input.edit-disk-chk[data-source="host"]').forEach(chk => {
+          if (chk.disabled) return;
+          if (chk.dataset.isSystem !== '1' && chk.dataset.writable !== '0') {
+            chk.checked = true;
+            chk.dispatchEvent(new Event('change', { bubbles: true }));
+          }
+        });
+        updateDiskPickerCounter(listEl);
+      }
+      return;
+    }
+    const clearAllBtn = e.target.closest('button[data-disk-clear-all]');
+    if (clearAllBtn) {
+      const listEl = document.getElementById(clearAllBtn.dataset.diskClearAll);
+      if (listEl) {
+        listEl.querySelectorAll('input.edit-disk-chk').forEach(chk => {
+          if (chk.disabled) return;
+          chk.checked = false;
+          chk.dispatchEvent(new Event('change', { bubbles: true }));
+        });
+        updateDiskPickerCounter(listEl);
+      }
+      return;
+    }
     const btn = e.target.closest('button[data-action]');
     if (!btn) return;
     const id = btn.dataset.id || '';
     switch (btn.dataset.action) {
+      case 'assign-project-accounts': openAssignProjectModal(id); break;
       case 'quick-integrate-project': openProjectQuickGuide(id); break;
       case 'edit-project': openProjectModal(id); break;
       case 'delete-project': deleteProject(id); break;
@@ -2431,8 +2677,9 @@ function setupEvents() {
     const form = document.getElementById('create-project-form');
     form.reset();
     const existing = projectId ? cachedProjects.find(ps => ps.project.id === projectId)?.project : null;
-    document.getElementById('project-modal-title').textContent = existing ? `编辑项目策略: ${existing.id}` : '新建项目';
+    document.getElementById('project-modal-title').textContent = existing ? `编辑项目策略: ${existing.name || existing.id}` : '新建项目';
     form.elements.id.readOnly = !!existing;
+    document.getElementById('btn-gen-project-id')?.classList.toggle('hidden', !!existing);
     if (existing) {
       form.elements.id.value = existing.id;
       form.elements.name.value = existing.name || existing.id;
@@ -2483,6 +2730,7 @@ function setupEvents() {
             : '未启用 · 不会写入该磁盘');
         sub.innerHTML = `目录: <span class="mono">${esc(dir)}</span> · ${esc(msg)}`;
       }
+      updateDiskPickerCounter(el);
     });
     el.addEventListener('click', (e) => {
       const btn = e.target.closest('button[data-toggle-remove-disk]');
@@ -2493,10 +2741,30 @@ function setupEvents() {
       row.dataset.removed = nowRemoved ? '1' : '0';
       row.classList.toggle('is-removed', nowRemoved);
       btn.textContent = nowRemoved ? '撤销移出' : '移出磁盘池';
+      updateDiskPickerCounter(el);
     });
   };
   bindDiskPickerEvents('edit-disks-list');
   bindDiskPickerEvents('edit-a-disks-list');
+
+  document.querySelectorAll('input[data-disk-filter]').forEach(inp => {
+    inp.addEventListener('input', () => {
+      const listEl = document.getElementById(inp.dataset.diskFilter);
+      if (!listEl) return;
+      const q = (inp.value || '').trim().toLowerCase();
+      listEl.querySelectorAll('[data-disk-row]').forEach(row => {
+        const hay = (row.dataset.search || row.textContent || '').toLowerCase();
+        row.classList.toggle('hidden', !!q && !hay.includes(q));
+      });
+    });
+  });
+
+  document.getElementById('create-disk-policy-select')?.addEventListener('change', () => {
+    syncDiskPolicyWindowUI('create-disk-policy-select', 'create-disk-window-wrap');
+  });
+  document.getElementById('edit-disk-policy-select')?.addEventListener('change', () => {
+    syncDiskPolicyWindowUI('edit-disk-policy-select', 'edit-disk-window-wrap');
+  });
 
   document.getElementById('create-project-form').addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -2536,6 +2804,11 @@ function setupEvents() {
         : '<strong>什么是接收节点？</strong> 你本地机房/NAS 上用来落盘存文件的 Linux 机器（<strong>无需公网 IP</strong>）。这里先登记节点编号并生成密钥，创建后直接点「生成一键安装脚本」放到目标机执行即可自动上线。';
     }
     document.getElementById('node-public-addr-wrap').classList.toggle('hidden', role !== 'agent_a');
+    document.getElementById('create-node-owner-wrap')?.classList.toggle('hidden', role !== 'agent_b' || isCustomer());
+    if (role === 'agent_b' && !isCustomer()) {
+      populateOwnerAccountSelect(document.getElementById('create-node-owner-select'), '');
+    }
+    syncDiskPolicyWindowUI('create-disk-policy-select', 'create-disk-window-wrap');
     document.getElementById('node-token-result').classList.add('hidden');
     const scopedCust = isScopedCustomer();
     const createAllOpt = document.getElementById('create-node-mode-all-opt');
@@ -2610,6 +2883,10 @@ function setupEvents() {
       if (role === 'agent_b') {
         payload.project_schedule = String(fd.get('project_schedule') || 'fifo');
         payload.disk_policy = String(fd.get('disk_policy') || 'affinity_hash');
+        payload.active_disk_window = Number(fd.get('active_disk_window') || 10);
+        if (!isCustomer()) {
+          payload.owner_account_id = String(fd.get('owner_account_id') || '').trim();
+        }
       }
       const res = await api('/api/v1/admin/nodes', {
         method: 'POST',
@@ -2673,10 +2950,14 @@ function setupEvents() {
       projects: projs,
       project_schedule: projectSchedule,
       disk_policy: diskPolicy,
+      active_disk_window: Number(fd.get('active_disk_window') || 10),
       concurrency_mode: String(fd.get('concurrency_mode') || 'auto'),
       max_concurrent_override: Number(fd.get('max_concurrent_override') || 0),
       rate_limit_mbps: Number(fd.get('rate_limit_mbps') || 0),
     };
+    if (!isCustomer()) {
+      body.owner_account_id = String(fd.get('owner_account_id') || '').trim();
+    }
     if (sel.hasChks) {
       if (sel.awaiting && sel.enabledCount === 0) {
         showToast('请至少勾选 1 块已挂载的物理磁盘才能激活接收节点', 'error');
@@ -2998,9 +3279,6 @@ function setupEvents() {
   if (openAccBtn) {
     openAccBtn.addEventListener('click', () => openAccountModal(''));
   }
-  document.querySelectorAll('input[name="account_scope"]').forEach(el => {
-    el.addEventListener('change', syncAccountScopeUI);
-  });
   const accChecks = document.getElementById('account-project-checks');
   if (accChecks) {
     accChecks.addEventListener('change', (e) => {
@@ -3022,15 +3300,7 @@ function setupEvents() {
       const mode = String(fd.get('mode') || 'create');
       const id = String(fd.get('id') || '').trim();
       const name = String(fd.get('name') || '').trim();
-      const scope = String(fd.get('account_scope') || 'all');
-      let projs = [];
-      if (scope === 'selected') {
-        projs = String(fd.get('projects') || '').split(',').map(s => s.trim()).filter(Boolean);
-        if (!projs.length) {
-          showToast('请至少选择一个授权项目，或切换为「全部项目」', 'error');
-          return;
-        }
-      }
+      const projs = String(fd.get('projects') || '').split(',').map(s => s.trim()).filter(Boolean);
       try {
         if (mode === 'edit') {
           await api(`/api/v1/admin/accounts/${encodeURIComponent(id)}`, {
@@ -3042,7 +3312,7 @@ function setupEvents() {
             }),
           });
           closeModal('account-modal');
-          showToast(`客户账号 ${name || id} 已更新`, 'success');
+          showToast(`客户账号 ${name || id} 已更新（授权 ${projs.length} 个项目）`, 'success');
           refreshAll();
         } else {
           const res = await api('/api/v1/admin/accounts', {
@@ -3051,7 +3321,7 @@ function setupEvents() {
           });
           closeModal('account-modal');
           showAccountTokenModal(res.account, res.token, `客户账号已创建: ${res.account.name}`);
-          showToast(`客户账号 ${res.account.id} 创建成功`, 'success');
+          showToast(`客户账号 ${res.account.id} 创建成功（授权 ${projs.length} 个项目）`, 'success');
           refreshAll();
         }
       } catch (err) {
@@ -3059,6 +3329,30 @@ function setupEvents() {
       }
     });
   }
+
+  document.getElementById('assign-project-form')?.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    const projectId = String(fd.get('project_id') || '').trim();
+    const accountIds = Array.from(document.querySelectorAll('#assign-project-accounts-list input.assign-acc-chk:checked')).map(el => el.value);
+    try {
+      await api(`/api/v1/admin/projects/${encodeURIComponent(projectId)}/accounts`, {
+        method: 'PUT',
+        body: JSON.stringify({ account_ids: accountIds }),
+      });
+      closeModal('assign-project-modal');
+      const meta = getProjectMeta(projectId);
+      showToast(
+        accountIds.length
+          ? `项目 ${meta.name} 已分配给 ${accountIds.length} 个客户账号`
+          : `项目 ${meta.name} 已收回全部客户可见权限（仅管理员可见）`,
+        'success'
+      );
+      refreshAll();
+    } catch (err) {
+      if (err.message !== 'unauthorized') showToast(`分配项目失败: ${err.message}`, 'error');
+    }
+  });
   const copyUrlBtn = document.getElementById('btn-copy-account-url');
   if (copyUrlBtn) {
     copyUrlBtn.addEventListener('click', () => {

@@ -29,18 +29,22 @@ func (p consolePrincipal) IsAdmin() bool {
 }
 
 func (p consolePrincipal) AllowsProject(projectID string) bool {
-	if p.IsAdmin() || len(p.Projects) == 0 {
+	if p.IsAdmin() {
 		return true
+	}
+	// Default-deny for customer accounts: empty Projects grants ZERO access.
+	if len(p.Projects) == 0 {
+		return false
 	}
 	return nodeAllowsProject(p.Projects, projectID)
 }
 
 func (p consolePrincipal) AllowsAllProjects(projects []string) bool {
-	if p.IsAdmin() || len(p.Projects) == 0 {
+	if p.IsAdmin() {
 		return true
 	}
-	if len(projects) == 0 {
-		// A project-scoped customer cannot create or operate wildcard ("all projects") receiver nodes.
+	// Default-deny: customers cannot access wildcard/all-project scopes or unassigned projects.
+	if len(p.Projects) == 0 || len(projects) == 0 {
 		return false
 	}
 	for _, pid := range projects {
@@ -55,11 +59,12 @@ func (p consolePrincipal) CanAccessNode(n protocol.NodeRecord) bool {
 	if p.IsAdmin() {
 		return true
 	}
-	// Customer accounts can NEVER view or control dispatch (agent_a) nodes.
+	// Strict multi-tenant isolation: customers can ONLY view/control receiver (agent_b) nodes
+	// explicitly owned by their own account (never dispatch nodes, never other customers' receivers).
 	if n.Role != protocol.RoleAgentB {
 		return false
 	}
-	return p.AllowsAllProjects(n.Projects)
+	return p.AccountID != "" && n.OwnerAccountID == p.AccountID
 }
 
 func principalFromRequest(r *http.Request) consolePrincipal {
@@ -249,7 +254,61 @@ func (s *Server) handleAdminUpdateAccount(w http.ResponseWriter, r *http.Request
 		protocol.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	s.disconnectCustomerNodesSSE(r.Context(), rec.ID)
 	protocol.WriteJSON(w, http.StatusOK, rec)
+}
+
+func (s *Server) disconnectCustomerNodesSSE(ctx context.Context, accountIDs ...string) {
+	if len(accountIDs) == 0 {
+		return
+	}
+	accSet := make(map[string]struct{}, len(accountIDs))
+	for _, id := range accountIDs {
+		if id != "" {
+			accSet[id] = struct{}{}
+		}
+	}
+	nodes, err := s.store.ListNodes(ctx)
+	if err != nil {
+		return
+	}
+	for _, n := range nodes {
+		if n.Role == protocol.RoleAgentB && n.OwnerAccountID != "" {
+			if _, ok := accSet[n.OwnerAccountID]; ok {
+				s.hub.DisconnectSSE(n.ID)
+			}
+		}
+	}
+}
+
+func (s *Server) handleAdminAssignProjectAccounts(w http.ResponseWriter, r *http.Request) {
+	projectID := strings.TrimSpace(r.PathValue("id"))
+	if _, err := s.store.GetProject(r.Context(), projectID); err != nil {
+		if errors.Is(err, ErrNotFound) {
+			protocol.WriteError(w, http.StatusNotFound, "project not found")
+			return
+		}
+		protocol.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	var req struct {
+		AccountIDs []string `json:"account_ids"`
+	}
+	if err := protocol.DecodeJSON(r.Body, &req); err != nil {
+		protocol.WriteError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	changed, err := s.store.SetProjectCustomerAccounts(r.Context(), projectID, req.AccountIDs)
+	if err != nil {
+		protocol.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	s.disconnectCustomerNodesSSE(r.Context(), changed...)
+	protocol.WriteJSON(w, http.StatusOK, map[string]any{
+		"project_id":       projectID,
+		"account_ids":      req.AccountIDs,
+		"changed_accounts": changed,
+	})
 }
 
 func (s *Server) handleAdminRotateAccountToken(w http.ResponseWriter, r *http.Request) {
@@ -280,5 +339,6 @@ func (s *Server) handleAdminDeleteAccount(w http.ResponseWriter, r *http.Request
 		protocol.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	s.disconnectCustomerNodesSSE(r.Context(), id)
 	w.WriteHeader(http.StatusNoContent)
 }

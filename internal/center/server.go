@@ -297,6 +297,7 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("GET /api/v1/admin/overview", s.requireConsole(s.handleAdminOverview))
 	mux.HandleFunc("GET /api/v1/admin/projects", s.requireConsole(s.handleAdminListProjects))
 	mux.HandleFunc("POST /api/v1/admin/projects", s.requireSuperAdmin(s.handleAdminUpsertProject))
+	mux.HandleFunc("PUT /api/v1/admin/projects/{id}/accounts", s.requireSuperAdmin(s.handleAdminAssignProjectAccounts))
 	mux.HandleFunc("DELETE /api/v1/admin/projects/{id}", s.requireSuperAdmin(s.handleAdminDeleteProject))
 	mux.HandleFunc("GET /api/v1/admin/nodes", s.requireConsole(s.handleAdminListNodes))
 	mux.HandleFunc("GET /api/v1/admin/nodes/{id}/disks", s.requireConsole(s.handleAdminGetNodeDisks))
@@ -374,6 +375,31 @@ func (s *Server) isTrustedAdminRequest(r *http.Request) bool {
 	return false
 }
 
+// effectiveReceiverAccess enforces customer account ownership & project authorization on a receiver
+// node in real time. If an admin revokes a project or disables/deletes the owning customer account,
+// the receiver immediately loses access to revoked projects (zero stale JWT issuance / SSE wakeups).
+func (s *Server) effectiveReceiverAccess(ctx context.Context, node *StoredNode) (projects []string, restricted bool, active bool) {
+	if strings.TrimSpace(node.OwnerAccountID) == "" {
+		// Admin-owned node: follows node.Projects directly (empty = all projects).
+		return append([]string(nil), node.Projects...), len(node.Projects) > 0, true
+	}
+	acc, err := s.store.GetAccount(ctx, node.OwnerAccountID)
+	if err != nil || acc == nil || !acc.Enabled || len(acc.Projects) == 0 {
+		// Account disabled/deleted or has zero assigned projects -> strictly cut off.
+		return []string{}, true, false
+	}
+	if len(node.Projects) == 0 {
+		return append([]string(nil), acc.Projects...), true, true
+	}
+	allowed := make([]string, 0, len(node.Projects))
+	for _, p := range node.Projects {
+		if nodeAllowsProject(acc.Projects, p) {
+			allowed = append(allowed, p)
+		}
+	}
+	return allowed, true, len(allowed) > 0
+}
+
 func (s *Server) processUnplugLatches(ctx context.Context, node *StoredNode, disks []protocol.DiskStatus) {
 	if len(disks) == 0 {
 		return
@@ -419,21 +445,21 @@ func (s *Server) handleAHeartbeat(w http.ResponseWriter, r *http.Request, node *
 	req.OS = sanitizeSingleLine(req.OS, 32)
 	req.Arch = sanitizeSingleLine(req.Arch, 32)
 	req.UpgradeError = sanitizeSingleLine(req.UpgradeError, 256)
-	if len(req.StorageDirs) > 64 {
-		req.StorageDirs = req.StorageDirs[:64]
+	if len(req.StorageDirs) > 256 {
+		req.StorageDirs = req.StorageDirs[:256]
 	}
 	for i := range req.StorageDirs {
 		req.StorageDirs[i] = sanitizeSingleLine(req.StorageDirs[i], 256)
 	}
-	if len(req.Disks) > 64 {
-		req.Disks = req.Disks[:64]
+	if len(req.Disks) > 256 {
+		req.Disks = req.Disks[:256]
 	}
 	for i := range req.Disks {
 		req.Disks[i].Path = sanitizeSingleLine(req.Disks[i].Path, 256)
 		req.Disks[i].StatusReason = sanitizeSingleLine(req.Disks[i].StatusReason, 160)
 	}
-	if len(req.HostDisks) > 64 {
-		req.HostDisks = req.HostDisks[:64]
+	if len(req.HostDisks) > 256 {
+		req.HostDisks = req.HostDisks[:256]
 	}
 	for i := range req.HostDisks {
 		req.HostDisks[i].Device = sanitizeSingleLine(req.HostDisks[i].Device, 128)
@@ -538,21 +564,21 @@ func (s *Server) handleBHeartbeat(w http.ResponseWriter, r *http.Request, node *
 	req.UpgradeError = sanitizeSingleLine(req.UpgradeError, 256)
 	req.AdaptiveState = sanitizeSingleLine(req.AdaptiveState, 32)
 	req.AdaptiveReason = sanitizeSingleLine(req.AdaptiveReason, 160)
-	if len(req.StorageDirs) > 64 {
-		req.StorageDirs = req.StorageDirs[:64]
+	if len(req.StorageDirs) > 256 {
+		req.StorageDirs = req.StorageDirs[:256]
 	}
 	for i := range req.StorageDirs {
 		req.StorageDirs[i] = sanitizeSingleLine(req.StorageDirs[i], 256)
 	}
-	if len(req.Disks) > 64 {
-		req.Disks = req.Disks[:64]
+	if len(req.Disks) > 256 {
+		req.Disks = req.Disks[:256]
 	}
 	for i := range req.Disks {
 		req.Disks[i].Path = sanitizeSingleLine(req.Disks[i].Path, 256)
 		req.Disks[i].StatusReason = sanitizeSingleLine(req.Disks[i].StatusReason, 160)
 	}
-	if len(req.HostDisks) > 64 {
-		req.HostDisks = req.HostDisks[:64]
+	if len(req.HostDisks) > 256 {
+		req.HostDisks = req.HostDisks[:256]
 	}
 	for i := range req.HostDisks {
 		req.HostDisks[i].Device = sanitizeSingleLine(req.HostDisks[i].Device, 128)
@@ -560,20 +586,22 @@ func (s *Server) handleBHeartbeat(w http.ResponseWriter, r *http.Request, node *
 		req.HostDisks[i].FSType = sanitizeSingleLine(req.HostDisks[i].FSType, 32)
 		req.HostDisks[i].SuggestedDir = sanitizeSingleLine(req.HostDisks[i].SuggestedDir, 256)
 	}
-	if len(node.Projects) > 0 {
+	effProjects, restricted, accActive := s.effectiveReceiverAccess(r.Context(), node)
+	if restricted {
 		filtered := make([]string, 0, len(req.Projects))
 		for _, p := range req.Projects {
-			if nodeAllowsProject(node.Projects, p) {
+			if nodeAllowsProject(effProjects, p) {
 				filtered = append(filtered, p)
 			}
 		}
 		req.Projects = filtered
 	}
-	req.Paused = node.Paused
+	effPaused := node.Paused || !accActive
+	req.Paused = effPaused
 	s.processUnplugLatches(r.Context(), node, req.Disks)
 	s.hub.UpdateB(req)
 	hbResp := s.processNodeHeartbeatUpgrade(r.Context(), node.ID, req.Version, req.UpgradeAttemptID, req.UpgradeStatus, req.UpgradeError)
-	hbResp.Paused = node.Paused
+	hbResp.Paused = effPaused
 	hbResp.DiskGen = node.DiskGen
 
 	projs, _ := s.store.ListProjects(r.Context())
@@ -585,11 +613,12 @@ func (s *Server) handleBHeartbeat(w http.ResponseWriter, r *http.Request, node *
 	maxConc, suggestedStreamCap, rateLimitMBps := s.hub.ComputeClusterQuotas(node, projs, dbNodes)
 
 	dir := &protocol.ReceiverDirective{
-		Paused:             node.Paused,
+		Paused:             effPaused,
 		ProjectMode:        "all",
 		KnownProjects:      knownIDs,
 		ProjectSchedule:    node.ProjectSchedule,
 		DiskPolicy:         node.DiskPolicy,
+		ActiveDiskWindow:   node.ActiveDiskWindow,
 		StorageDirs:        append([]string(nil), node.StorageDirs...),
 		DisabledDisks:      append([]string(nil), node.DisabledDisks...),
 		DiskGen:            node.DiskGen,
@@ -598,10 +627,10 @@ func (s *Server) handleBHeartbeat(w http.ResponseWriter, r *http.Request, node *
 		SuggestedStreamCap: suggestedStreamCap,
 		RateLimitMBps:      rateLimitMBps,
 	}
-	if len(node.Projects) > 0 {
+	if restricted {
 		dir.ProjectMode = "selected"
-		dir.AllowedProjects = append([]string(nil), node.Projects...)
-		hbResp.AllowedProjects = append([]string(nil), node.Projects...)
+		dir.AllowedProjects = append([]string(nil), effProjects...)
+		hbResp.AllowedProjects = append([]string(nil), effProjects...)
 	}
 	hbResp.Directive = dir
 	protocol.WriteJSON(w, http.StatusOK, hbResp)
@@ -613,26 +642,29 @@ func (s *Server) handleBEventsSSE(w http.ResponseWriter, r *http.Request, node *
 		protocol.WriteError(w, http.StatusInternalServerError, "streaming unsupported")
 		return
 	}
+	effProjects, restricted, accActive := s.effectiveReceiverAccess(r.Context(), node)
 	projectsParam := strings.TrimSpace(r.URL.Query().Get("projects"))
 	var projects []string
 	wildcard := false
-	if projectsParam == "*" && len(node.Projects) == 0 {
+	if !accActive {
+		projects = nil
+	} else if projectsParam == "*" && !restricted {
 		wildcard = true
 		projects = []string{"*"}
 	} else if projectsParam != "" {
 		for _, p := range strings.Split(projectsParam, ",") {
 			p = strings.TrimSpace(p)
-			if p == "*" && len(node.Projects) == 0 {
+			if p == "*" && !restricted {
 				wildcard = true
 				projects = []string{"*"}
 				break
 			}
-			if p != "" && nodeAllowsProject(node.Projects, p) {
+			if p != "" && (!restricted || nodeAllowsProject(effProjects, p)) {
 				projects = append(projects, p)
 			}
 		}
-	} else if len(node.Projects) > 0 {
-		projects = node.Projects
+	} else if restricted {
+		projects = effProjects
 	} else {
 		wildcard = true
 		projects = []string{"*"}
@@ -704,7 +736,8 @@ func (s *Server) handleBDiscover(w http.ResponseWriter, r *http.Request, node *S
 		protocol.WriteError(w, http.StatusBadRequest, "project query parameter required")
 		return
 	}
-	if !nodeAllowsProject(node.Projects, projectID) {
+	effProjects, restricted, accActive := s.effectiveReceiverAccess(r.Context(), node)
+	if !accActive || (restricted && !nodeAllowsProject(effProjects, projectID)) {
 		protocol.WriteError(w, http.StatusForbidden, "b node not authorized for project")
 		return
 	}
@@ -809,6 +842,7 @@ func (s *Server) handleAdminOverview(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		iq.AllowedProjects = principal.Projects
+		iq.ScopeRestricted = true
 	}
 
 	allProjects, err := s.store.ListProjects(ctx)
@@ -832,20 +866,31 @@ func (s *Server) handleAdminOverview(w http.ResponseWriter, r *http.Request) {
 		protocol.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	dailyTrend, err := s.store.GetDailyStatsScoped(ctx, iq.ProjectID, iq.AllowedProjects, 14)
-	if err != nil {
-		protocol.WriteError(w, http.StatusInternalServerError, err.Error())
-		return
+	emptyCustomerScope := !principal.IsAdmin() && len(principal.Projects) == 0
+	var dailyTrend []protocol.DailyStat
+	if emptyCustomerScope {
+		dailyTrend = []protocol.DailyStat{}
+	} else {
+		dailyTrend, err = s.store.GetDailyStatsScoped(ctx, iq.ProjectID, iq.AllowedProjects, 14)
+		if err != nil {
+			protocol.WriteError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
 	}
 	intervalResp, err := s.store.QueryIntervalStats(ctx, iq)
 	if err != nil {
 		protocol.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	_, _, projWindowMap, err := s.store.GetWindowEntityStatsScoped(ctx, iq.Now, intervalResp.WindowHours, iq.AllowedProjects)
-	if err != nil {
-		protocol.WriteError(w, http.StatusInternalServerError, err.Error())
-		return
+	var projWindowMap map[string]WindowSummary
+	if emptyCustomerScope {
+		projWindowMap = map[string]WindowSummary{}
+	} else {
+		_, _, projWindowMap, err = s.store.GetWindowEntityStatsScoped(ctx, iq.Now, intervalResp.WindowHours, iq.AllowedProjects)
+		if err != nil {
+			protocol.WriteError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
 	}
 
 	aSnap, bSnap := s.hub.Snapshot()
@@ -1080,10 +1125,16 @@ func (s *Server) handleAdminListNodes(w http.ResponseWriter, r *http.Request) {
 		protocol.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	aWinStats, bWinStats, _, err := s.store.GetWindowEntityStatsScoped(ctx, time.Now().UTC(), hours, principal.Projects)
-	if err != nil {
-		protocol.WriteError(w, http.StatusInternalServerError, err.Error())
-		return
+	var aWinStats, bWinStats map[string]WindowSummary
+	if !principal.IsAdmin() && len(principal.Projects) == 0 {
+		aWinStats = map[string]WindowSummary{}
+		bWinStats = map[string]WindowSummary{}
+	} else {
+		aWinStats, bWinStats, _, err = s.store.GetWindowEntityStatsScoped(ctx, time.Now().UTC(), hours, principal.Projects)
+		if err != nil {
+			protocol.WriteError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
 	}
 	aSnap, bSnap := s.hub.Snapshot()
 	upgrades, _ := s.store.ListNodeUpgrades(ctx)
@@ -1096,9 +1147,11 @@ func (s *Server) handleAdminListNodes(w http.ResponseWriter, r *http.Request) {
 			ID:                    n.ID,
 			Name:                  n.Name,
 			Role:                  n.Role,
+			OwnerAccountID:        n.OwnerAccountID,
 			Projects:              n.Projects,
 			ProjectSchedule:       n.ProjectSchedule,
 			DiskPolicy:            n.DiskPolicy,
+			ActiveDiskWindow:      n.ActiveDiskWindow,
 			StorageDirs:           append([]string(nil), n.StorageDirs...),
 			DisabledDisks:         n.DisabledDisks,
 			UnplugLockedDisks:     n.UnplugLockedDisks,
@@ -1191,9 +1244,11 @@ type createNodeReq struct {
 	ID                    string   `json:"id"`
 	Name                  string   `json:"name"`
 	Role                  string   `json:"role"`
+	OwnerAccountID        string   `json:"owner_account_id,omitempty"`
 	Projects              []string `json:"projects"`
 	ProjectSchedule       string   `json:"project_schedule,omitempty"`
 	DiskPolicy            string   `json:"disk_policy,omitempty"`
+	ActiveDiskWindow      int      `json:"active_disk_window,omitempty"`
 	StorageDirs           []string `json:"storage_dirs,omitempty"`
 	DisabledDisks         []string `json:"disabled_disks,omitempty"`
 	ConcurrencyMode       string   `json:"concurrency_mode,omitempty"`
@@ -1343,14 +1398,23 @@ func (s *Server) handleAdminCreateNode(w http.ResponseWriter, r *http.Request) {
 		protocol.WriteError(w, http.StatusBadRequest, "role must be agent_a or agent_b")
 		return
 	}
+	ownerAccID := strings.TrimSpace(req.OwnerAccountID)
 	if !principal.IsAdmin() {
 		if req.Role != protocol.RoleAgentB {
 			protocol.WriteError(w, http.StatusForbidden, "customer accounts can only manage receiver nodes")
 			return
 		}
 		req.PublicAddr = ""
+		ownerAccID = principal.AccountID
 		if existing, err := s.store.GetNode(r.Context(), req.ID); err == nil && !principal.CanAccessNode(*existing) {
 			protocol.WriteError(w, http.StatusForbidden, "cannot overwrite an inaccessible node")
+			return
+		}
+	} else if ownerAccID != "" {
+		if req.Role != protocol.RoleAgentB {
+			ownerAccID = ""
+		} else if _, err := s.store.GetAccount(r.Context(), ownerAccID); err != nil {
+			protocol.WriteError(w, http.StatusBadRequest, "owner_account_id not found")
 			return
 		}
 	}
@@ -1366,7 +1430,7 @@ func (s *Server) handleAdminCreateNode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !principal.IsAdmin() && !principal.AllowsAllProjects(cleanProjects) {
-		protocol.WriteError(w, http.StatusForbidden, "receiver node projects must be within this account's allowed project list")
+		protocol.WriteError(w, http.StatusForbidden, "receiver node projects must be explicitly selected from this account's authorized projects")
 		return
 	}
 	cleanStorageDirs, err := cleanStorageDirList(req.StorageDirs)
@@ -1386,7 +1450,15 @@ func (s *Server) handleAdminCreateNode(w http.ResponseWriter, r *http.Request) {
 	}
 	dp := normalizeDiskPolicy(req.DiskPolicy)
 	if dp == "" {
-		protocol.WriteError(w, http.StatusBadRequest, "disk_policy must be affinity_hash, most_free, round_robin, or first")
+		protocol.WriteError(w, http.StatusBadRequest, "disk_policy must be affinity_hash, most_free, round_robin, first, or rolling_window")
+		return
+	}
+	diskWin := req.ActiveDiskWindow
+	if diskWin <= 0 {
+		diskWin = 10
+	}
+	if diskWin > 256 {
+		protocol.WriteError(w, http.StatusBadRequest, "active_disk_window must be between 1 and 256")
 		return
 	}
 	cm := normalizeConcurrencyMode(req.ConcurrencyMode)
@@ -1413,9 +1485,11 @@ func (s *Server) handleAdminCreateNode(w http.ResponseWriter, r *http.Request) {
 		ID:                    req.ID,
 		Name:                  req.Name,
 		Role:                  req.Role,
+		OwnerAccountID:        ownerAccID,
 		Projects:              cleanProjects,
 		ProjectSchedule:       sched,
 		DiskPolicy:            dp,
+		ActiveDiskWindow:      diskWin,
 		StorageDirs:           cleanStorageDirs,
 		DisabledDisks:         cleanDisks,
 		ConcurrencyMode:       cm,
@@ -1438,9 +1512,11 @@ func (s *Server) handleAdminCreateNode(w http.ResponseWriter, r *http.Request) {
 
 type updateNodeReq struct {
 	Name                  string    `json:"name,omitempty"`
+	OwnerAccountID        *string   `json:"owner_account_id,omitempty"`
 	Projects              *[]string `json:"projects,omitempty"`
 	ProjectSchedule       string    `json:"project_schedule,omitempty"`
 	DiskPolicy            string    `json:"disk_policy,omitempty"`
+	ActiveDiskWindow      *int      `json:"active_disk_window,omitempty"`
 	StorageDirs           *[]string `json:"storage_dirs,omitempty"`
 	DisabledDisks         *[]string `json:"disabled_disks,omitempty"`
 	ConcurrencyMode       string    `json:"concurrency_mode,omitempty"`
@@ -1493,13 +1569,31 @@ func (s *Server) handleAdminUpdateNode(w http.ResponseWriter, r *http.Request) {
 		}
 		rec.ProjectSchedule = sched
 	}
+	if req.OwnerAccountID != nil && principal.IsAdmin() && rec.Role == protocol.RoleAgentB {
+		owner := strings.TrimSpace(*req.OwnerAccountID)
+		if owner != "" {
+			if _, err := s.store.GetAccount(r.Context(), owner); err != nil {
+				protocol.WriteError(w, http.StatusBadRequest, "owner_account_id not found")
+				return
+			}
+		}
+		rec.OwnerAccountID = owner
+	}
 	if req.DiskPolicy != "" {
 		dp := normalizeDiskPolicy(req.DiskPolicy)
 		if dp == "" {
-			protocol.WriteError(w, http.StatusBadRequest, "disk_policy must be affinity_hash, most_free, round_robin, or first")
+			protocol.WriteError(w, http.StatusBadRequest, "disk_policy must be affinity_hash, most_free, round_robin, first, or rolling_window")
 			return
 		}
 		rec.DiskPolicy = dp
+	}
+	if req.ActiveDiskWindow != nil {
+		v := *req.ActiveDiskWindow
+		if v < 1 || v > 256 {
+			protocol.WriteError(w, http.StatusBadRequest, "active_disk_window must be between 1 and 256")
+			return
+		}
+		rec.ActiveDiskWindow = v
 	}
 	diskConfigTouched := false
 	if req.StorageDirs != nil {
@@ -1640,6 +1734,7 @@ func (s *Server) handleAdminIntervalStats(w http.ResponseWriter, r *http.Request
 			}
 		}
 		iq.AllowedProjects = principal.Projects
+		iq.ScopeRestricted = true
 	}
 	resp, err := s.store.QueryIntervalStats(r.Context(), iq)
 	if err != nil {
@@ -1654,6 +1749,10 @@ func (s *Server) handleAdminDailyStats(w http.ResponseWriter, r *http.Request) {
 	projectID := strings.TrimSpace(r.URL.Query().Get("project"))
 	if !principal.IsAdmin() && projectID != "" && !principal.AllowsProject(projectID) {
 		protocol.WriteError(w, http.StatusForbidden, "project not authorized for this account")
+		return
+	}
+	if !principal.IsAdmin() && len(principal.Projects) == 0 {
+		protocol.WriteJSON(w, http.StatusOK, []protocol.DailyStat{})
 		return
 	}
 	days := 14

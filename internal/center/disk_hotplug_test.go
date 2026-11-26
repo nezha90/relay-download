@@ -44,10 +44,12 @@ func TestCenterDiskHotPlugAutoLockAndManualReconfirm(t *testing.T) {
 
 	ctx := context.Background()
 	if err := srv.Store().UpsertNode(ctx, protocol.NodeRecord{
-		ID:          "b-nas",
-		Name:        "NAS 接收机",
-		Role:        protocol.RoleAgentB,
-		StorageDirs: []string{"/mnt/sda/relay-delivery", "/mnt/sdb/relay-delivery"},
+		ID:             "b-nas",
+		Name:           "NAS 接收机",
+		Role:           protocol.RoleAgentB,
+		OwnerAccountID: "cust-1",
+		Projects:       []string{"tw-audio"},
+		StorageDirs:    []string{"/mnt/sda/relay-delivery", "/mnt/sdb/relay-delivery"},
 	}, "b-token"); err != nil {
 		t.Fatalf("upsert b node: %v", err)
 	}
@@ -61,10 +63,11 @@ func TestCenterDiskHotPlugAutoLockAndManualReconfirm(t *testing.T) {
 		t.Fatalf("upsert a node: %v", err)
 	}
 	if err := srv.Store().CreateAccount(ctx, protocol.AccountRecord{
-		ID:      "cust-1",
-		Name:    "客户1",
-		Role:    protocol.AccountRoleCustomer,
-		Enabled: true,
+		ID:       "cust-1",
+		Name:     "客户1",
+		Role:     protocol.AccountRoleCustomer,
+		Projects: []string{"tw-audio"},
+		Enabled:  true,
 	}, "cust-token"); err != nil {
 		t.Fatalf("create customer: %v", err)
 	}

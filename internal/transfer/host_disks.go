@@ -184,15 +184,55 @@ func DiscoverHostDisks(subdirName string) []protocol.HostDisk {
 		})
 	}
 
-	// Sort real data disks first (largest free space first), system "/" disk last.
+	// Sort real data disks first in natural path order (e.g. disk1, disk2, ..., disk10), system "/" disk last.
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].IsSystem != out[j].IsSystem {
 			return !out[i].IsSystem
 		}
-		if out[i].FreeBytes != out[j].FreeBytes {
-			return out[i].FreeBytes > out[j].FreeBytes
-		}
-		return out[i].MountPoint < out[j].MountPoint
+		return NaturalLess(out[i].MountPoint, out[j].MountPoint)
 	})
 	return out
+}
+
+// NaturalLess compares strings with embedded decimal numbers numerically (so /mnt/disk2 < /mnt/disk10).
+func NaturalLess(a, b string) bool {
+	ia, ib := 0, 0
+	for ia < len(a) && ib < len(b) {
+		ca, cb := a[ia], b[ib]
+		if ca >= '0' && ca <= '9' && cb >= '0' && cb <= '9' {
+			za := ia
+			for za < len(a) && a[za] == '0' {
+				za++
+			}
+			ea := za
+			for ea < len(a) && a[ea] >= '0' && a[ea] <= '9' {
+				ea++
+			}
+			zb := ib
+			for zb < len(b) && b[zb] == '0' {
+				zb++
+			}
+			eb := zb
+			for eb < len(b) && b[eb] >= '0' && b[eb] <= '9' {
+				eb++
+			}
+			if (ea - za) != (eb - zb) {
+				return (ea - za) < (eb - zb)
+			}
+			if a[za:ea] != b[zb:eb] {
+				return a[za:ea] < b[zb:eb]
+			}
+			if (ea - ia) != (eb - ib) {
+				return (ea - ia) < (eb - ib)
+			}
+			ia, ib = ea, eb
+			continue
+		}
+		if ca != cb {
+			return ca < cb
+		}
+		ia++
+		ib++
+	}
+	return len(a) < len(b)
 }

@@ -67,9 +67,10 @@ type Agent struct {
 	allowedOrder    []string            // ordered Center-enforced project allowlist when directiveMode=="selected"
 	allowedProjects map[string]struct{} // non-nil when directiveMode=="selected"
 	knownOrder      []string            // Center-reported known projects ordered by created_at ASC
-	projectSchedule string              // "fifo" | "fair" | "random"
-	diskPolicy      string              // "affinity_hash" | "most_free" | "round_robin" | "first"
-	dirStorageDirs  []string            // Center-managed data disk pool roots (overrides cfg.StorageDirs when non-empty)
+	projectSchedule  string              // "fifo" | "fair" | "random"
+	diskPolicy       string              // "affinity_hash" | "most_free" | "round_robin" | "first" | "rolling_window"
+	activeDiskWindow int                 // concurrent active disk window for rolling_window policy
+	dirStorageDirs   []string            // Center-managed data disk pool roots (overrides cfg.StorageDirs when non-empty)
 	disabledDisks   map[string]struct{} // cleaned root paths disabled via Console or auto-locked on unplug
 	diskGen         int64               // monotonic Center disk-config generation
 	diskHealth      *transfer.DiskHealthTracker
@@ -285,9 +286,10 @@ func New(cfg *Config, logger *slog.Logger) (*Agent, error) {
 		ackWakeCh:       make(chan struct{}, 1),
 		hbWakeCh:        make(chan struct{}, 1),
 		discCache:       make(map[string]cachedDiscover),
-		projectSchedule: cfg.ProjectSchedule,
-		diskPolicy:      cfg.DiskPolicy,
-		diskHealth:      diskHealth,
+		projectSchedule:  cfg.ProjectSchedule,
+		diskPolicy:       cfg.DiskPolicy,
+		activeDiskWindow: cfg.ActiveDiskWindow,
+		diskHealth:       diskHealth,
 	}
 	upgradeClient := &http.Client{
 		Transport: &http.Transport{
@@ -541,6 +543,19 @@ func (a *Agent) effectiveDiskPolicy() string {
 		return a.cfg.DiskPolicy
 	}
 	return p
+}
+
+func (a *Agent) effectiveActiveDiskWindow() int {
+	a.dirMu.RLock()
+	w := a.activeDiskWindow
+	a.dirMu.RUnlock()
+	if w <= 0 {
+		w = a.cfg.ActiveDiskWindow
+	}
+	if w <= 0 {
+		return 10
+	}
+	return w
 }
 
 func (a *Agent) isDiskRootDisabledLocked(root string) bool {
@@ -863,6 +878,7 @@ func (a *Agent) applyDirective(dir *protocol.ReceiverDirective, legacyAllowed []
 		nextKnown       []string
 		nextSched       = a.cfg.ProjectSchedule
 		nextDiskPol     = a.cfg.DiskPolicy
+		nextDiskWin     = a.cfg.ActiveDiskWindow
 		nextStorageDirs []string
 		nextDisabled    map[string]struct{}
 		nextDiskGen     int64
@@ -902,8 +918,14 @@ func (a *Agent) applyDirective(dir *protocol.ReceiverDirective, legacyAllowed []
 			nextSched = strings.ToLower(strings.TrimSpace(dir.ProjectSchedule))
 		}
 		switch strings.ToLower(strings.TrimSpace(dir.DiskPolicy)) {
-		case protocol.DiskPolicyAffinityHash, protocol.DiskPolicyMostFree, protocol.DiskPolicyRoundRobin, protocol.DiskPolicyFirst:
+		case protocol.DiskPolicyAffinityHash, protocol.DiskPolicyMostFree, protocol.DiskPolicyRoundRobin, protocol.DiskPolicyFirst, protocol.DiskPolicyRollingWindow:
 			nextDiskPol = strings.ToLower(strings.TrimSpace(dir.DiskPolicy))
+		}
+		if dir.ActiveDiskWindow > 0 {
+			nextDiskWin = dir.ActiveDiskWindow
+			if nextDiskWin > 256 {
+				nextDiskWin = 256
+			}
 		}
 		if len(dir.DisabledDisks) > 0 {
 			nextDisabled = make(map[string]struct{}, len(dir.DisabledDisks))
@@ -961,6 +983,7 @@ func (a *Agent) applyDirective(dir *protocol.ReceiverDirective, legacyAllowed []
 		!equalStringSlices(a.knownOrder, nextKnown)
 	policyChanged := a.projectSchedule != nextSched ||
 		a.diskPolicy != nextDiskPol ||
+		a.activeDiskWindow != nextDiskWin ||
 		!equalStringSlices(a.dirStorageDirs, nextStorageDirs) ||
 		!equalStringSet(a.disabledDisks, nextDisabled) ||
 		a.diskGen != nextDiskGen
@@ -971,6 +994,7 @@ func (a *Agent) applyDirective(dir *protocol.ReceiverDirective, legacyAllowed []
 	a.knownOrder = nextKnown
 	a.projectSchedule = nextSched
 	a.diskPolicy = nextDiskPol
+	a.activeDiskWindow = nextDiskWin
 	a.dirStorageDirs = nextStorageDirs
 	a.disabledDisks = nextDisabled
 	if nextDiskGen > a.diskGen {
@@ -1389,6 +1413,32 @@ func (a *Agent) chooseDestDir(projectID, filename string, fileSize int64) string
 			}
 		}
 		return pickMostFree()
+	case protocol.DiskPolicyRollingWindow:
+		// Sliding active window: concurrently fill the first N healthy non-full disks in order.
+		// Within the active window, hash by media affinity key so paired assets stay on the same disk;
+		// once any disk hits the mandatory watermark (or is disabled/detached), disk N+1 automatically slides in.
+		winSize := a.effectiveActiveDiskWindow()
+		if winSize > len(dirs) {
+			winSize = len(dirs)
+		}
+		activeWin := make([]string, 0, winSize)
+		for _, cand := range dirs {
+			if fits(cand) {
+				activeWin = append(activeWin, cand)
+				if len(activeWin) >= winSize {
+					break
+				}
+			}
+		}
+		if len(activeWin) == 0 {
+			return pickMostFree()
+		}
+		if len(activeWin) == 1 {
+			return activeWin[0]
+		}
+		h := fnv.New32a()
+		_, _ = h.Write([]byte(mediaAffinityKey(filename)))
+		return activeWin[int(h.Sum32()%uint32(len(activeWin)))]
 	default:
 		// affinity_hash: paired media + metadata land on the same disk; spill over when full.
 		h := fnv.New32a()
@@ -2870,11 +2920,45 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 	}
 	a.dirMu.RUnlock()
 
+	diskPol := a.effectiveDiskPolicy()
+	activeWinSize := a.effectiveActiveDiskWindow()
+	activeWinUsed := 0
+
 	for _, root := range roots {
 		enabled := enabledByRoot[root]
 		probe := a.diskHealth.ProbeRoot(root, enabled, a.cfg.MaxDiskUsagePct, a.cfg.MinFreeDiskBytes, 0)
 		if probe.Detached || probe.UnplugLatched {
 			a.evictReadyDirsForRoot(root)
+		}
+		role := "active"
+		reason := probe.StatusReason
+		switch {
+		case probe.Detached:
+			role = "detached"
+		case probe.UnplugLatched:
+			role = "locked"
+		case !enabled:
+			role = "disabled"
+		case probe.LowSpace:
+			role = "full"
+			if probe.InFlight == 0 {
+				reason = "已写满水位（在途 0）· 停用即可安全拔盘"
+			} else {
+				reason = fmt.Sprintf("已写满水位（在途 %d 收尾中）", probe.InFlight)
+			}
+		default:
+			if diskPol == protocol.DiskPolicyRollingWindow {
+				activeWinUsed++
+				if activeWinUsed <= activeWinSize {
+					role = "active"
+					reason = fmt.Sprintf("写入窗口中 (%d/%d)", activeWinUsed, activeWinSize)
+				} else {
+					role = "standby"
+					reason = "候补排队中（前序盘满自动顶上）"
+				}
+			} else {
+				role = "active"
+			}
 		}
 		disks = append(disks, protocol.DiskStatus{
 			Path:          root,
@@ -2889,7 +2973,8 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 			LatchedGen:    probe.LatchedGen,
 			InFlight:      probe.InFlight,
 			SafeToEject:   probe.SafeToEject,
-			StatusReason:  probe.StatusReason,
+			DiskRole:      role,
+			StatusReason:  reason,
 		})
 		if probe.Mounted && !probe.Detached {
 			devKey := probe.DevID
@@ -2941,7 +3026,8 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 		Disks:               disks,
 		HostDisks:           a.cachedHostDisks(),
 		ProjectSchedule:     a.effectiveProjectSchedule(),
-		DiskPolicy:          a.effectiveDiskPolicy(),
+		DiskPolicy:          diskPol,
+		ActiveDiskWindow:    activeWinSize,
 		ConcurrencyMode:     snap.Mode,
 		EffectiveConcurrent: snap.EffectiveConcurrent,
 		MaxConcurrentCap:    snap.MaxConcurrentCap,

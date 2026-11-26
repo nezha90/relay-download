@@ -63,7 +63,7 @@ func TestCustomerAccountRBACAndProjectScoping(t *testing.T) {
 		t.Fatalf("UpsertNode a-1: %v", err)
 	}
 	if err := srv.store.UpsertNode(ctx, protocol.NodeRecord{
-		ID: "b-a", Name: "Recv-A", Role: protocol.RoleAgentB, Projects: []string{"proj-a"}, CreatedAt: now,
+		ID: "b-a", Name: "Recv-A", Role: protocol.RoleAgentB, OwnerAccountID: "cust-proj-a", Projects: []string{"proj-a"}, CreatedAt: now,
 	}, "tok-b-a"); err != nil {
 		t.Fatalf("UpsertNode b-a: %v", err)
 	}
@@ -123,23 +123,49 @@ func TestCustomerAccountRBACAndProjectScoping(t *testing.T) {
 		return rec
 	}
 
-	// 1. Admin creates an unscoped customer account & a project-scoped customer account.
-	rCreateAll := doReq(http.MethodPost, "/api/v1/admin/accounts", "super-admin-token-123456", map[string]any{
-		"id": "cust-global", "name": "Global Customer",
+	// 1. Default-deny check: newly created customer account with empty projects sees ZERO projects, ZERO stats, ZERO nodes!
+	rCreateEmpty := doReq(http.MethodPost, "/api/v1/admin/accounts", "super-admin-token-123456", map[string]any{
+		"id": "cust-empty", "name": "Unassigned Customer",
 	}, "198.51.100.2:1234")
-	if rCreateAll.Code != http.StatusOK {
-		t.Fatalf("create cust-global failed: %d %s", rCreateAll.Code, rCreateAll.Body.String())
+	if rCreateEmpty.Code != http.StatusOK {
+		t.Fatalf("create cust-empty failed: %d %s", rCreateEmpty.Code, rCreateEmpty.Body.String())
 	}
-	var createAllResp struct {
+	var createEmptyResp struct {
 		Account protocol.AccountRecord `json:"account"`
 		Token   string                 `json:"token"`
 	}
-	_ = json.Unmarshal(rCreateAll.Body.Bytes(), &createAllResp)
-	custGlobalTok := createAllResp.Token
-	if !strings.HasPrefix(custGlobalTok, "rcust_") {
-		t.Fatalf("expected rcust_ token prefix, got %q", custGlobalTok)
+	_ = json.Unmarshal(rCreateEmpty.Body.Bytes(), &createEmptyResp)
+	custEmptyTok := createEmptyResp.Token
+	if !strings.HasPrefix(custEmptyTok, "rcust_") {
+		t.Fatalf("expected rcust_ token prefix, got %q", custEmptyTok)
 	}
 
+	// Trusted-IP precedence: explicit customer token from 127.0.0.1 must authenticate as customer, NOT admin!
+	rEmptyOv := doReq(http.MethodGet, "/api/v1/admin/overview", custEmptyTok, nil, "127.0.0.1:4567")
+	if rEmptyOv.Code != http.StatusOK {
+		t.Fatalf("cust-empty overview: %d %s", rEmptyOv.Code, rEmptyOv.Body.String())
+	}
+	var emptyOv protocol.OverviewResp
+	_ = json.Unmarshal(rEmptyOv.Body.Bytes(), &emptyOv)
+	if emptyOv.AuthRole != protocol.AccountRoleCustomer || emptyOv.AuthTrustedIP {
+		t.Fatalf("expected customer principal even from trusted IP, got role=%s trusted=%v", emptyOv.AuthRole, emptyOv.AuthTrustedIP)
+	}
+	if len(emptyOv.Projects) != 0 || emptyOv.TotalBNodes != 0 || emptyOv.AllTimeBytes != 0 || emptyOv.WindowBytes != 0 || len(emptyOv.DailyTrend) != 0 {
+		t.Fatalf("default-deny failed for unassigned customer: projs=%d B=%d allBytes=%d winBytes=%d daily=%d",
+			len(emptyOv.Projects), emptyOv.TotalBNodes, emptyOv.AllTimeBytes, emptyOv.WindowBytes, len(emptyOv.DailyTrend))
+	}
+	// Daily & interval endpoints must also return zero/empty for unassigned customer.
+	if res := doReq(http.MethodGet, "/api/v1/admin/stats/daily", custEmptyTok, nil, "198.51.100.9:1111"); res.Code != http.StatusOK || strings.TrimSpace(res.Body.String()) != "[]" {
+		t.Fatalf("expected empty daily stats for unassigned customer, got %d %s", res.Code, res.Body.String())
+	}
+	rEmptyInt := doReq(http.MethodGet, "/api/v1/admin/stats/intervals", custEmptyTok, nil, "198.51.100.9:1111")
+	var emptyInt protocol.IntervalStatsResp
+	_ = json.Unmarshal(rEmptyInt.Body.Bytes(), &emptyInt)
+	if emptyInt.TotalBytes != 0 || emptyInt.TotalCompleted != 0 {
+		t.Fatalf("expected zero interval stats for unassigned customer, got bytes=%d cmp=%d", emptyInt.TotalBytes, emptyInt.TotalCompleted)
+	}
+
+	// Create two tenant customer accounts: cust-proj-a (proj-a) and cust-peer-a (also assigned proj-a, to verify strict node ownership isolation!).
 	rCreateScoped := doReq(http.MethodPost, "/api/v1/admin/accounts", "super-admin-token-123456", map[string]any{
 		"id": "cust-proj-a", "name": "Project A Customer", "projects": []string{"proj-a"},
 	}, "198.51.100.2:1234")
@@ -153,49 +179,55 @@ func TestCustomerAccountRBACAndProjectScoping(t *testing.T) {
 	_ = json.Unmarshal(rCreateScoped.Body.Bytes(), &createScopedResp)
 	custScopedTok := createScopedResp.Token
 
-	// 2. Trusted-IP precedence: explicit customer token from 127.0.0.1 must authenticate as customer, NOT admin!
-	rOv := doReq(http.MethodGet, "/api/v1/admin/overview", custGlobalTok, nil, "127.0.0.1:4567")
-	if rOv.Code != http.StatusOK {
-		t.Fatalf("cust-global overview: %d %s", rOv.Code, rOv.Body.String())
+	rCreatePeer := doReq(http.MethodPost, "/api/v1/admin/accounts", "super-admin-token-123456", map[string]any{
+		"id": "cust-peer-a", "name": "Peer Tenant", "projects": []string{"proj-a"},
+	}, "198.51.100.2:1234")
+	var createPeerResp struct {
+		Token string `json:"token"`
 	}
-	var ov protocol.OverviewResp
-	_ = json.Unmarshal(rOv.Body.Bytes(), &ov)
-	if ov.AuthRole != protocol.AccountRoleCustomer || ov.AuthTrustedIP {
-		t.Fatalf("expected customer principal even from trusted IP, got role=%s trusted=%v", ov.AuthRole, ov.AuthTrustedIP)
+	_ = json.Unmarshal(rCreatePeer.Body.Bytes(), &createPeerResp)
+	custPeerTok := createPeerResp.Token
+
+	// 2. Customer cust-proj-a sees ONLY proj-a, ONLY its own receiver b-a, and ZERO dispatch node details.
+	rScopedOv := doReq(http.MethodGet, "/api/v1/admin/overview", custScopedTok, nil, "198.51.100.10:1111")
+	if rScopedOv.Code != http.StatusOK {
+		t.Fatalf("scoped overview: %d %s", rScopedOv.Code, rScopedOv.Body.String())
 	}
-	if ov.TotalANodes != 0 || ov.OnlineANodes != 0 || ov.TotalBNodes != 2 || ov.OnlineBNodes != 2 {
-		t.Fatalf("unexpected node counts for customer overview: A=%d/%d B=%d/%d", ov.OnlineANodes, ov.TotalANodes, ov.OnlineBNodes, ov.TotalBNodes)
+	var scopedOv protocol.OverviewResp
+	_ = json.Unmarshal(rScopedOv.Body.Bytes(), &scopedOv)
+	if len(scopedOv.Projects) != 1 || scopedOv.Projects[0].Project.ID != "proj-a" {
+		t.Fatalf("scoped customer should only see proj-a, got %+v", scopedOv.Projects)
 	}
-	for _, ps := range ov.Projects {
-		if ps.OnlineANodes != 0 || len(ps.ANodeAvailability) != 0 {
-			t.Fatalf("dispatch node details leaked in project %s: onlineA=%d avail=%+v", ps.Project.ID, ps.OnlineANodes, ps.ANodeAvailability)
-		}
+	if scopedOv.TotalANodes != 0 || scopedOv.OnlineANodes != 0 || scopedOv.TotalBNodes != 1 || scopedOv.AllTimeBytes != 5000 {
+		t.Fatalf("scoped customer stats mismatch/leak: A=%d B=%d allTimeBytes=%d", scopedOv.TotalANodes, scopedOv.TotalBNodes, scopedOv.AllTimeBytes)
+	}
+	if scopedOv.Projects[0].OnlineANodes != 0 || len(scopedOv.Projects[0].ANodeAvailability) != 0 {
+		t.Fatalf("dispatch node details leaked in proj-a")
 	}
 
-	// 3. Global customer cannot see or touch dispatch nodes, projects mutations, releases mutations, deploy, or accounts.
-	rNodes := doReq(http.MethodGet, "/api/v1/admin/nodes", custGlobalTok, nil, "198.51.100.9:1111")
-	if rNodes.Code != http.StatusOK {
-		t.Fatalf("cust-global nodes: %d", rNodes.Code)
+	// Peer tenant (also allowed proj-a) MUST NOT see or touch cust-proj-a's receiver b-a!
+	rPeerNodes := doReq(http.MethodGet, "/api/v1/admin/nodes", custPeerTok, nil, "198.51.100.11:1111")
+	var peerNodes []protocol.LiveNodeView
+	_ = json.Unmarshal(rPeerNodes.Body.Bytes(), &peerNodes)
+	if len(peerNodes) != 0 {
+		t.Fatalf("peer tenant must NOT see another customer's receiver b-a, got %+v", peerNodes)
 	}
-	var nodes []protocol.LiveNodeView
-	_ = json.Unmarshal(rNodes.Body.Bytes(), &nodes)
-	for _, n := range nodes {
-		if n.Role == protocol.RoleAgentA || n.ID == "a-1" {
-			t.Fatalf("dispatch node leaked to customer: %+v", n)
-		}
+	if res := doReq(http.MethodPut, "/api/v1/admin/nodes/b-a", custPeerTok, map[string]any{"paused": true}, "198.51.100.11:1111"); res.Code != http.StatusForbidden {
+		t.Fatalf("peer tenant must get 403 editing cust-proj-a's node b-a, got %d", res.Code)
 	}
-	if len(nodes) != 2 {
-		t.Fatalf("expected 2 receiver nodes for global customer, got %d", len(nodes))
+	if res := doReq(http.MethodDelete, "/api/v1/admin/nodes/b-a", custPeerTok, nil, "198.51.100.11:1111"); res.Code != http.StatusForbidden {
+		t.Fatalf("peer tenant must get 403 deleting cust-proj-a's node b-a, got %d", res.Code)
 	}
 
 	// Customer releases list only shows agent_b; asking for agent_a is 403.
-	rRels := doReq(http.MethodGet, "/api/v1/admin/releases", custGlobalTok, nil, "198.51.100.9:1111")
+	rRels := doReq(http.MethodGet, "/api/v1/admin/releases", custScopedTok, nil, "198.51.100.9:1111")
 	var rels []protocol.ReleaseRecord
 	_ = json.Unmarshal(rRels.Body.Bytes(), &rels)
 	if len(rels) != 1 || rels[0].Role != protocol.RoleAgentB {
 		t.Fatalf("expected only agent_b release for customer, got %+v", rels)
 	}
 
+	// 3. Forbidden actions for customer (dispatch nodes, admin endpoints, unauthorized projects, admin-owned b-all).
 	forbiddenCases := []struct {
 		name   string
 		method string
@@ -204,7 +236,7 @@ func TestCustomerAccountRBACAndProjectScoping(t *testing.T) {
 	}{
 		{"list agent_a releases", http.MethodGet, "/api/v1/admin/releases?role=agent_a", nil},
 		{"create agent_a node", http.MethodPost, "/api/v1/admin/nodes", map[string]any{"id": "a-evil", "role": "agent_a"}},
-		{"overwrite existing a-1 as agent_b", http.MethodPost, "/api/v1/admin/nodes", map[string]any{"id": "a-1", "role": "agent_b"}},
+		{"overwrite existing a-1 as agent_b", http.MethodPost, "/api/v1/admin/nodes", map[string]any{"id": "a-1", "role": "agent_b", "projects": []string{"proj-a"}}},
 		{"update a-1", http.MethodPut, "/api/v1/admin/nodes/a-1", map[string]any{"name": "pwned"}},
 		{"delete a-1", http.MethodDelete, "/api/v1/admin/nodes/a-1", nil},
 		{"upgrade a-1 with rel-a", http.MethodPost, "/api/v1/admin/upgrades", map[string]any{"release_id": "rel-a", "node_ids": []string{"a-1"}}},
@@ -215,6 +247,7 @@ func TestCustomerAccountRBACAndProjectScoping(t *testing.T) {
 		{"deploy agent-a", http.MethodPost, "/api/v1/admin/deploy/agent-a", map[string]any{"host": "1.2.3.4", "node_id": "a-2"}},
 		{"list deploy tasks", http.MethodGet, "/api/v1/admin/deploy/tasks", nil},
 		{"upsert project", http.MethodPost, "/api/v1/admin/projects", map[string]any{"id": "proj-evil", "name": "evil"}},
+		{"assign project accounts", http.MethodPut, "/api/v1/admin/projects/proj-a/accounts", map[string]any{"account_ids": []string{"cust-proj-a"}}},
 		{"delete project", http.MethodDelete, "/api/v1/admin/projects/proj-a", nil},
 		{"upload release", http.MethodPost, "/api/v1/admin/releases", map[string]any{}},
 		{"delete release", http.MethodDelete, "/api/v1/admin/releases/rel-b", nil},
@@ -222,77 +255,80 @@ func TestCustomerAccountRBACAndProjectScoping(t *testing.T) {
 		{"create account", http.MethodPost, "/api/v1/admin/accounts", map[string]any{"name": "escalate"}},
 		{"filter intervals by a_node", http.MethodGet, "/api/v1/admin/stats/intervals?a_node=a-1", nil},
 		{"filter overview by a_node", http.MethodGet, "/api/v1/admin/overview?a_node=a-1", nil},
-	}
-	for _, tc := range forbiddenCases {
-		res := doReq(tc.method, tc.path, custGlobalTok, tc.body, "198.51.100.9:1111")
-		if res.Code != http.StatusForbidden {
-			t.Fatalf("case %q: expected 403 Forbidden for customer, got %d (%s)", tc.name, res.Code, res.Body.String())
-		}
-	}
-
-	// 4. Global customer CAN fully manage receiver (agent_b) nodes.
-	if res := doReq(http.MethodPost, "/api/v1/admin/nodes", custGlobalTok, map[string]any{
-		"id": "b-cust-1", "name": "Customer NAS", "role": "agent_b", "projects": []string{"proj-a"},
-	}, "198.51.100.9:1111"); res.Code != http.StatusOK {
-		t.Fatalf("customer create agent_b failed: %d %s", res.Code, res.Body.String())
-	}
-	if res := doReq(http.MethodPut, "/api/v1/admin/nodes/b-cust-1", custGlobalTok, map[string]any{
-		"disk_policy": "most_free", "rate_limit_mbps": 50,
-	}, "198.51.100.9:1111"); res.Code != http.StatusOK {
-		t.Fatalf("customer update agent_b failed: %d %s", res.Code, res.Body.String())
-	}
-	if res := doReq(http.MethodPost, "/api/v1/admin/upgrades", custGlobalTok, map[string]any{
-		"release_id": "rel-b", "node_ids": []string{"b-cust-1"},
-	}, "198.51.100.9:1111"); res.Code != http.StatusOK {
-		t.Fatalf("customer upgrade agent_b failed: %d %s", res.Code, res.Body.String())
-	}
-	if res := doReq(http.MethodDelete, "/api/v1/admin/upgrades/b-cust-1", custGlobalTok, nil, "198.51.100.9:1111"); res.Code != http.StatusNoContent {
-		t.Fatalf("customer cancel upgrade failed: %d %s", res.Code, res.Body.String())
-	}
-	if res := doReq(http.MethodPost, "/api/v1/admin/deploy/agent-b-script", custGlobalTok, map[string]any{
-		"node_id": "b-cust-1", "storage_dirs": []string{"/mnt/sda/relay"},
-	}, "198.51.100.9:1111"); res.Code != http.StatusOK {
-		t.Fatalf("customer agent-b-script failed: %d %s", res.Code, res.Body.String())
-	}
-	if res := doReq(http.MethodDelete, "/api/v1/admin/nodes/b-cust-1", custGlobalTok, nil, "198.51.100.9:1111"); res.Code != http.StatusNoContent {
-		t.Fatalf("customer delete agent_b failed: %d %s", res.Code, res.Body.String())
-	}
-
-	// 5. Project-scoped customer (proj-a only) cannot view or touch proj-b or wildcard receiver b-all.
-	rScopedOv := doReq(http.MethodGet, "/api/v1/admin/overview", custScopedTok, nil, "198.51.100.10:1111")
-	if rScopedOv.Code != http.StatusOK {
-		t.Fatalf("scoped overview: %d %s", rScopedOv.Code, rScopedOv.Body.String())
-	}
-	var scopedOv protocol.OverviewResp
-	_ = json.Unmarshal(rScopedOv.Body.Bytes(), &scopedOv)
-	if len(scopedOv.Projects) != 1 || scopedOv.Projects[0].Project.ID != "proj-a" {
-		t.Fatalf("scoped customer should only see proj-a, got %+v", scopedOv.Projects)
-	}
-	if scopedOv.TotalBNodes != 1 || scopedOv.AllTimeBytes != 5000 {
-		t.Fatalf("scoped customer stats leak: B=%d allTimeBytes=%d", scopedOv.TotalBNodes, scopedOv.AllTimeBytes)
-	}
-	for _, tc := range []struct {
-		name, method, path string
-		body               any
-	}{
 		{"overview proj-b", http.MethodGet, "/api/v1/admin/overview?project=proj-b", nil},
 		{"intervals proj-b", http.MethodGet, "/api/v1/admin/stats/intervals?project=proj-b", nil},
 		{"daily proj-b", http.MethodGet, "/api/v1/admin/stats/daily?project=proj-b", nil},
 		{"create wildcard node", http.MethodPost, "/api/v1/admin/nodes", map[string]any{"id": "b-wild", "role": "agent_b", "projects": []string{}}},
 		{"create proj-b node", http.MethodPost, "/api/v1/admin/nodes", map[string]any{"id": "b-other", "role": "agent_b", "projects": []string{"proj-b"}}},
-		{"edit shared b-all", http.MethodPut, "/api/v1/admin/nodes/b-all", map[string]any{"name": "hijack"}},
+		{"edit admin-owned b-all", http.MethodPut, "/api/v1/admin/nodes/b-all", map[string]any{"name": "hijack"}},
 		{"expand b-a to proj-b", http.MethodPut, "/api/v1/admin/nodes/b-a", map[string]any{"projects": []string{"proj-a", "proj-b"}}},
-		{"delete shared b-all", http.MethodDelete, "/api/v1/admin/nodes/b-all", nil},
+		{"delete admin-owned b-all", http.MethodDelete, "/api/v1/admin/nodes/b-all", nil},
 		{"script with unauthorized project", http.MethodPost, "/api/v1/admin/deploy/agent-b-script", map[string]any{"node_id": "b-a", "only_project": "proj-b"}},
-	} {
-		res := doReq(tc.method, tc.path, custScopedTok, tc.body, "198.51.100.10:1111")
+	}
+	for _, tc := range forbiddenCases {
+		res := doReq(tc.method, tc.path, custScopedTok, tc.body, "198.51.100.9:1111")
 		if res.Code != http.StatusForbidden {
-			t.Fatalf("scoped case %q: expected 403 Forbidden, got %d (%s)", tc.name, res.Code, res.Body.String())
+			t.Fatalf("case %q: expected 403 Forbidden for customer, got %d (%s)", tc.name, res.Code, res.Body.String())
 		}
 	}
 
+	// 4. Customer creates a new receiver node -> auto-stamped with owner_account_id="cust-proj-a" and fully manageable!
+	if res := doReq(http.MethodPost, "/api/v1/admin/nodes", custScopedTok, map[string]any{
+		"id": "b-cust-1", "name": "Customer NAS", "role": "agent_b", "projects": []string{"proj-a"}, "disk_policy": "rolling_window", "active_disk_window": 10,
+	}, "198.51.100.9:1111"); res.Code != http.StatusOK {
+		t.Fatalf("customer create agent_b failed: %d %s", res.Code, res.Body.String())
+	}
+	createdNode, _ := srv.store.GetNode(ctx, "b-cust-1")
+	if createdNode == nil || createdNode.OwnerAccountID != "cust-proj-a" || createdNode.DiskPolicy != protocol.DiskPolicyRollingWindow || createdNode.ActiveDiskWindow != 10 {
+		t.Fatalf("expected auto-stamped owner_account_id and rolling_window, got %+v", createdNode)
+	}
+	if res := doReq(http.MethodPut, "/api/v1/admin/nodes/b-cust-1", custScopedTok, map[string]any{
+		"disk_policy": "most_free", "rate_limit_mbps": 50,
+	}, "198.51.100.9:1111"); res.Code != http.StatusOK {
+		t.Fatalf("customer update agent_b failed: %d %s", res.Code, res.Body.String())
+	}
+	if res := doReq(http.MethodPost, "/api/v1/admin/upgrades", custScopedTok, map[string]any{
+		"release_id": "rel-b", "node_ids": []string{"b-cust-1"},
+	}, "198.51.100.9:1111"); res.Code != http.StatusOK {
+		t.Fatalf("customer upgrade agent_b failed: %d %s", res.Code, res.Body.String())
+	}
+	if res := doReq(http.MethodDelete, "/api/v1/admin/upgrades/b-cust-1", custScopedTok, nil, "198.51.100.9:1111"); res.Code != http.StatusNoContent {
+		t.Fatalf("customer cancel upgrade failed: %d %s", res.Code, res.Body.String())
+	}
+	if res := doReq(http.MethodPost, "/api/v1/admin/deploy/agent-b-script", custScopedTok, map[string]any{
+		"node_id": "b-cust-1", "storage_dirs": []string{"/mnt/sda/relay"},
+	}, "198.51.100.9:1111"); res.Code != http.StatusOK {
+		t.Fatalf("customer agent-b-script failed: %d %s", res.Code, res.Body.String())
+	}
+	if res := doReq(http.MethodDelete, "/api/v1/admin/nodes/b-cust-1", custScopedTok, nil, "198.51.100.9:1111"); res.Code != http.StatusNoContent {
+		t.Fatalf("customer delete agent_b failed: %d %s", res.Code, res.Body.String())
+	}
+
+	// 5. Admin reassigns proj-a away from cust-proj-a via PUT /api/v1/admin/projects/proj-a/accounts
+	//    -> b-a immediately loses discover access (403) and heartbeat enforces paused=true!
+	if res := doReq(http.MethodPut, "/api/v1/admin/projects/proj-a/accounts", "super-admin-token-123456", map[string]any{
+		"account_ids": []string{"cust-empty"},
+	}, "198.51.100.2:1234"); res.Code != http.StatusOK {
+		t.Fatalf("assign proj-a accounts failed: %d %s", res.Code, res.Body.String())
+	}
+	reqDiscRevoked := httptest.NewRequest(http.MethodGet, "https://center.test:8440/api/v1/b/discover?project=proj-a", nil)
+	reqDiscRevoked.Header.Set(protocol.HeaderNodeID, "b-a")
+	reqDiscRevoked.Header.Set(protocol.HeaderNodeToken, "tok-b-a")
+	recDiscRevoked := httptest.NewRecorder()
+	h.ServeHTTP(recDiscRevoked, reqDiscRevoked)
+	if recDiscRevoked.Code != http.StatusForbidden {
+		t.Fatalf("expected revoked customer node b-a to receive 403 on discover, got %d %s", recDiscRevoked.Code, recDiscRevoked.Body.String())
+	}
+	// Meanwhile cust-empty now sees proj-a!
+	rNowAssigned := doReq(http.MethodGet, "/api/v1/admin/projects", custEmptyTok, nil, "198.51.100.9:1111")
+	var nowProjs []protocol.Project
+	_ = json.Unmarshal(rNowAssigned.Body.Bytes(), &nowProjs)
+	if len(nowProjs) != 1 || nowProjs[0].ID != "proj-a" {
+		t.Fatalf("expected cust-empty to see proj-a after assignment, got %+v", nowProjs)
+	}
+
 	// 6. Token rotation & disablement revoke old credentials immediately.
-	rRot := doReq(http.MethodPost, "/api/v1/admin/accounts/cust-global/rotate", "super-admin-token-123456", nil, "198.51.100.2:1234")
+	rRot := doReq(http.MethodPost, "/api/v1/admin/accounts/cust-empty/rotate", "super-admin-token-123456", nil, "198.51.100.2:1234")
 	if rRot.Code != http.StatusOK {
 		t.Fatalf("rotate failed: %d %s", rRot.Code, rRot.Body.String())
 	}
@@ -300,14 +336,14 @@ func TestCustomerAccountRBACAndProjectScoping(t *testing.T) {
 		Token string `json:"token"`
 	}
 	_ = json.Unmarshal(rRot.Body.Bytes(), &rotResp)
-	if res := doReq(http.MethodGet, "/api/v1/admin/overview", custGlobalTok, nil, "127.0.0.1:4567"); res.Code != http.StatusUnauthorized {
+	if res := doReq(http.MethodGet, "/api/v1/admin/overview", custEmptyTok, nil, "127.0.0.1:4567"); res.Code != http.StatusUnauthorized {
 		t.Fatalf("old token must return 401 even from trusted IP, got %d", res.Code)
 	}
 	if res := doReq(http.MethodGet, "/api/v1/admin/overview", rotResp.Token, nil, "198.51.100.9:1111"); res.Code != http.StatusOK {
 		t.Fatalf("rotated token should work, got %d", res.Code)
 	}
 	disabled := false
-	if res := doReq(http.MethodPut, "/api/v1/admin/accounts/cust-global", "super-admin-token-123456", map[string]any{
+	if res := doReq(http.MethodPut, "/api/v1/admin/accounts/cust-empty", "super-admin-token-123456", map[string]any{
 		"enabled": disabled,
 	}, "198.51.100.2:1234"); res.Code != http.StatusOK {
 		t.Fatalf("disable account failed: %d", res.Code)
@@ -315,7 +351,7 @@ func TestCustomerAccountRBACAndProjectScoping(t *testing.T) {
 	if res := doReq(http.MethodGet, "/api/v1/admin/overview", rotResp.Token, nil, "198.51.100.9:1111"); res.Code != http.StatusUnauthorized {
 		t.Fatalf("disabled account must return 401, got %d", res.Code)
 	}
-	if res := doReq(http.MethodDelete, "/api/v1/admin/accounts/cust-global", "super-admin-token-123456", nil, "198.51.100.2:1234"); res.Code != http.StatusNoContent {
+	if res := doReq(http.MethodDelete, "/api/v1/admin/accounts/cust-empty", "super-admin-token-123456", nil, "198.51.100.2:1234"); res.Code != http.StatusNoContent {
 		t.Fatalf("delete account failed: %d", res.Code)
 	}
 }
@@ -355,12 +391,12 @@ func TestNodePauseResumeAndAgentAScript(t *testing.T) {
 	now := time.Now().UTC()
 	_ = srv.store.UpsertProject(ctx, protocol.Project{ID: "proj-1", Name: "P1", ConflictPolicy: protocol.ConflictOverwrite, LeaseTTLSec: 300, CreatedAt: now})
 	_ = srv.store.UpsertNode(ctx, protocol.NodeRecord{ID: "a-1", Name: "A1", Role: protocol.RoleAgentA, PublicAddr: "https://203.0.113.10:8443", CreatedAt: now}, "tok-a1")
-	_ = srv.store.UpsertNode(ctx, protocol.NodeRecord{ID: "b-1", Name: "B1", Role: protocol.RoleAgentB, Projects: []string{"proj-1"}, CreatedAt: now}, "tok-b1")
+	_ = srv.store.UpsertNode(ctx, protocol.NodeRecord{ID: "b-1", Name: "B1", Role: protocol.RoleAgentB, OwnerAccountID: "c1", Projects: []string{"proj-1"}, CreatedAt: now}, "tok-b1")
 	_ = srv.store.InsertRelease(ctx, protocol.ReleaseRecord{
 		ID: "rel-a", Role: protocol.RoleAgentA, Version: "v1.11.0", OS: "linux", Arch: "amd64",
 		SHA256: strings.Repeat("a", 64), Size: 123, Filename: "a.bin", CreatedAt: now,
 	})
-	_ = srv.store.CreateAccount(ctx, protocol.AccountRecord{ID: "c1", Name: "Cust1", Role: protocol.AccountRoleCustomer, Enabled: true, CreatedAt: now}, "rcust_test_pause_token_123456")
+	_ = srv.store.CreateAccount(ctx, protocol.AccountRecord{ID: "c1", Name: "Cust1", Role: protocol.AccountRoleCustomer, Projects: []string{"proj-1"}, Enabled: true, CreatedAt: now}, "rcust_test_pause_token_123456")
 
 	srv.hub.UpdateA(protocol.AgentAHeartbeatReq{
 		NodeID: "a-1", Name: "A1", PublicAddr: "https://203.0.113.10:8443",
