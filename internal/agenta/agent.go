@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -190,9 +191,16 @@ func (a *Agent) Start(ctx context.Context) error {
 		return err
 	}
 
+	if !isLoopbackHost(a.cfg.LocalListen) {
+		return fmt.Errorf("local_listen must bind strictly to localhost/loopback (got %q)", a.cfg.LocalListen)
+	}
 	localLn, err := net.Listen("tcp", a.cfg.LocalListen)
 	if err != nil {
 		return fmt.Errorf("listen local %s: %w", a.cfg.LocalListen, err)
+	}
+	if tcpAddr, ok := localLn.Addr().(*net.TCPAddr); !ok || tcpAddr.IP == nil || !tcpAddr.IP.IsLoopback() {
+		_ = localLn.Close()
+		return fmt.Errorf("local_listen resolved to non-loopback address %q", localLn.Addr().String())
 	}
 	rawPubLn, err := net.Listen("tcp", a.cfg.PublicListen)
 	if err != nil {
@@ -764,12 +772,61 @@ func (a *Agent) deleteFlushLoop(ctx context.Context) {
 	}
 }
 
+func isLoopbackHost(hostport string) bool {
+	s := strings.TrimSpace(hostport)
+	if s == "" {
+		return false
+	}
+	host := s
+	if h, _, err := net.SplitHostPort(s); err == nil {
+		host = h
+	}
+	host = strings.Trim(host, "[]")
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func isNonLoopbackOrigin(origin string) bool {
+	origin = strings.TrimSpace(origin)
+	if origin == "" {
+		return false
+	}
+	u, err := url.Parse(origin)
+	if err != nil || u.Hostname() == "" {
+		return true
+	}
+	return !isLoopbackHost(u.Hostname())
+}
+
 func (a *Agent) requireLocalAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		tok := r.Header.Get(protocol.HeaderLocalToken)
-		if a.cfg.LocalToken == "" || !auth.EqualConstantTime(tok, a.cfg.LocalToken) {
-			protocol.WriteError(w, http.StatusUnauthorized, "invalid local token")
+		// Strictly localhost-only: unconditionally reject non-loopback peers, DNS-rebinding Host headers,
+		// cross-origin browser requests, and reverse-proxied requests.
+		if !isLoopbackHost(r.RemoteAddr) {
+			protocol.WriteError(w, http.StatusForbidden, "local endpoint only accepts localhost connections")
 			return
+		}
+		if r.Host != "" && !isLoopbackHost(r.Host) {
+			protocol.WriteError(w, http.StatusForbidden, "local endpoint only accepts localhost Host header")
+			return
+		}
+		if isNonLoopbackOrigin(r.Header.Get("Origin")) {
+			protocol.WriteError(w, http.StatusForbidden, "cross-origin local request forbidden")
+			return
+		}
+		if r.Header.Get("X-Forwarded-For") != "" || r.Header.Get("Forwarded") != "" || r.Header.Get("X-Real-IP") != "" {
+			protocol.WriteError(w, http.StatusForbidden, "proxied requests to local endpoint are forbidden")
+			return
+		}
+		if a.cfg.RequireLocalToken {
+			tok := r.Header.Get(protocol.HeaderLocalToken)
+			if a.cfg.LocalToken == "" || !auth.EqualConstantTime(tok, a.cfg.LocalToken) {
+				protocol.WriteError(w, http.StatusUnauthorized, "invalid local token")
+				return
+			}
 		}
 		next(w, r)
 	}

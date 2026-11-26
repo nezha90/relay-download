@@ -130,7 +130,7 @@
         </div>
         <div id="guide-p-body" class="guide-body hidden">
           <div class="concept-box">
-            <strong>接口接入说明：</strong> 业务方在<strong>分发节点本机</strong>调用 <code>http://127.0.0.1:&lt;本机上传端口&gt;</code>（默认 <code>18081</code>），在请求头携带 <code>X-Local-Token</code> 密钥即可安全推送文件（密钥可在分发机 <code>/opt/relay-agent-a/config.json</code> 的 <code>local_token</code> 字段查看）。<strong>新项目无需提前建档</strong>，首次上传自动创建项目隔离目录；如需自定义冲突覆盖/全局限速，先点右上角「+ 新建项目」即可。
+            <strong>接口接入说明：</strong> 业务方在<strong>分发节点本机</strong>直接调用 <code>http://127.0.0.1:&lt;本机上传端口&gt;</code>（默认 <code>18081</code>），<strong>仅限本机回环访问、免鉴权直传</strong>（无需配置任何 Token）。<strong>新项目无需提前建档</strong>，首次上传自动创建项目隔离目录（默认仅管理员可见，分配给指定客户后客户立即可见）；如需自定义冲突覆盖/全局限速，先点右上角「+ 新建项目」即可。
           </div>
 
           <div class="api-var-bar">
@@ -141,13 +141,9 @@
                 <input id="guide-p-project-input" type="text" placeholder="my-project" value="my-project" autocomplete="off" />
               </div>
             </label>
-            <label class="api-var-item" style="max-width:130px">
+            <label class="api-var-item" style="max-width:150px">
               <span>本机上传端口</span>
               <input id="guide-p-port" type="number" value="18081" min="1" max="65535" />
-            </label>
-            <label class="api-var-item" style="flex:1.2">
-              <span>X-Local-Token（可选，填入后下方命令直接可用）</span>
-              <input id="guide-p-token" type="text" placeholder="<替换为分发节点的 X-Local-Token>" autocomplete="off" />
             </label>
           </div>
 
@@ -251,7 +247,7 @@
             <div class="api-codes-grid">
               <div class="api-code-item"><span class="badge online">200 OK</span><span>入队成功，返回 <code>{"file_id","project_id","filename","size","sha256","status":"ready"}</code></span></div>
               <div class="api-code-item"><span class="badge offline">400</span><span>项目 ID 非法（仅允许 <code>A-Za-z0-9._-</code> 1~64 位）、文件名非法或 SHA256 不一致</span></div>
-              <div class="api-code-item"><span class="badge offline">401 / 403</span><span><code>X-Local-Token</code> 无效，或该分发节点已限制只允许特定项目</span></div>
+              <div class="api-code-item"><span class="badge offline">403</span><span>仅允许本机 <code>localhost / 127.0.0.1</code> 直连（拒绝远程、反代或跨站请求），或该分发节点限制了允许的项目</span></div>
               <div class="api-code-item"><span class="badge awaiting">503</span><span>分发节点尚未在控制台勾选激活数据盘，请前往「分发节点」选盘激活</span></div>
               <div class="api-code-item"><span class="badge alarm">507</span><span>触发强制安全水位（≥85% 或剩余 ≤10GB），上游退避几秒重试即可，绝不写爆磁盘</span></div>
             </div>
@@ -305,8 +301,8 @@
               <div class="step-desc">无论数据盘或系统盘 <code>/</code> 均强制启用安全水位（≤85% 且至少预留 10GB），超水位自动拒收/切盘，绝不撑爆系统。</div>
             </div>
             <div class="step-item">
-              <div class="step-title"><span class="step-num">4</span>保存上传密钥并随时热控</div>
-              <div class="step-desc">保存 <code>X-Local-Token</code> 给上游推流即可；日常可随时点「暂停/启动」或热增减缓存数据盘。</div>
+              <div class="step-title"><span class="step-num">4</span>本机免鉴权推流并随时热控</div>
+              <div class="step-desc">业务方在分发机本机直接推送 <code>http://127.0.0.1:18081</code>（免 Token）；日常可随时点「暂停/启动」或热增减缓存数据盘。</div>
             </div>
           </div>
 

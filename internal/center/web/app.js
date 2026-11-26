@@ -892,12 +892,10 @@ function syncProjectGuideSelect(projects) {
 function renderProjectGuideSnippets() {
   const inp = document.getElementById('guide-p-project-input');
   const portEl = document.getElementById('guide-p-port');
-  const tokEl = document.getElementById('guide-p-token');
-  if (!inp || !portEl || !tokEl) return;
+  if (!inp || !portEl) return;
 
   const proj = (inp.value || 'my-project').trim().replace(/[^A-Za-z0-9._-]/g, '') || 'my-project';
   const port = Math.max(1, Math.min(65535, Number(portEl.value || 18081) || 18081));
-  const tok = (tokEl.value || '').trim() || '<你的_X_LOCAL_TOKEN>';
   const base = `http://127.0.0.1:${port}`;
 
   const setText = (id, text) => {
@@ -906,9 +904,8 @@ function renderProjectGuideSnippets() {
   };
 
   setText('code-p-put',
-`# 单文件流式 PUT（支持任意相对子目录，新项目自动建档）
+`# 单文件流式 PUT（本机回环免鉴权，支持任意相对子目录，新项目自动建档）
 curl -fsS -X PUT \\
-  -H "X-Local-Token: ${tok}" \\
   --data-binary @./sample.mp4 \\
   "${base}/local/v1/files/${proj}/videos/sample.mp4"`);
 
@@ -916,7 +913,6 @@ curl -fsS -X PUT \\
 `# 先算 SHA256 再上传，服务端落盘前强校验
 SHA=$(sha256sum ./sample.mp4 | awk '{print $1}')
 curl -fsS -X PUT \\
-  -H "X-Local-Token: ${tok}" \\
   -H "X-Expected-SHA256: $SHA" \\
   --data-binary @./sample.mp4 \\
   "${base}/local/v1/files/${proj}/videos/sample.mp4"`);
@@ -924,7 +920,6 @@ curl -fsS -X PUT \\
   setText('code-p-multipart',
 `# Multipart 表单上传（兼容传统上传表单）
 curl -fsS -X POST \\
-  -H "X-Local-Token: ${tok}" \\
   -F "project=${proj}" \\
   -F "filename=videos/sample.mp4" \\
   -F "file=@./sample.mp4" \\
@@ -933,7 +928,6 @@ curl -fsS -X POST \\
   setText('code-p-reg',
 `# 文件已在本机磁盘时零拷贝入队（mode: move=原子移入 | hardlink=保留源文件）
 curl -fsS -X POST \\
-  -H "X-Local-Token: ${tok}" \\
   -H "Content-Type: application/json" \\
   -d '{
     "project_id": "${proj}",
@@ -946,7 +940,6 @@ curl -fsS -X POST \\
   setText('code-p-reg-batch',
 `# 批量零拷贝注册入队（单次最多 256 个文件，适合亿级海量文件）
 curl -fsS -X POST \\
-  -H "X-Local-Token: ${tok}" \\
   -H "Content-Type: application/json" \\
   -d '{
     "items": [
@@ -960,14 +953,13 @@ curl -fsS -X POST \\
 `import time, hashlib, pathlib, requests
 
 BASE = "${base}"
-TOKEN = "${tok}"
 PROJECT = "${proj}"
 
 def push_file(local_path: str, rel_name: str):
     p = pathlib.Path(local_path)
     sha = hashlib.sha256(p.read_bytes()).hexdigest()
     url = f"{BASE}/local/v1/files/{PROJECT}/{rel_name.lstrip('/')}"
-    headers = {"X-Local-Token": TOKEN, "X-Expected-SHA256": sha}
+    headers = {"X-Expected-SHA256": sha}
     for attempt in range(10):
         with p.open("rb") as f:
             r = requests.put(url, headers=headers, data=f, timeout=600)
@@ -983,9 +975,7 @@ print(push_file("./sample.mp4", "videos/sample.mp4"))`);
 
   setText('code-p-status',
 `# 查询本机分发节点当前排队数与磁盘水位（summary=1 轻量模式）
-curl -fsS \\
-  -H "X-Local-Token: ${tok}" \\
-  "${base}/local/v1/status?project=${proj}&summary=1"`);
+curl -fsS "${base}/local/v1/status?project=${proj}&summary=1"`);
 }
 
 function openProjectQuickGuide(projectId) {
@@ -1895,11 +1885,11 @@ function renderDeployTaskDetail(t, targetEl) {
     ? `部署成功！公网地址: ${t.public_addr}`
     : (t.status === 'failed' ? `部署失败: ${t.error}` : `正在后台部署 (${t.step})，请点击「刷新部署状态」查看最新日志`);
   let tokHtml = '';
-  if (t.local_token) {
+  if (t.status === 'succeeded') {
     tokHtml = `
       <div class="token-box" style="margin-bottom:10px">
-        <strong>请保存该分发节点的本机上传密钥 X-Local-Token（仅展示一次）：</strong>
-        <div class="mono" style="margin-top:6px">${esc(t.local_token)}</div>
+        <strong>本机上传接口默认免鉴权：</strong>
+        <div class="muted" style="margin-top:4px">分发节点仅监听 <code>127.0.0.1</code> 回环地址，本机业务方直接 <code>PUT</code> 推送即可，无需携带 <code>X-Local-Token</code>。</div>
       </div>
     `;
   }
@@ -2598,7 +2588,6 @@ function setupEvents() {
     renderProjectGuideSnippets();
   });
   document.getElementById('guide-p-port')?.addEventListener('input', renderProjectGuideSnippets);
-  document.getElementById('guide-p-token')?.addEventListener('input', renderProjectGuideSnippets);
   renderProjectGuideSnippets();
 
   document.addEventListener('change', (e) => {
@@ -3238,13 +3227,12 @@ function setupEvents() {
         });
         lastAScript = res.script || '';
         lastAScriptNodeId = res.node_id || body.node_id || 'dispatch';
-        const uploadCmd = `curl -fsS -X PUT -H "X-Local-Token: ${res.local_token}" --data-binary @test.bin "http://127.0.0.1:${body.local_port}/local/v1/files/my-project/test.bin"`;
+        const uploadCmd = `curl -fsS -X PUT --data-binary @test.bin "http://127.0.0.1:${body.local_port}/local/v1/files/my-project/test.bin"`;
         const tokBox = document.getElementById('a-script-token-box');
         tokBox.innerHTML = `
-          <div><strong>请保存该分发节点的本机上传密钥 X-Local-Token（已内嵌到下方脚本）：</strong></div>
-          <div class="mono" style="margin:6px 0">${esc(res.local_token)}</div>
+          <div><strong>本机推流测试命令（仅限 127.0.0.1 回环访问，免鉴权直传）：</strong></div>
+          <div class="mono" style="margin:6px 0">${esc(uploadCmd)}</div>
           <div class="btn-row">
-            <button type="button" class="btn sm" data-copy-text="${esc(res.local_token)}">复制上传密钥</button>
             <button type="button" class="btn sm" data-copy-text="${esc(uploadCmd)}">复制本机推送测试命令</button>
           </div>
         `;

@@ -21,7 +21,8 @@ type Config struct {
 	CenterSecret         string   `yaml:"center_secret"`
 	Projects             []string `yaml:"projects"` // empty = allow any project
 	LocalListen          string   `yaml:"local_listen"`
-	LocalToken           string   `yaml:"local_token"`
+	LocalToken           string   `yaml:"local_token,omitempty"`
+	RequireLocalToken    bool     `yaml:"require_local_token,omitempty"` // default false: loopback 127.0.0.1/::1 requests do not require X-Local-Token
 	PublicListen         string   `yaml:"public_listen"`
 	TLSCert              string   `yaml:"tls_cert"`
 	TLSKey               string   `yaml:"tls_key"`
@@ -107,8 +108,8 @@ func (c *Config) Validate() error {
 	if c.CenterSecret == "" {
 		return errors.New("center_secret is required")
 	}
-	if c.LocalToken == "" {
-		return errors.New("local_token is required")
+	if c.RequireLocalToken && c.LocalToken == "" {
+		return errors.New("local_token is required when require_local_token is enabled")
 	}
 	host, _, err := net.SplitHostPort(c.LocalListen)
 	if err != nil {

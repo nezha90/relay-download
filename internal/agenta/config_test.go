@@ -1,6 +1,8 @@
 package agenta
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"testing"
 	"time"
@@ -48,11 +50,19 @@ func TestConfigValidationHardening(t *testing.T) {
 		}
 	}
 
-	// Missing local_token must fail.
+	// Empty local_token is allowed by default on loopback when require_local_token is false.
 	noLocalTok := baseValidConfig()
 	noLocalTok.LocalToken = ""
-	if err := noLocalTok.Validate(); err == nil {
-		t.Fatalf("expected empty local_token to fail validation")
+	if err := noLocalTok.Validate(); err != nil {
+		t.Fatalf("expected empty local_token to pass on loopback by default, got: %v", err)
+	}
+
+	// Empty local_token must fail when require_local_token is explicitly enabled.
+	reqLocalTok := baseValidConfig()
+	reqLocalTok.LocalToken = ""
+	reqLocalTok.RequireLocalToken = true
+	if err := reqLocalTok.Validate(); err == nil {
+		t.Fatalf("expected empty local_token to fail validation when require_local_token=true")
 	}
 
 	// Missing center_secret must fail.
@@ -150,5 +160,100 @@ func TestStoreNackBackoffAndAuthenticatedAckIdempotency(t *testing.T) {
 	_, already, err = st.AckAndRemove(reclaimed.FileID, reclaimed.LeaseID, "wrong-token", "b1", "abcd", nil, nil)
 	if err != ErrFileNotFound || already {
 		t.Fatalf("expected ErrFileNotFound for forged token, got already=%v err=%v", already, err)
+	}
+}
+
+func TestLocalAuthLoopbackNoTokenAndOriginGuard(t *testing.T) {
+	okHandler := func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}
+
+	// Default mode (RequireLocalToken=false): loopback allowed WITHOUT X-Local-Token,
+	// even if LocalToken is present in YAML (backward compatibility with existing nodes).
+	cfg := baseValidConfig()
+	a := &Agent{cfg: &cfg}
+	h := a.requireLocalAuth(okHandler)
+
+	for _, remote := range []string{"127.0.0.1:54321", "[::1]:54321", "localhost:1234"} {
+		req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:18081/local/v1/status", nil)
+		req.RemoteAddr = remote
+		rec := httptest.NewRecorder()
+		h(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected loopback %s without token to return 200, got %d", remote, rec.Code)
+		}
+	}
+
+	// Cross-origin browser request from non-loopback Origin must be blocked (403).
+	for _, badOrigin := range []string{"https://evil.example", "http://192.168.1.50:8080", "null"} {
+		req := httptest.NewRequest(http.MethodPut, "http://127.0.0.1:18081/local/v1/files/p/a.bin", nil)
+		req.RemoteAddr = "127.0.0.1:54321"
+		req.Header.Set("Origin", badOrigin)
+		rec := httptest.NewRecorder()
+		h(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("expected cross-origin %q to return 403, got %d", badOrigin, rec.Code)
+		}
+	}
+
+	// Non-loopback Host header (DNS rebinding) must be blocked (403).
+	for _, badHost := range []string{"evil.example:18081", "192.168.1.10:18081", "example.com"} {
+		req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:18081/local/v1/status", nil)
+		req.RemoteAddr = "127.0.0.1:54321"
+		req.Host = badHost
+		rec := httptest.NewRecorder()
+		h(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("expected non-loopback Host %q to return 403, got %d", badHost, rec.Code)
+		}
+	}
+
+	// Reverse-proxied requests (X-Forwarded-For / Forwarded / X-Real-IP) must be blocked (403).
+	for _, hdr := range []struct{ k, v string }{
+		{"X-Forwarded-For", "203.0.113.9"},
+		{"Forwarded", "for=203.0.113.9"},
+		{"X-Real-IP", "203.0.113.9"},
+	} {
+		req := httptest.NewRequest(http.MethodPut, "http://127.0.0.1:18081/local/v1/files/p/a.bin", nil)
+		req.RemoteAddr = "127.0.0.1:54321"
+		req.Header.Set(hdr.k, hdr.v)
+		rec := httptest.NewRecorder()
+		h(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("expected proxied header %s=%s to return 403, got %d", hdr.k, hdr.v, rec.Code)
+		}
+	}
+
+	// Non-loopback remote address must ALWAYS be rejected (403), even if valid token is supplied.
+	reqRemote := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:18081/local/v1/status", nil)
+	reqRemote.RemoteAddr = "192.0.2.10:44321"
+	reqRemote.Header.Set(protocol.HeaderLocalToken, cfg.LocalToken)
+	recRemote := httptest.NewRecorder()
+	h(recRemote, reqRemote)
+	if recRemote.Code != http.StatusForbidden {
+		t.Fatalf("expected non-loopback remote even with token to return 403, got %d", recRemote.Code)
+	}
+
+	// Opt-in strict mode (RequireLocalToken=true): loopback without token returns 401; matching token returns 200.
+	strictCfg := baseValidConfig()
+	strictCfg.RequireLocalToken = true
+	strictAgent := &Agent{cfg: &strictCfg}
+	strictH := strictAgent.requireLocalAuth(okHandler)
+
+	reqNoTok := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:18081/local/v1/status", nil)
+	reqNoTok.RemoteAddr = "127.0.0.1:54321"
+	recNoTok := httptest.NewRecorder()
+	strictH(recNoTok, reqNoTok)
+	if recNoTok.Code != http.StatusUnauthorized {
+		t.Fatalf("expected strict mode without token to return 401, got %d", recNoTok.Code)
+	}
+
+	reqGoodTok := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:18081/local/v1/status", nil)
+	reqGoodTok.RemoteAddr = "127.0.0.1:54321"
+	reqGoodTok.Header.Set(protocol.HeaderLocalToken, strictCfg.LocalToken)
+	recGoodTok := httptest.NewRecorder()
+	strictH(recGoodTok, reqGoodTok)
+	if recGoodTok.Code != http.StatusOK {
+		t.Fatalf("expected strict mode with matching token to return 200, got %d", recGoodTok.Code)
 	}
 }

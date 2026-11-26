@@ -160,7 +160,9 @@ func (f *feeder) queryAgentAStatus(ctx context.Context) (*protocol.LiveFilesResp
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set(protocol.HeaderLocalToken, f.localToken)
+	if f.localToken != "" {
+		req.Header.Set(protocol.HeaderLocalToken, f.localToken)
+	}
 	resp, err := f.httpClient.Do(req)
 	if err != nil {
 		return nil, err
@@ -249,7 +251,9 @@ func (f *feeder) pushObject(ctx context.Context, obj s3client.ObjectInfo) error 
 			if obj.Size >= 0 {
 				putReq.ContentLength = obj.Size
 			}
-			putReq.Header.Set(protocol.HeaderLocalToken, f.localToken)
+			if f.localToken != "" {
+				putReq.Header.Set(protocol.HeaderLocalToken, f.localToken)
+			}
 			putReq.Header.Set("Content-Type", "application/octet-stream")
 
 			putResp, putErr := f.httpClient.Do(putReq)
@@ -485,8 +489,8 @@ func main() {
 		}
 	}
 
-	if *s3Bucket == "" || *projectID == "" || aURL == "" || tok == "" {
-		logger.Error("required flags missing: -s3-bucket, -project, and (-agent-a-config or -agent-a-url + -local-token)")
+	if *s3Bucket == "" || *projectID == "" || aURL == "" {
+		logger.Error("required flags missing: -s3-bucket, -project, and (-agent-a-config or -agent-a-url)")
 		os.Exit(2)
 	}
 	if *concurrency <= 0 {
