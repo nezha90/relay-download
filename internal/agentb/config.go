@@ -12,6 +12,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"relay-download/internal/protocol"
+	"relay-download/internal/transfer"
 )
 
 type Config struct {
@@ -43,7 +44,7 @@ type Config struct {
 	ClaimBatchSize       int                 `yaml:"claim_batch_size,omitempty"`      // max files claimed per RPC
 	AckBatchIntervalMs   int                 `yaml:"ack_batch_interval_ms,omitempty"` // ms to buffer verified on-disk ACKs before batch-ack (<=0 = immediate)
 	AckBatchSize         int                 `yaml:"ack_batch_size,omitempty"`        // flush early once pending ACKs hit this count
-	MaxDiskUsagePct      float64             `yaml:"max_disk_usage_pct,omitempty"`    // mandatory per-disk watermark ceiling (default 90.0%)
+	MaxDiskUsagePct      float64             `yaml:"max_disk_usage_pct,omitempty"`    // mandatory per-disk watermark ceiling [1..99] (default 85.0%)
 	MinFreeDiskBytes     uint64              `yaml:"min_free_disk_bytes"`
 	RateLimitMBps        float64             `yaml:"rate_limit_mbps"`
 	PollIntervalSec      int                 `yaml:"poll_interval_sec"`
@@ -161,12 +162,7 @@ func (c *Config) ApplyDefaults() {
 	if c.AckBatchSize <= 0 {
 		c.AckBatchSize = 50
 	}
-	if c.MaxDiskUsagePct <= 0 {
-		c.MaxDiskUsagePct = 90.0
-	}
-	if c.MaxDiskUsagePct > 95.0 {
-		c.MaxDiskUsagePct = 95.0
-	}
+	c.MaxDiskUsagePct = transfer.NormalizeMaxDiskUsagePct(c.MaxDiskUsagePct)
 	if c.PollIntervalSec <= 0 {
 		c.PollIntervalSec = 10
 	}

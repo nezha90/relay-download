@@ -249,7 +249,7 @@
               <div class="api-code-item"><span class="badge offline">400</span><span>项目 ID 非法（仅允许 <code>A-Za-z0-9._-</code> 1~64 位）、文件名非法或 SHA256 不一致</span></div>
               <div class="api-code-item"><span class="badge offline">403</span><span>仅允许本机 <code>localhost / 127.0.0.1</code> 直连（拒绝远程、反代或跨站请求），或该分发节点限制了允许的项目</span></div>
               <div class="api-code-item"><span class="badge awaiting">503</span><span>分发节点尚未在控制台勾选激活数据盘，请前往「分发节点」选盘激活</span></div>
-              <div class="api-code-item"><span class="badge alarm">507</span><span>触发强制安全水位（≥85% 或剩余 ≤10GB），上游退避几秒重试即可，绝不写爆磁盘</span></div>
+              <div class="api-code-item"><span class="badge alarm">507</span><span>触发强制安全水位（默认 ≥85%，支持节点自定义 1%~99%），上游退避几秒重试即可，绝不写爆磁盘</span></div>
             </div>
           </div>
         </div>
@@ -298,7 +298,7 @@
             </div>
             <div class="step-item">
               <div class="step-title"><span class="step-num">3</span>强制水位防写爆保护</div>
-              <div class="step-desc">无论数据盘或系统盘 <code>/</code> 均强制启用安全水位（≤85% 且至少预留 10GB），超水位自动拒收/切盘，绝不撑爆系统。</div>
+              <div class="step-desc">无论数据盘或系统盘 <code>/</code> 均强制启用安全水位（支持自定义 1%~99%，默认 85%），超水位自动拒收/切盘，绝不撑爆系统。</div>
             </div>
             <div class="step-item">
               <div class="step-title"><span class="step-num">4</span>本机免鉴权推流并随时热控</div>
@@ -408,7 +408,7 @@
             </div>
             <div class="step-item">
               <div class="step-title"><span class="step-num">4</span>强制水位保护 & 免 SSH 热控</div>
-              <div class="step-desc">无论数据盘还是系统盘 <code>/</code> 均强制启用水位保护（≤90% 且保留 ≥10GB）；后续热增减硬盘、切项目、<strong>暂停/启动</strong>、热升级全在网页完成。</div>
+              <div class="step-desc">无论数据盘还是系统盘 <code>/</code> 均强制启用水位保护（支持自定义 1%~99%，默认 85%）；后续热增减硬盘、切项目、<strong>暂停/启动</strong>、热升级全在网页完成。</div>
               <div class="cmd-copy-row">
                 <code>sudo systemctl status relay-agent-b --no-pager</code>
                 <button type="button" class="btn sm" data-copy-text="sudo systemctl status relay-agent-b --no-pager">复制</button>
@@ -702,6 +702,9 @@
         <label id="node-multi-projects-wrap">绑定项目 (逗号分隔，留空表示允许全部项目)
           <input name="projects" placeholder="proj-alpha,proj-beta" autocomplete="off" />
         </label>
+        <label>数据盘强制安全水位上限 %（最低 1%，最高 99%，默认 85%，超过自动停写/切盘）
+          <input name="max_disk_usage_pct" type="number" value="85" min="1" max="99" step="1" />
+        </label>
         <button type="submit" class="btn primary full">创建并生成密钥</button>
       </form>
       <div id="node-token-result" class="token-box hidden"></div>
@@ -773,13 +776,13 @@
 
         <div class="config-section">
           <div class="disk-sec-head">
-            <div class="config-section-title">2. 选择数据盘与选盘策略（支持多盘并发 · 全盘强制水位 ≤90% 且保留 ≥10GB）</div>
+            <div class="config-section-title">2. 选择数据盘、选盘策略与强制水位（支持多盘并发 · 自定义 1%~99%，默认 85%）</div>
             <button type="button" id="btn-refresh-b-disks" class="btn sm">
               <svg class="ico ico-sm ico-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/></svg>
               <span>刷新物理盘</span>
             </button>
           </div>
-          <div class="form-grid-2">
+          <div class="form-grid-3">
             <label>多磁盘选盘策略
               <select name="disk_policy" id="edit-disk-policy-select">
                 <option value="affinity_hash">同源亲和均匀 (音视频与 .info.json 同盘，满盘溢出)</option>
@@ -791,6 +794,9 @@
             </label>
             <label id="edit-disk-window-wrap" class="hidden">同时写入盘数 N (1~256，满 1 块自动滚下一块)
               <input name="active_disk_window" type="number" value="10" min="1" max="256" />
+            </label>
+            <label>强制安全水位上限 % (1~99%，默认 85%)
+              <input name="max_disk_usage_pct" id="edit-b-watermark-input" type="number" value="85" min="1" max="99" step="1" />
             </label>
           </div>
           <div id="edit-disks-section">
@@ -844,7 +850,7 @@
       <div class="modal-head">
         <div>
           <h3 id="edit-a-disks-title">选择分发节点数据盘</h3>
-          <p class="muted">勾选 1 块或多块物理盘作为中转缓存盘（支持多盘并发传大文件，全盘强制水位保护 ≤85% 且预留 ≥10GB）</p>
+          <p class="muted">勾选 1 块或多块物理盘作为中转缓存盘（支持多盘并发传大文件，全盘强制安全水位支持自定义 1%~99%，默认 85%）</p>
         </div>
         <button class="btn ghost" type="button" data-close-modal="edit-a-disks-modal">关闭</button>
       </div>
@@ -855,11 +861,17 @@
         <input type="hidden" name="node_id" />
         <div class="config-section">
           <div class="disk-sec-head">
-            <div class="config-section-title">本机已挂载物理盘列表（自动过滤系统虚拟分区）</div>
+            <div class="config-section-title">本机已挂载物理盘列表与强制水位（自动过滤系统虚拟分区）</div>
             <button type="button" id="btn-refresh-a-disks" class="btn sm">
               <svg class="ico ico-sm ico-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/></svg>
               <span>刷新物理盘</span>
             </button>
+          </div>
+          <div class="form-grid-2" style="margin-bottom:8px">
+            <label>缓存盘强制安全水位上限 %（最低 1%，最高 99%，默认 85%）
+              <input name="max_disk_usage_pct" id="edit-a-watermark-input" type="number" value="85" min="1" max="99" step="1" />
+            </label>
+            <div class="muted" style="align-self:end;padding-bottom:6px">任意启用缓存盘达到水位即自动切盘，全部达到水位时本机上传返回 <code>507</code> 退避保护。</div>
           </div>
           <div class="muted">勾选即可自动创建 <code>&lt;挂载点&gt;/relay-cache</code>（系统盘自动建 <code>/data/relay-cache</code>）并开启多盘并发缓存；停用等待在途排空可安全拔盘，直接拔盘自动锁定防穿透写系统盘，重插后需人工勾选确认启用。</div>
           <div class="disk-picker-toolbar">
@@ -928,9 +940,12 @@
             <input name="data_dir" value="/data/relay-a" autocomplete="off" />
           </label>
         </div>
-        <div class="form-grid-2">
+        <div class="form-grid-3">
           <label>绑定项目 (逗号分隔，留空允许全部项目)
             <input name="projects" placeholder="proj-alpha,proj-beta" autocomplete="off" />
+          </label>
+          <label>数据盘强制安全水位 % (1~99%，默认 85%)
+            <input name="max_disk_usage_pct" type="number" value="85" min="1" max="99" step="1" />
           </label>
           <label>目标版本包 (留空自动匹配架构最新版)
             <select id="deploy-a-release-select" name="release_id">

@@ -71,9 +71,10 @@ type Agent struct {
 	diskPolicy       string              // "affinity_hash" | "most_free" | "round_robin" | "first" | "rolling_window"
 	activeDiskWindow int                 // concurrent active disk window for rolling_window policy
 	dirStorageDirs   []string            // Center-managed data disk pool roots (overrides cfg.StorageDirs when non-empty)
-	disabledDisks   map[string]struct{} // cleaned root paths disabled via Console or auto-locked on unplug
-	diskGen         int64               // monotonic Center disk-config generation
-	diskHealth      *transfer.DiskHealthTracker
+	disabledDisks    map[string]struct{} // cleaned root paths disabled via Console or auto-locked on unplug
+	diskGen          int64               // monotonic Center disk-config generation
+	maxDiskUsagePct  float64             // Center-customizable mandatory disk watermark [1..99], default 85
+	diskHealth       *transfer.DiskHealthTracker
 
 	hostDiskMu     sync.Mutex
 	hostDisksCache []protocol.HostDisk
@@ -289,6 +290,7 @@ func New(cfg *Config, logger *slog.Logger) (*Agent, error) {
 		projectSchedule:  cfg.ProjectSchedule,
 		diskPolicy:       cfg.DiskPolicy,
 		activeDiskWindow: cfg.ActiveDiskWindow,
+		maxDiskUsagePct:  transfer.NormalizeMaxDiskUsagePct(cfg.MaxDiskUsagePct),
 		diskHealth:       diskHealth,
 	}
 	upgradeClient := &http.Client{
@@ -558,6 +560,16 @@ func (a *Agent) effectiveActiveDiskWindow() int {
 	return w
 }
 
+func (a *Agent) effectiveMaxDiskUsagePct() float64 {
+	a.dirMu.RLock()
+	pct := a.maxDiskUsagePct
+	a.dirMu.RUnlock()
+	if pct <= 0 {
+		pct = a.cfg.MaxDiskUsagePct
+	}
+	return transfer.NormalizeMaxDiskUsagePct(pct)
+}
+
 func (a *Agent) isDiskRootDisabledLocked(root string) bool {
 	if len(a.disabledDisks) == 0 {
 		return false
@@ -685,7 +697,7 @@ func (a *Agent) handleLocalDiskErr(root string, err error) bool {
 		a.evictReadyDirsForRoot(root)
 		return true
 	}
-	probe := a.diskHealth.ProbeRoot(root, !a.isDiskRootDisabled(root), a.cfg.MaxDiskUsagePct, a.cfg.MinFreeDiskBytes, 0)
+	probe := a.diskHealth.ProbeRoot(root, !a.isDiskRootDisabled(root), a.effectiveMaxDiskUsagePct(), a.cfg.MinFreeDiskBytes, 0)
 	if probe.Detached || probe.UnplugLatched || !probe.Mounted {
 		a.evictReadyDirsForRoot(root)
 		a.logger.Warn("receiver disk detached during transfer, aborting file to protect source", "root", root, "reason", probe.StatusReason, "err", err)
@@ -879,6 +891,7 @@ func (a *Agent) applyDirective(dir *protocol.ReceiverDirective, legacyAllowed []
 		nextSched       = a.cfg.ProjectSchedule
 		nextDiskPol     = a.cfg.DiskPolicy
 		nextDiskWin     = a.cfg.ActiveDiskWindow
+		nextMaxDiskPct  = transfer.NormalizeMaxDiskUsagePct(a.cfg.MaxDiskUsagePct)
 		nextStorageDirs []string
 		nextDisabled    map[string]struct{}
 		nextDiskGen     int64
@@ -926,6 +939,9 @@ func (a *Agent) applyDirective(dir *protocol.ReceiverDirective, legacyAllowed []
 			if nextDiskWin > 256 {
 				nextDiskWin = 256
 			}
+		}
+		if dir.MaxDiskUsagePct > 0 {
+			nextMaxDiskPct = transfer.NormalizeMaxDiskUsagePct(dir.MaxDiskUsagePct)
 		}
 		if len(dir.DisabledDisks) > 0 {
 			nextDisabled = make(map[string]struct{}, len(dir.DisabledDisks))
@@ -984,6 +1000,7 @@ func (a *Agent) applyDirective(dir *protocol.ReceiverDirective, legacyAllowed []
 	policyChanged := a.projectSchedule != nextSched ||
 		a.diskPolicy != nextDiskPol ||
 		a.activeDiskWindow != nextDiskWin ||
+		a.maxDiskUsagePct != nextMaxDiskPct ||
 		!equalStringSlices(a.dirStorageDirs, nextStorageDirs) ||
 		!equalStringSet(a.disabledDisks, nextDisabled) ||
 		a.diskGen != nextDiskGen
@@ -995,6 +1012,7 @@ func (a *Agent) applyDirective(dir *protocol.ReceiverDirective, legacyAllowed []
 	a.projectSchedule = nextSched
 	a.diskPolicy = nextDiskPol
 	a.activeDiskWindow = nextDiskWin
+	a.maxDiskUsagePct = nextMaxDiskPct
 	a.dirStorageDirs = nextStorageDirs
 	a.disabledDisks = nextDisabled
 	if nextDiskGen > a.diskGen {
@@ -1635,12 +1653,13 @@ func (a *Agent) availableDiskFor(dir string) uint64 {
 	if a.isDiskRootDisabled(root) || a.diskHealth.IsBlocked(root) {
 		return 0
 	}
-	probe := a.diskHealth.ProbeRoot(root, true, a.cfg.MaxDiskUsagePct, a.cfg.MinFreeDiskBytes, 0)
+	maxPct := a.effectiveMaxDiskUsagePct()
+	probe := a.diskHealth.ProbeRoot(root, true, maxPct, a.cfg.MinFreeDiskBytes, 0)
 	if probe.Detached || probe.UnplugLatched || !probe.Mounted || !probe.Writable {
 		a.evictReadyDirsForRoot(root)
 		return 0
 	}
-	usable, _ := transfer.MandatoryWatermarkFree(probe.TotalBytes, probe.FreeBytes, a.cfg.MaxDiskUsagePct, a.cfg.MinFreeDiskBytes)
+	usable, _ := transfer.MandatoryWatermarkFree(probe.TotalBytes, probe.FreeBytes, maxPct, a.cfg.MinFreeDiskBytes)
 	return usable
 }
 
@@ -2924,9 +2943,10 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 	activeWinSize := a.effectiveActiveDiskWindow()
 	activeWinUsed := 0
 
+	maxPct := a.effectiveMaxDiskUsagePct()
 	for _, root := range roots {
 		enabled := enabledByRoot[root]
-		probe := a.diskHealth.ProbeRoot(root, enabled, a.cfg.MaxDiskUsagePct, a.cfg.MinFreeDiskBytes, 0)
+		probe := a.diskHealth.ProbeRoot(root, enabled, maxPct, a.cfg.MinFreeDiskBytes, 0)
 		if probe.Detached || probe.UnplugLatched {
 			a.evictReadyDirsForRoot(root)
 		}
@@ -3044,6 +3064,7 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 		DiskTotalBytes:   totalDisk,
 		DiskFreeBytes:    freeDisk,
 		DiskUsedPct:      usedPct,
+		MaxDiskUsagePct:  maxPct,
 		AwaitingDisk:     a.awaitingDisk(),
 		Paused:           a.paused.Load(),
 		ActiveCount:      int(a.activeCount.Load()),

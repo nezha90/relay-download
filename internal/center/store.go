@@ -15,6 +15,7 @@ import (
 
 	"relay-download/internal/auth"
 	"relay-download/internal/protocol"
+	"relay-download/internal/transfer"
 )
 
 const BaseIntervalSec int64 = 300 // 5-minute persisted summary buckets
@@ -205,6 +206,7 @@ CREATE TABLE IF NOT EXISTS accounts (
 		`ALTER TABLE nodes ADD COLUMN disk_gen INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE nodes ADD COLUMN active_disk_window INTEGER NOT NULL DEFAULT 10`,
 		`ALTER TABLE nodes ADD COLUMN owner_account_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE nodes ADD COLUMN max_disk_usage_pct REAL NOT NULL DEFAULT 85`,
 	}
 	for _, stmt := range migrations {
 		if _, err := db.Exec(stmt); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
@@ -427,6 +429,7 @@ func (s *Store) UpsertNode(ctx context.Context, n protocol.NodeRecord, rawToken 
 	if n.ActiveDiskWindow > 256 {
 		n.ActiveDiskWindow = 256
 	}
+	n.MaxDiskUsagePct = transfer.NormalizeMaxDiskUsagePct(n.MaxDiskUsagePct)
 	projJSON, _ := json.Marshal(n.Projects)
 	if n.Projects == nil {
 		projJSON = []byte("[]")
@@ -449,8 +452,8 @@ func (s *Store) UpsertNode(ctx context.Context, n protocol.NodeRecord, rawToken 
 	}
 	tokHash := auth.HashToken(rawToken)
 	_, err := s.db.ExecContext(ctx, `
-INSERT INTO nodes (id, name, role, owner_account_id, projects_json, project_schedule, disk_policy, active_disk_window, storage_dirs_json, disabled_disks_json, unplug_locked_disks_json, disk_gen, concurrency_mode, max_concurrent_override, rate_limit_mbps, paused, public_addr, token_hash, created_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO nodes (id, name, role, owner_account_id, projects_json, project_schedule, disk_policy, active_disk_window, storage_dirs_json, disabled_disks_json, unplug_locked_disks_json, disk_gen, max_disk_usage_pct, concurrency_mode, max_concurrent_override, rate_limit_mbps, paused, public_addr, token_hash, created_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
 	name=excluded.name,
 	role=excluded.role,
@@ -463,13 +466,14 @@ ON CONFLICT(id) DO UPDATE SET
 	disabled_disks_json=excluded.disabled_disks_json,
 	unplug_locked_disks_json=excluded.unplug_locked_disks_json,
 	disk_gen=excluded.disk_gen,
+	max_disk_usage_pct=excluded.max_disk_usage_pct,
 	concurrency_mode=excluded.concurrency_mode,
 	max_concurrent_override=excluded.max_concurrent_override,
 	rate_limit_mbps=excluded.rate_limit_mbps,
 	paused=excluded.paused,
 	public_addr=excluded.public_addr,
 	token_hash=CASE WHEN ? != '' THEN excluded.token_hash ELSE nodes.token_hash END
-`, n.ID, n.Name, n.Role, strings.TrimSpace(n.OwnerAccountID), string(projJSON), n.ProjectSchedule, n.DiskPolicy, n.ActiveDiskWindow, string(storageDirsJSON), string(disDisksJSON), string(unplugLockedJSON), n.DiskGen, n.ConcurrencyMode, n.MaxConcurrentOverride, n.RateLimitMBps, pausedInt, n.PublicAddr, tokHash, n.CreatedAt, rawToken)
+`, n.ID, n.Name, n.Role, strings.TrimSpace(n.OwnerAccountID), string(projJSON), n.ProjectSchedule, n.DiskPolicy, n.ActiveDiskWindow, string(storageDirsJSON), string(disDisksJSON), string(unplugLockedJSON), n.DiskGen, n.MaxDiskUsagePct, n.ConcurrencyMode, n.MaxConcurrentOverride, n.RateLimitMBps, pausedInt, n.PublicAddr, tokHash, n.CreatedAt, rawToken)
 	return err
 }
 
@@ -549,9 +553,9 @@ func (s *Store) AuthenticateNode(ctx context.Context, id, rawToken, expectedRole
 	var projJSON, storageDirsJSON, disDisksJSON, unplugLockedJSON string
 	var pausedInt int
 	err := s.db.QueryRowContext(ctx, `
-SELECT id, name, role, owner_account_id, projects_json, project_schedule, disk_policy, active_disk_window, storage_dirs_json, disabled_disks_json, unplug_locked_disks_json, disk_gen, concurrency_mode, max_concurrent_override, rate_limit_mbps, paused, public_addr, token_hash, created_at
+SELECT id, name, role, owner_account_id, projects_json, project_schedule, disk_policy, active_disk_window, storage_dirs_json, disabled_disks_json, unplug_locked_disks_json, disk_gen, max_disk_usage_pct, concurrency_mode, max_concurrent_override, rate_limit_mbps, paused, public_addr, token_hash, created_at
 FROM nodes WHERE id = ?
-`, id).Scan(&sn.ID, &sn.Name, &sn.Role, &sn.OwnerAccountID, &projJSON, &sn.ProjectSchedule, &sn.DiskPolicy, &sn.ActiveDiskWindow, &storageDirsJSON, &disDisksJSON, &unplugLockedJSON, &sn.DiskGen, &sn.ConcurrencyMode, &sn.MaxConcurrentOverride, &sn.RateLimitMBps, &pausedInt, &sn.PublicAddr, &sn.TokenHash, &sn.CreatedAt)
+`, id).Scan(&sn.ID, &sn.Name, &sn.Role, &sn.OwnerAccountID, &projJSON, &sn.ProjectSchedule, &sn.DiskPolicy, &sn.ActiveDiskWindow, &storageDirsJSON, &disDisksJSON, &unplugLockedJSON, &sn.DiskGen, &sn.MaxDiskUsagePct, &sn.ConcurrencyMode, &sn.MaxConcurrentOverride, &sn.RateLimitMBps, &pausedInt, &sn.PublicAddr, &sn.TokenHash, &sn.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -578,6 +582,7 @@ FROM nodes WHERE id = ?
 	if sn.ActiveDiskWindow <= 0 {
 		sn.ActiveDiskWindow = 10
 	}
+	sn.MaxDiskUsagePct = transfer.NormalizeMaxDiskUsagePct(sn.MaxDiskUsagePct)
 	if sn.ConcurrencyMode == "" {
 		sn.ConcurrencyMode = protocol.ConcurrencyAuto
 	}
@@ -586,7 +591,7 @@ FROM nodes WHERE id = ?
 
 func (s *Store) ListNodes(ctx context.Context) ([]protocol.NodeRecord, error) {
 	rows, err := s.db.QueryContext(ctx, `
-SELECT id, name, role, owner_account_id, projects_json, project_schedule, disk_policy, active_disk_window, storage_dirs_json, disabled_disks_json, unplug_locked_disks_json, disk_gen, concurrency_mode, max_concurrent_override, rate_limit_mbps, paused, public_addr, created_at
+SELECT id, name, role, owner_account_id, projects_json, project_schedule, disk_policy, active_disk_window, storage_dirs_json, disabled_disks_json, unplug_locked_disks_json, disk_gen, max_disk_usage_pct, concurrency_mode, max_concurrent_override, rate_limit_mbps, paused, public_addr, created_at
 FROM nodes ORDER BY role ASC, created_at ASC
 `)
 	if err != nil {
@@ -598,7 +603,7 @@ FROM nodes ORDER BY role ASC, created_at ASC
 		var n protocol.NodeRecord
 		var projJSON, storageDirsJSON, disDisksJSON, unplugLockedJSON string
 		var pausedInt int
-		if err := rows.Scan(&n.ID, &n.Name, &n.Role, &n.OwnerAccountID, &projJSON, &n.ProjectSchedule, &n.DiskPolicy, &n.ActiveDiskWindow, &storageDirsJSON, &disDisksJSON, &unplugLockedJSON, &n.DiskGen, &n.ConcurrencyMode, &n.MaxConcurrentOverride, &n.RateLimitMBps, &pausedInt, &n.PublicAddr, &n.CreatedAt); err != nil {
+		if err := rows.Scan(&n.ID, &n.Name, &n.Role, &n.OwnerAccountID, &projJSON, &n.ProjectSchedule, &n.DiskPolicy, &n.ActiveDiskWindow, &storageDirsJSON, &disDisksJSON, &unplugLockedJSON, &n.DiskGen, &n.MaxDiskUsagePct, &n.ConcurrencyMode, &n.MaxConcurrentOverride, &n.RateLimitMBps, &pausedInt, &n.PublicAddr, &n.CreatedAt); err != nil {
 			return nil, err
 		}
 		n.Paused = pausedInt != 0
@@ -615,6 +620,7 @@ FROM nodes ORDER BY role ASC, created_at ASC
 		if n.ActiveDiskWindow <= 0 {
 			n.ActiveDiskWindow = 10
 		}
+		n.MaxDiskUsagePct = transfer.NormalizeMaxDiskUsagePct(n.MaxDiskUsagePct)
 		if n.ConcurrencyMode == "" {
 			n.ConcurrencyMode = protocol.ConcurrencyAuto
 		}
@@ -628,9 +634,9 @@ func (s *Store) GetNode(ctx context.Context, id string) (*protocol.NodeRecord, e
 	var projJSON, storageDirsJSON, disDisksJSON, unplugLockedJSON string
 	var pausedInt int
 	err := s.db.QueryRowContext(ctx, `
-SELECT id, name, role, owner_account_id, projects_json, project_schedule, disk_policy, active_disk_window, storage_dirs_json, disabled_disks_json, unplug_locked_disks_json, disk_gen, concurrency_mode, max_concurrent_override, rate_limit_mbps, paused, public_addr, created_at
+SELECT id, name, role, owner_account_id, projects_json, project_schedule, disk_policy, active_disk_window, storage_dirs_json, disabled_disks_json, unplug_locked_disks_json, disk_gen, max_disk_usage_pct, concurrency_mode, max_concurrent_override, rate_limit_mbps, paused, public_addr, created_at
 FROM nodes WHERE id = ?
-`, id).Scan(&n.ID, &n.Name, &n.Role, &n.OwnerAccountID, &projJSON, &n.ProjectSchedule, &n.DiskPolicy, &n.ActiveDiskWindow, &storageDirsJSON, &disDisksJSON, &unplugLockedJSON, &n.DiskGen, &n.ConcurrencyMode, &n.MaxConcurrentOverride, &n.RateLimitMBps, &pausedInt, &n.PublicAddr, &n.CreatedAt)
+`, id).Scan(&n.ID, &n.Name, &n.Role, &n.OwnerAccountID, &projJSON, &n.ProjectSchedule, &n.DiskPolicy, &n.ActiveDiskWindow, &storageDirsJSON, &disDisksJSON, &unplugLockedJSON, &n.DiskGen, &n.MaxDiskUsagePct, &n.ConcurrencyMode, &n.MaxConcurrentOverride, &n.RateLimitMBps, &pausedInt, &n.PublicAddr, &n.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -651,6 +657,7 @@ FROM nodes WHERE id = ?
 	if n.ActiveDiskWindow <= 0 {
 		n.ActiveDiskWindow = 10
 	}
+	n.MaxDiskUsagePct = transfer.NormalizeMaxDiskUsagePct(n.MaxDiskUsagePct)
 	if n.ConcurrencyMode == "" {
 		n.ConcurrencyMode = protocol.ConcurrencyAuto
 	}

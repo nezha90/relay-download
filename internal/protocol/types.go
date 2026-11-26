@@ -113,6 +113,7 @@ type ReceiverDirective struct {
 	StorageDirs        []string `json:"storage_dirs,omitempty"`         // optional Center-managed data disk pool roots (overrides local storage_dirs when non-empty)
 	DisabledDisks      []string `json:"disabled_disks,omitempty"`       // storage root dirs disabled via console or auto-locked on unplug
 	DiskGen            int64    `json:"disk_gen,omitempty"`             // monotonic operator disk-config generation (clears prior unplug latch on re-enable)
+	MaxDiskUsagePct    float64  `json:"max_disk_usage_pct,omitempty"`   // customizable mandatory disk watermark ceiling [1..99], default 85
 	ConcurrencyMode    string   `json:"concurrency_mode,omitempty"`     // "auto" | "manual"
 	MaxConcurrent      int      `json:"max_concurrent,omitempty"`       // >0 overrides effective upper concurrency cap
 	SuggestedStreamCap int      `json:"suggested_stream_cap,omitempty"` // >0 cluster-wide fair-share stream ceiling from dispatch capacity
@@ -151,6 +152,7 @@ type NodeRecord struct {
 	DisabledDisks         []string  `json:"disabled_disks,omitempty"`
 	UnplugLockedDisks     []string  `json:"unplug_locked_disks,omitempty"`
 	DiskGen               int64     `json:"disk_gen,omitempty"`
+	MaxDiskUsagePct       float64   `json:"max_disk_usage_pct,omitempty"`
 	ConcurrencyMode       string    `json:"concurrency_mode,omitempty"`
 	MaxConcurrentOverride int       `json:"max_concurrent_override,omitempty"`
 	RateLimitMBps         float64   `json:"rate_limit_mbps,omitempty"`
@@ -181,6 +183,7 @@ type AgentAHeartbeatReq struct {
 	DiskFreeBytes        uint64                `json:"disk_free_bytes"`
 	DiskUsedPct          float64               `json:"disk_used_pct"`
 	DiskAlarm            bool                  `json:"disk_alarm"`
+	MaxDiskUsagePct      float64               `json:"max_disk_usage_pct,omitempty"`
 	StorageDirs          []string              `json:"storage_dirs,omitempty"`
 	Disks                []DiskStatus          `json:"disks,omitempty"`
 	HostDisks            []HostDisk            `json:"host_disks,omitempty"`
@@ -232,6 +235,7 @@ type AgentBHeartbeatReq struct {
 	DiskTotalBytes        uint64            `json:"disk_total_bytes"`
 	DiskFreeBytes         uint64            `json:"disk_free_bytes"`
 	DiskUsedPct           float64           `json:"disk_used_pct"`
+	MaxDiskUsagePct       float64           `json:"max_disk_usage_pct,omitempty"`
 	AwaitingDisk          bool              `json:"awaiting_disk,omitempty"`
 	Paused                bool              `json:"paused,omitempty"`
 	ActiveCount           int               `json:"active_count"`
@@ -248,9 +252,10 @@ type UpgradeDirective struct {
 
 type HeartbeatResp struct {
 	Paused          bool                `json:"paused,omitempty"`
-	StorageDirs     []string            `json:"storage_dirs,omitempty"`   // for agent_a: Center-selected multi-disk cache roots
-	DisabledDisks   []string            `json:"disabled_disks,omitempty"` // for agent_a: disabled / unplug-locked cache roots
-	DiskGen         int64               `json:"disk_gen,omitempty"`       // monotonic operator disk-config generation
+	StorageDirs     []string            `json:"storage_dirs,omitempty"`       // for agent_a: Center-selected multi-disk cache roots
+	DisabledDisks   []string            `json:"disabled_disks,omitempty"`     // for agent_a: disabled / unplug-locked cache roots
+	DiskGen         int64               `json:"disk_gen,omitempty"`           // monotonic operator disk-config generation
+	MaxDiskUsagePct float64             `json:"max_disk_usage_pct,omitempty"` // for agent_a: Center-configured mandatory disk watermark [1..99]
 	Upgrade         *UpgradeDirective   `json:"upgrade,omitempty"`
 	AllowedProjects []string            `json:"allowed_projects,omitempty"`
 	Directive       *ReceiverDirective  `json:"directive,omitempty"`
@@ -499,6 +504,7 @@ type LiveNodeView struct {
 	DisabledDisks         []string              `json:"disabled_disks,omitempty"`
 	UnplugLockedDisks     []string              `json:"unplug_locked_disks,omitempty"`
 	DiskGen               int64                 `json:"disk_gen,omitempty"`
+	MaxDiskUsagePct       float64               `json:"max_disk_usage_pct,omitempty"`
 	ConcurrencyMode       string                `json:"concurrency_mode,omitempty"`
 	MaxConcurrentOverride int                   `json:"max_concurrent_override,omitempty"`
 	RateLimitMBps         float64               `json:"rate_limit_mbps,omitempty"`
@@ -705,6 +711,7 @@ type AgentBScriptReq struct {
 	Projects           map[string]string   `json:"projects,omitempty"`
 	ProjectDirs        map[string][]string `json:"project_dirs,omitempty"`
 	MaxConcurrent      int                 `json:"max_concurrent,omitempty"`
+	MaxDiskUsagePct    float64             `json:"max_disk_usage_pct,omitempty"`
 	MinFreeDiskBytes   uint64              `json:"min_free_disk_bytes,omitempty"`
 	AckBatchIntervalMs int                 `json:"ack_batch_interval_ms,omitempty"`
 	ReleaseID          string              `json:"release_id,omitempty"`

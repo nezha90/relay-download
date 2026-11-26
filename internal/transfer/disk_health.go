@@ -554,7 +554,7 @@ func (t *DiskHealthTracker) ProbeRoot(root string, enabled bool, maxUsedPct floa
 				res.StatusReason = fmt.Sprintf("停用中（尚有 %d 个待分发缓存文件）", extraQueued)
 			}
 		case res.LowSpace:
-			res.StatusReason = "触达强制安全水位"
+			res.StatusReason = fmt.Sprintf("触达强制安全水位 (≥%.0f%%)", NormalizeMaxDiskUsagePct(maxUsedPct))
 		default:
 			if lReason != "" && !isLatched {
 				delete(t.latchedReason, clean)

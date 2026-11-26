@@ -1,6 +1,7 @@
 package agenta
 
 import (
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -8,6 +9,7 @@ import (
 	"time"
 
 	"relay-download/internal/protocol"
+	"relay-download/internal/transfer"
 )
 
 func baseValidConfig() Config {
@@ -255,5 +257,35 @@ func TestLocalAuthLoopbackNoTokenAndOriginGuard(t *testing.T) {
 	strictH(recGoodTok, reqGoodTok)
 	if recGoodTok.Code != http.StatusOK {
 		t.Fatalf("expected strict mode with matching token to return 200, got %d", recGoodTok.Code)
+	}
+}
+
+func TestDispatchCustomWatermarkHotUpdate(t *testing.T) {
+	cfg := baseValidConfig()
+	cfg.ApplyDefaults()
+	if cfg.MaxDiskUsagePct != 85.0 {
+		t.Fatalf("expected default MaxDiskUsagePct=85, got %.1f", cfg.MaxDiskUsagePct)
+	}
+	a := &Agent{
+		cfg:             &cfg,
+		maxDiskUsagePct: cfg.MaxDiskUsagePct,
+		disabledDisks:   make(map[string]struct{}),
+		diskHealth:      transfer.NewDiskHealthTracker(),
+		logger:          slog.Default(),
+	}
+	if got := a.effectiveMaxDiskUsagePct(); got != 85.0 {
+		t.Fatalf("expected default effective watermark 85, got %.1f", got)
+	}
+	a.applyDiskConfig(nil, nil, 0, 99.0)
+	if got := a.effectiveMaxDiskUsagePct(); got != 99.0 {
+		t.Fatalf("expected hot-updated 99%% watermark, got %.1f", got)
+	}
+	a.applyDiskConfig(nil, nil, 0, 1.0)
+	if got := a.effectiveMaxDiskUsagePct(); got != 1.0 {
+		t.Fatalf("expected hot-updated 1%% watermark, got %.1f", got)
+	}
+	a.applyDiskConfig(nil, nil, 0, 100.0)
+	if got := a.effectiveMaxDiskUsagePct(); got != 99.0 {
+		t.Fatalf("expected >99%% clamped to 99%%, got %.1f", got)
 	}
 }

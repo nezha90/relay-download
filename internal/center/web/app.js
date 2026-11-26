@@ -965,7 +965,7 @@ def push_file(local_path: str, rel_name: str):
             r = requests.put(url, headers=headers, data=f, timeout=600)
         if r.status_code == 200:
             return r.json()  # {"file_id": ..., "status": "ready"}
-        if r.status_code in (503, 507):  # 待选盘激活 或 触发 85% 强制水位保护
+        if r.status_code in (503, 507):  # 待选盘激活 或 触发强制安全水位保护
             time.sleep(min(30, 2 ** attempt))
             continue
         r.raise_for_status()
@@ -1310,11 +1310,50 @@ function renderDiskMiniItem(d, disabledSet, lockedSet, watermarkPct) {
   `;
 }
 
+function nodeWatermarkPct(node) {
+  const v = Number(node && node.max_disk_usage_pct);
+  if (!Number.isFinite(v) || v <= 0) return 85;
+  return Math.max(1, Math.min(99, Math.round(v * 10) / 10));
+}
+
+function parseWatermarkInput(raw) {
+  const v = Number(raw);
+  if (!Number.isFinite(v) || v < 1 || v > 99) return null;
+  return Math.round(v * 10) / 10;
+}
+
+function updateDiskPickerWatermarkPreview(listEl, wm) {
+  if (!listEl || !Number.isFinite(wm)) return;
+  const clamped = Math.max(1, Math.min(99, wm));
+  listEl.querySelectorAll('[data-disk-row]').forEach(row => {
+    const pct = Number(row.dataset.usedPct);
+    const wmSpan = row.querySelector('[data-wm-label]');
+    if (wmSpan) {
+      wmSpan.textContent = wmSpan.dataset.isSystem === '1'
+        ? `系统盘 · 强制水位 ≤${clamped}%`
+        : `数据盘 · 强制水位 ≤${clamped}%`;
+    }
+    if (Number.isFinite(pct)) {
+      const over = pct >= clamped;
+      const overBadge = row.querySelector('[data-wm-over]');
+      if (overBadge) overBadge.classList.toggle('hidden', !over);
+      const chk = row.querySelector('input.edit-disk-chk');
+      const bar = row.querySelector('.bar-fill');
+      if (bar && chk && chk.checked) {
+        bar.classList.toggle('red', over);
+        bar.classList.toggle('green', !over);
+      }
+    }
+  });
+}
+
 function renderReceiverDisks(n) {
+  const wm = nodeWatermarkPct(n);
+  const wmBadge = `<span class="badge">水位 ≤${wm}%</span>`;
   if (n.awaiting_disk) {
     const foundCnt = (n.host_disks || []).length;
     return `
-      <div><span class="badge awaiting">⚠ 待选择数据盘（未激活）</span></div>
+      <div style="display:flex;gap:4px;flex-wrap:wrap;align-items:center"><span class="badge awaiting">⚠ 待选择数据盘（未激活）</span>${wmBadge}</div>
       <div class="muted" style="margin-top:4px">${foundCnt > 0 ? `已扫描到 ${foundCnt} 块物理盘，请点右侧「选择数据盘并激活」` : '请点右侧「选择数据盘并激活」'}</div>
     `;
   }
@@ -1323,7 +1362,7 @@ function renderReceiverDisks(n) {
   if (!disks.length) {
     return `
       <div>${fmtBytes(n.disk_free_bytes)} <span class="muted">(${(n.disk_used_pct || 0).toFixed(1)}% 已用)</span></div>
-      <div style="margin-top:4px">${polBadge}</div>
+      <div style="margin-top:4px;display:flex;gap:4px;flex-wrap:wrap">${polBadge}${wmBadge}</div>
     `;
   }
   const disabledSet = new Set(n.disabled_disks || []);
@@ -1344,7 +1383,7 @@ function renderReceiverDisks(n) {
     displayDisks = (priority.length ? priority : disks).slice(0, 6);
     hiddenCount = disks.length - displayDisks.length;
   }
-  const items = displayDisks.map(d => renderDiskMiniItem(d, disabledSet, lockedSet, 90)).join('');
+  const items = displayDisks.map(d => renderDiskMiniItem(d, disabledSet, lockedSet, wm)).join('');
   const summaryHtml = disks.length > 6 ? `
     <div class="disk-summary-strip">
       <span class="badge online">写入 ${activeCnt}</span>
@@ -1357,6 +1396,7 @@ function renderReceiverDisks(n) {
   return `
     <div style="margin-bottom:5px;display:flex;gap:4px;flex-wrap:wrap;align-items:center">
       ${polBadge}
+      ${wmBadge}
       ${activeCnt > 1 ? `<span class="badge accent">${activeCnt} 盘并发</span>` : ''}
     </div>
     ${summaryHtml}
@@ -1366,10 +1406,12 @@ function renderReceiverDisks(n) {
 }
 
 function renderDispatchDisks(n) {
+  const wm = nodeWatermarkPct(n);
+  const wmBadge = `<span class="badge">水位 ≤${wm}%</span>`;
   if (n.awaiting_disk) {
     const foundCnt = (n.host_disks || []).length;
     return `
-      <div><span class="badge awaiting">⚠ 待选缓存盘（未激活）</span></div>
+      <div style="display:flex;gap:4px;flex-wrap:wrap;align-items:center"><span class="badge awaiting">⚠ 待选缓存盘（未激活）</span>${wmBadge}</div>
       <div class="muted" style="margin-top:4px">${foundCnt > 0 ? `已扫描到 ${foundCnt} 块物理盘，请点右侧激活` : '请点右侧「选择数据盘并激活」'}</div>
     `;
   }
@@ -1378,15 +1420,19 @@ function renderDispatchDisks(n) {
     const disabledSet = new Set(n.disabled_disks || []);
     const lockedSet = new Set(n.unplug_locked_disks || []);
     const activeCnt = disks.filter(d => d.enabled !== false && !disabledSet.has(d.path) && !d.detached && !d.unplug_latched && !lockedSet.has(d.path)).length;
-    const items = disks.map(d => renderDiskMiniItem(d, disabledSet, lockedSet, 85)).join('');
+    const items = disks.map(d => renderDiskMiniItem(d, disabledSet, lockedSet, wm)).join('');
     return `
-      ${activeCnt > 1 ? `<div style="margin-bottom:5px"><span class="badge accent">${activeCnt} 盘并发缓存</span></div>` : ''}
+      <div style="margin-bottom:5px;display:flex;gap:4px;flex-wrap:wrap;align-items:center">
+        ${wmBadge}
+        ${activeCnt > 1 ? `<span class="badge accent">${activeCnt} 盘并发缓存</span>` : ''}
+      </div>
       <div class="disk-mini-list">${items}</div>
     `;
   }
   const pct = Number(n.disk_used_pct || 0).toFixed(1);
   return `
-    <div class="bar-wrap"><div class="bar-fill ${n.disk_alarm ? 'red' : ''}" style="width:${Math.min(100, Number(pct))}%"></div></div>
+    <div style="margin-bottom:4px">${wmBadge}</div>
+    <div class="bar-wrap"><div class="bar-fill ${n.disk_alarm || Number(pct) >= wm ? 'red' : ''}" style="width:${Math.min(100, Number(pct))}%"></div></div>
     <div class="muted">${pct}% (剩余 ${fmtBytes(n.disk_free_bytes)})</div>
   `;
 }
@@ -1835,6 +1881,7 @@ function readDeployAForm() {
     local_port: Number(fd.get('local_port') || 18081),
     install_dir: String(fd.get('install_dir') || '/opt/relay-agent-a').trim(),
     data_dir: String(fd.get('data_dir') || '/data/relay-a').trim(),
+    max_disk_usage_pct: Number(fd.get('max_disk_usage_pct') || 85),
     projects: projs,
     release_id: String(fd.get('release_id') || ''),
     force_overwrite: document.getElementById('deploy-force-chk').checked,
@@ -2042,11 +2089,11 @@ function renderHostDiskPicker(wrap, node, watermarkPct) {
       const checked = isConfigured && !isDisabled;
 
       const pct = Number(hd.used_pct || 0);
-      const overWM = pct >= watermarkPct || (hd.total_bytes >= 50 * 1024 * 1024 * 1024 && hd.free_bytes <= 10 * 1024 * 1024 * 1024);
+      const overWM = pct >= watermarkPct;
       const barCls = !checked ? '' : (overWM ? 'red' : 'green');
       const kindBadge = hd.is_system
-        ? `<span class="badge alarm">系统盘 · 强制水位 ≤${watermarkPct}%</span>`
-        : `<span class="badge accent">数据盘 · 强制水位 ≤${watermarkPct}%</span>`;
+        ? `<span class="badge alarm" data-wm-label="1" data-is-system="1">系统盘 · 强制水位 ≤${watermarkPct}%</span>`
+        : `<span class="badge accent" data-wm-label="1" data-is-system="0">数据盘 · 强制水位 ≤${watermarkPct}%</span>`;
 
       let stateBadge = '';
       let subText = '';
@@ -2092,7 +2139,7 @@ function renderHostDiskPicker(wrap, node, watermarkPct) {
 
       const searchHaystack = `${hd.mount_point} ${hd.device} ${hd.fs_type} ${targetPath}`.toLowerCase();
       return `
-        <div class="disk-toggle-row${rowCls}" data-disk-row="1" data-search="${esc(searchHaystack)}">
+        <div class="disk-toggle-row${rowCls}" data-disk-row="1" data-used-pct="${pct.toFixed(2)}" data-search="${esc(searchHaystack)}">
           <label class="disk-toggle-left" style="cursor:pointer;flex:1">
             <input type="checkbox" class="edit-disk-chk" data-source="host" data-is-system="${hd.is_system ? '1' : '0'}" data-writable="${hd.writable === false ? '0' : '1'}" data-configured="${isConfigured ? '1' : '0'}" data-dir="${esc(targetPath)}" value="${esc(targetPath)}" ${checked ? 'checked' : ''} />
             <div>
@@ -2101,7 +2148,7 @@ function renderHostDiskPicker(wrap, node, watermarkPct) {
                 <span class="muted mono">${esc(hd.device)} · ${esc(hd.fs_type)}</span>
                 ${kindBadge}
                 ${stateBadge}
-                ${overWM ? '<span class="badge offline">接近/超水位</span>' : ''}
+                <span class="badge offline${overWM ? '' : ' hidden'}" data-wm-over="1">接近/超水位</span>
               </div>
               <div class="muted disk-toggle-sub" style="margin-top:3px">目录: <span class="mono">${esc(targetPath)}</span> · ${esc(subText)}${hd.writable === false ? ' · 不可写' : ''}</div>
             </div>
@@ -2210,7 +2257,7 @@ function collectDiskSelectionFromPicker(listEl, node) {
   };
 }
 
-function renderEditDisksList(node) {
+function renderEditDisksList(node, overrideWatermark) {
   const sec = document.getElementById('edit-disks-section');
   const wrap = document.getElementById('edit-disks-list');
   const tip = document.getElementById('edit-storage-pool-tip');
@@ -2219,7 +2266,8 @@ function renderEditDisksList(node) {
     const hasInfo = (node.host_disks && node.host_disks.length > 0) || (node.disks && node.disks.length > 0);
     tip.classList.toggle('hidden', !node.online || hasInfo);
   }
-  renderHostDiskPicker(wrap, node, 90);
+  const wm = Number.isFinite(overrideWatermark) ? overrideWatermark : nodeWatermarkPct(node);
+  renderHostDiskPicker(wrap, node, wm);
 }
 
 function updateNodeDiskModalBanners(node, role) {
@@ -2256,15 +2304,18 @@ async function refreshNodeDisksInModal(nodeId, role, btnEl) {
     node.online = !!fresh.online;
     node.awaiting_disk = !!fresh.awaiting_disk;
     node.disk_gen = fresh.disk_gen || 0;
+    if (fresh.max_disk_usage_pct) node.max_disk_usage_pct = fresh.max_disk_usage_pct;
     node.storage_dirs = fresh.storage_dirs || [];
     node.disabled_disks = fresh.disabled_disks || [];
     node.unplug_locked_disks = fresh.unplug_locked_disks || [];
     node.disks = fresh.disks || [];
     node.host_disks = fresh.host_disks || [];
     if (role === 'agent_b') {
-      renderEditDisksList(node);
+      const inpWm = parseWatermarkInput(document.getElementById('edit-b-watermark-input')?.value);
+      renderEditDisksList(node, inpWm ?? nodeWatermarkPct(node));
     } else {
-      renderHostDiskPicker(document.getElementById('edit-a-disks-list'), node, 85);
+      const inpWm = parseWatermarkInput(document.getElementById('edit-a-watermark-input')?.value);
+      renderHostDiskPicker(document.getElementById('edit-a-disks-list'), node, inpWm ?? nodeWatermarkPct(node));
     }
     updateNodeDiskModalBanners(node, role);
     const cnt = (node.host_disks || []).length;
@@ -2289,10 +2340,14 @@ function openEditADisksModal(nodeId) {
   if (!form) return;
   form.reset();
   form.elements.node_id.value = node.id;
+  const wm = nodeWatermarkPct(node);
+  if (form.elements.max_disk_usage_pct) {
+    form.elements.max_disk_usage_pct.value = wm;
+  }
   document.getElementById('edit-a-disks-title').textContent = node.awaiting_disk
     ? `⚡ 选择分发节点数据盘并激活: ${node.name || node.id}`
     : `选择分发节点数据盘: ${node.name || node.id}`;
-  renderHostDiskPicker(document.getElementById('edit-a-disks-list'), node, 85);
+  renderHostDiskPicker(document.getElementById('edit-a-disks-list'), node, wm);
   updateNodeDiskModalBanners(node, 'agent_a');
   openModal('edit-a-disks-modal');
   if (node.online) {
@@ -2314,6 +2369,9 @@ function openEditNodeProjectsModal(nodeId) {
   form.elements.disk_policy.value = node.disk_policy || 'affinity_hash';
   if (form.elements.active_disk_window) {
     form.elements.active_disk_window.value = node.active_disk_window || 10;
+  }
+  if (form.elements.max_disk_usage_pct) {
+    form.elements.max_disk_usage_pct.value = nodeWatermarkPct(node);
   }
   syncDiskPolicyWindowUI('edit-disk-policy-select', 'edit-disk-window-wrap');
   const bSearch = document.getElementById('edit-b-disk-search');
@@ -2754,6 +2812,14 @@ function setupEvents() {
   document.getElementById('edit-disk-policy-select')?.addEventListener('change', () => {
     syncDiskPolicyWindowUI('edit-disk-policy-select', 'edit-disk-window-wrap');
   });
+  document.getElementById('edit-b-watermark-input')?.addEventListener('input', (e) => {
+    const v = parseWatermarkInput(e.target.value);
+    if (v !== null) updateDiskPickerWatermarkPreview(document.getElementById('edit-disks-list'), v);
+  });
+  document.getElementById('edit-a-watermark-input')?.addEventListener('input', (e) => {
+    const v = parseWatermarkInput(e.target.value);
+    if (v !== null) updateDiskPickerWatermarkPreview(document.getElementById('edit-a-disks-list'), v);
+  });
 
   document.getElementById('create-project-form').addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -2861,6 +2927,12 @@ function setupEvents() {
       projs = String(fd.get('projects') || '').split(',').map(s => s.trim()).filter(Boolean);
     }
 
+    const maxDiskPct = parseWatermarkInput(fd.get('max_disk_usage_pct') || 85);
+    if (maxDiskPct === null) {
+      showToast('强制安全水位必须在 1% ~ 99% 之间', 'error');
+      return;
+    }
+
     try {
       const payload = {
         id: fd.get('id'),
@@ -2868,6 +2940,7 @@ function setupEvents() {
         role,
         public_addr: fd.get('public_addr'),
         projects: projs,
+        max_disk_usage_pct: maxDiskPct,
       };
       if (role === 'agent_b') {
         payload.project_schedule = String(fd.get('project_schedule') || 'fifo');
@@ -2932,6 +3005,12 @@ function setupEvents() {
       projs = [];
     }
 
+    const maxDiskPct = parseWatermarkInput(fd.get('max_disk_usage_pct') || 85);
+    if (maxDiskPct === null) {
+      showToast('强制安全水位必须在 1% ~ 99% 之间', 'error');
+      return;
+    }
+
     const node = cachedNodes.find(n => n.id === nodeId);
     const sel = collectDiskSelectionFromPicker(document.getElementById('edit-disks-list'), node);
     const body = {
@@ -2940,6 +3019,7 @@ function setupEvents() {
       project_schedule: projectSchedule,
       disk_policy: diskPolicy,
       active_disk_window: Number(fd.get('active_disk_window') || 10),
+      max_disk_usage_pct: maxDiskPct,
       concurrency_mode: String(fd.get('concurrency_mode') || 'auto'),
       max_concurrent_override: Number(fd.get('max_concurrent_override') || 0),
       rate_limit_mbps: Number(fd.get('rate_limit_mbps') || 0),
@@ -3006,7 +3086,15 @@ function setupEvents() {
         return;
       }
     }
-    const payload = { disabled_disks: sel.disabledDisks };
+    const maxDiskPct = parseWatermarkInput(fd.get('max_disk_usage_pct') || 85);
+    if (maxDiskPct === null) {
+      showToast('强制安全水位必须在 1% ~ 99% 之间', 'error');
+      return;
+    }
+    const payload = {
+      disabled_disks: sel.disabledDisks,
+      max_disk_usage_pct: maxDiskPct,
+    };
     if (!sel.isLegacyOnly) {
       payload.storage_dirs = sel.storageDirs;
     }

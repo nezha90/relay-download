@@ -595,12 +595,13 @@ func (s *Server) runDeployAgentATask(taskID string, req protocol.DeployAgentAReq
 	}
 	appendLog("register_node", fmt.Sprintf("在中心注册/更新节点 %s (%s)...", req.NodeID, pubAddr))
 	if err := s.store.UpsertNode(ctx, protocol.NodeRecord{
-		ID:         req.NodeID,
-		Name:       name,
-		Role:       protocol.RoleAgentA,
-		Projects:   req.Projects,
-		PublicAddr: pubAddr,
-		CreatedAt:  time.Now().UTC(),
+		ID:              req.NodeID,
+		Name:            name,
+		Role:            protocol.RoleAgentA,
+		Projects:        req.Projects,
+		MaxDiskUsagePct: req.MaxDiskUsagePct,
+		PublicAddr:      pubAddr,
+		CreatedAt:       time.Now().UTC(),
 	}, centerTok); err != nil {
 		finish("failed", "register node in center db: "+err.Error(), "")
 		return

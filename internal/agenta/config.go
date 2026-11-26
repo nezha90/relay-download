@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"relay-download/internal/transfer"
 )
 
 type Config struct {
@@ -69,9 +71,7 @@ func (c *Config) ApplyDefaults() {
 	if c.DataDir == "" {
 		c.DataDir = "./data-a"
 	}
-	if c.MaxDiskUsagePct <= 0 {
-		c.MaxDiskUsagePct = 85.0
-	}
+	c.MaxDiskUsagePct = transfer.NormalizeMaxDiskUsagePct(c.MaxDiskUsagePct)
 	if c.LeaseTTLSec <= 0 {
 		c.LeaseTTLSec = 300
 	}

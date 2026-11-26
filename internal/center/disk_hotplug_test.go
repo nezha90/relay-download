@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"relay-download/internal/pki"
@@ -180,5 +181,59 @@ func TestCenterDiskHotPlugAutoLockAndManualReconfirm(t *testing.T) {
 	}, nil)
 	if hbStale.Directive == nil || hbStale.Directive.DiskGen != 1 || len(hbStale.Directive.DisabledDisks) != 0 {
 		t.Fatalf("stale heartbeat must not re-lock disk after operator re-enable, got %+v", hbStale.Directive)
+	}
+
+	// 4. Custom mandatory disk watermark (1..99%, default 85%) on both Dispatch & Receiver nodes.
+	if hbStale.Directive.MaxDiskUsagePct != 85 {
+		t.Fatalf("expected default receiver watermark 85%%, got %.1f", hbStale.Directive.MaxDiskUsagePct)
+	}
+	// Reject out-of-range values (<1 or >99).
+	for _, bad := range []string{`{"max_disk_usage_pct":0.5}`, `{"max_disk_usage_pct":100}`, `{"max_disk_usage_pct":-5}`} {
+		reqBad := httptest.NewRequest(http.MethodPut, "/api/v1/admin/nodes/b-nas", strings.NewReader(bad))
+		reqBad.Header.Set(protocol.HeaderAdminToken, "admin-secret")
+		recBad := httptest.NewRecorder()
+		handler.ServeHTTP(recBad, reqBad)
+		if recBad.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 for invalid watermark %s, got %d", bad, recBad.Code)
+		}
+	}
+	// Update receiver to 99% and dispatch to 1%, verify persisted and pushed via heartbeats!
+	for _, tc := range []struct {
+		id  string
+		pct float64
+	}{
+		{"b-nas", 99},
+		{"a-edge", 1},
+	} {
+		body, _ := json.Marshal(map[string]any{"max_disk_usage_pct": tc.pct})
+		reqW := httptest.NewRequest(http.MethodPut, "/api/v1/admin/nodes/"+tc.id, bytes.NewReader(body))
+		reqW.Header.Set(protocol.HeaderAdminToken, "admin-secret")
+		recW := httptest.NewRecorder()
+		handler.ServeHTTP(recW, reqW)
+		if recW.Code != http.StatusOK {
+			t.Fatalf("PUT watermark %.0f%% on %s failed: %d %s", tc.pct, tc.id, recW.Code, recW.Body.String())
+		}
+		got, _ := srv.Store().GetNode(ctx, tc.id)
+		if got.MaxDiskUsagePct != tc.pct {
+			t.Fatalf("expected persisted watermark %.0f%% for %s, got %.1f", tc.pct, tc.id, got.MaxDiskUsagePct)
+		}
+	}
+	hbB99 := sendBHB(nil, nil)
+	if hbB99.Directive == nil || hbB99.Directive.MaxDiskUsagePct != 99 {
+		t.Fatalf("expected receiver heartbeat directive watermark 99%%, got %+v", hbB99.Directive)
+	}
+	ahbBody, _ := json.Marshal(protocol.AgentAHeartbeatReq{NodeID: "a-edge", PublicAddr: "https://1.2.3.4:8443"})
+	reqAHB := httptest.NewRequest(http.MethodPost, "/api/v1/a/heartbeat", bytes.NewReader(ahbBody))
+	reqAHB.Header.Set(protocol.HeaderNodeID, "a-edge")
+	reqAHB.Header.Set(protocol.HeaderNodeToken, "a-token")
+	recAHB := httptest.NewRecorder()
+	handler.ServeHTTP(recAHB, reqAHB)
+	if recAHB.Code != http.StatusOK {
+		t.Fatalf("dispatch heartbeat failed: %d %s", recAHB.Code, recAHB.Body.String())
+	}
+	var hbA1 protocol.HeartbeatResp
+	_ = json.Unmarshal(recAHB.Body.Bytes(), &hbA1)
+	if hbA1.MaxDiskUsagePct != 1 {
+		t.Fatalf("expected dispatch heartbeat watermark 1%%, got %.1f", hbA1.MaxDiskUsagePct)
 	}
 }

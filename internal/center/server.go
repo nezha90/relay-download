@@ -499,6 +499,7 @@ func (s *Server) handleAHeartbeat(w http.ResponseWriter, r *http.Request, node *
 	hbResp := s.processNodeHeartbeatUpgrade(r.Context(), node.ID, req.Version, req.UpgradeAttemptID, req.UpgradeStatus, req.UpgradeError)
 	hbResp.Paused = node.Paused
 	hbResp.DiskGen = node.DiskGen
+	hbResp.MaxDiskUsagePct = transfer.NormalizeMaxDiskUsagePct(node.MaxDiskUsagePct)
 	if len(node.StorageDirs) > 0 {
 		hbResp.StorageDirs = append([]string(nil), node.StorageDirs...)
 	}
@@ -622,6 +623,7 @@ func (s *Server) handleBHeartbeat(w http.ResponseWriter, r *http.Request, node *
 		StorageDirs:        append([]string(nil), node.StorageDirs...),
 		DisabledDisks:      append([]string(nil), node.DisabledDisks...),
 		DiskGen:            node.DiskGen,
+		MaxDiskUsagePct:    transfer.NormalizeMaxDiskUsagePct(node.MaxDiskUsagePct),
 		ConcurrencyMode:    node.ConcurrencyMode,
 		MaxConcurrent:      maxConc,
 		SuggestedStreamCap: suggestedStreamCap,
@@ -1156,6 +1158,7 @@ func (s *Server) handleAdminListNodes(w http.ResponseWriter, r *http.Request) {
 			DisabledDisks:         n.DisabledDisks,
 			UnplugLockedDisks:     n.UnplugLockedDisks,
 			DiskGen:               n.DiskGen,
+			MaxDiskUsagePct:       transfer.NormalizeMaxDiskUsagePct(n.MaxDiskUsagePct),
 			ConcurrencyMode:       n.ConcurrencyMode,
 			MaxConcurrentOverride: n.MaxConcurrentOverride,
 			RateLimitMBps:         n.RateLimitMBps,
@@ -1251,6 +1254,7 @@ type createNodeReq struct {
 	ActiveDiskWindow      int      `json:"active_disk_window,omitempty"`
 	StorageDirs           []string `json:"storage_dirs,omitempty"`
 	DisabledDisks         []string `json:"disabled_disks,omitempty"`
+	MaxDiskUsagePct       float64  `json:"max_disk_usage_pct,omitempty"`
 	ConcurrencyMode       string   `json:"concurrency_mode,omitempty"`
 	MaxConcurrentOverride int      `json:"max_concurrent_override,omitempty"`
 	RateLimitMBps         float64  `json:"rate_limit_mbps,omitempty"`
@@ -1281,6 +1285,7 @@ func (s *Server) handleAdminGetNodeDisks(w http.ResponseWriter, r *http.Request)
 		"online":              false,
 		"awaiting_disk":       false,
 		"disk_gen":            node.DiskGen,
+		"max_disk_usage_pct":  transfer.NormalizeMaxDiskUsagePct(node.MaxDiskUsagePct),
 		"storage_dirs":        node.StorageDirs,
 		"disabled_disks":      node.DisabledDisks,
 		"unplug_locked_disks": node.UnplugLockedDisks,
@@ -1461,6 +1466,14 @@ func (s *Server) handleAdminCreateNode(w http.ResponseWriter, r *http.Request) {
 		protocol.WriteError(w, http.StatusBadRequest, "active_disk_window must be between 1 and 256")
 		return
 	}
+	maxDiskPct := transfer.DefaultMaxDiskUsagePct
+	if req.MaxDiskUsagePct != 0 {
+		if req.MaxDiskUsagePct < transfer.MinMaxDiskUsagePct || req.MaxDiskUsagePct > transfer.MaxMaxDiskUsagePct {
+			protocol.WriteError(w, http.StatusBadRequest, "max_disk_usage_pct must be between 1 and 99")
+			return
+		}
+		maxDiskPct = req.MaxDiskUsagePct
+	}
 	cm := normalizeConcurrencyMode(req.ConcurrencyMode)
 	if cm == "" {
 		protocol.WriteError(w, http.StatusBadRequest, "concurrency_mode must be auto or manual")
@@ -1492,6 +1505,7 @@ func (s *Server) handleAdminCreateNode(w http.ResponseWriter, r *http.Request) {
 		ActiveDiskWindow:      diskWin,
 		StorageDirs:           cleanStorageDirs,
 		DisabledDisks:         cleanDisks,
+		MaxDiskUsagePct:       maxDiskPct,
 		ConcurrencyMode:       cm,
 		MaxConcurrentOverride: req.MaxConcurrentOverride,
 		RateLimitMBps:         req.RateLimitMBps,
@@ -1519,6 +1533,7 @@ type updateNodeReq struct {
 	ActiveDiskWindow      *int      `json:"active_disk_window,omitempty"`
 	StorageDirs           *[]string `json:"storage_dirs,omitempty"`
 	DisabledDisks         *[]string `json:"disabled_disks,omitempty"`
+	MaxDiskUsagePct       *float64  `json:"max_disk_usage_pct,omitempty"`
 	ConcurrencyMode       string    `json:"concurrency_mode,omitempty"`
 	MaxConcurrentOverride *int      `json:"max_concurrent_override,omitempty"`
 	RateLimitMBps         *float64  `json:"rate_limit_mbps,omitempty"`
@@ -1594,6 +1609,14 @@ func (s *Server) handleAdminUpdateNode(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		rec.ActiveDiskWindow = v
+	}
+	if req.MaxDiskUsagePct != nil {
+		v := *req.MaxDiskUsagePct
+		if v < transfer.MinMaxDiskUsagePct || v > transfer.MaxMaxDiskUsagePct {
+			protocol.WriteError(w, http.StatusBadRequest, "max_disk_usage_pct must be between 1 and 99")
+			return
+		}
+		rec.MaxDiskUsagePct = v
 	}
 	diskConfigTouched := false
 	if req.StorageDirs != nil {

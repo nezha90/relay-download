@@ -244,4 +244,31 @@ func TestRollingWindowSlidingDiskSelection(t *testing.T) {
 			t.Fatalf("standby disk%d must remain idle until earlier disks fill/disable", i+1)
 		}
 	}
+
+	// 3. Hot-updating MaxDiskUsagePct via ReceiverDirective (1..99%, default 85%) works without restart.
+	if got := ag.effectiveMaxDiskUsagePct(); got != 85.0 {
+		t.Fatalf("expected default receiver watermark 85%%, got %.1f", got)
+	}
+	ag.applyDirective(&protocol.ReceiverDirective{
+		ProjectMode:      "selected",
+		AllowedProjects:  []string{"proj-tw"},
+		DiskPolicy:       protocol.DiskPolicyRollingWindow,
+		ActiveDiskWindow: 3,
+		StorageDirs:      roots,
+		MaxDiskUsagePct:  99.0,
+	}, nil)
+	if got := ag.effectiveMaxDiskUsagePct(); got != 99.0 {
+		t.Fatalf("expected hot-updated receiver watermark 99%%, got %.1f", got)
+	}
+	ag.applyDirective(&protocol.ReceiverDirective{
+		ProjectMode:      "selected",
+		AllowedProjects:  []string{"proj-tw"},
+		DiskPolicy:       protocol.DiskPolicyRollingWindow,
+		ActiveDiskWindow: 3,
+		StorageDirs:      roots,
+		MaxDiskUsagePct:  1.0,
+	}, nil)
+	if got := ag.effectiveMaxDiskUsagePct(); got != 1.0 {
+		t.Fatalf("expected hot-updated receiver watermark 1%%, got %.1f", got)
+	}
 }

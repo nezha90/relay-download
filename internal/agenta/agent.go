@@ -41,12 +41,13 @@ type Agent struct {
 	uploadDir string
 	readyDir  string
 
-	storageMu     sync.RWMutex
-	storageDirs   []string
-	disabledDisks map[string]struct{}
-	diskGen       int64
-	diskHealth    *transfer.DiskHealthTracker
-	diskRRIdx     atomic.Uint64
+	storageMu       sync.RWMutex
+	storageDirs     []string
+	disabledDisks   map[string]struct{}
+	diskGen         int64
+	maxDiskUsagePct float64
+	diskHealth      *transfer.DiskHealthTracker
+	diskRRIdx       atomic.Uint64
 
 	localSrv  *http.Server
 	publicSrv *http.Server
@@ -129,9 +130,10 @@ func New(cfg *Config, logger *slog.Logger) (*Agent, error) {
 		logger:        logger.With("component", "agent-a", "node_id", cfg.NodeID),
 		uploadDir:     uploadDir,
 		readyDir:      readyDir,
-		storageDirs:   initStorage,
-		disabledDisks: make(map[string]struct{}),
-		diskHealth:    diskHealth,
+		storageDirs:     initStorage,
+		disabledDisks:   make(map[string]struct{}),
+		maxDiskUsagePct: transfer.NormalizeMaxDiskUsagePct(cfg.MaxDiskUsagePct),
+		diskHealth:      diskHealth,
 		limiter:       limiter,
 		httpClient: &http.Client{
 			Timeout: 15 * time.Second,
@@ -369,7 +371,17 @@ func (a *Agent) isDiskDisabled(root string) bool {
 	return dis
 }
 
-func (a *Agent) applyDiskConfig(dirs, disabled []string, diskGen int64) {
+func (a *Agent) effectiveMaxDiskUsagePct() float64 {
+	a.storageMu.RLock()
+	pct := a.maxDiskUsagePct
+	a.storageMu.RUnlock()
+	if pct <= 0 {
+		pct = a.cfg.MaxDiskUsagePct
+	}
+	return transfer.NormalizeMaxDiskUsagePct(pct)
+}
+
+func (a *Agent) applyDiskConfig(dirs, disabled []string, diskGen int64, maxDiskUsagePct float64) {
 	disSet := make(map[string]struct{}, len(disabled))
 	for _, d := range disabled {
 		d = strings.TrimSpace(d)
@@ -402,6 +414,13 @@ func (a *Agent) applyDiskConfig(dirs, disabled []string, diskGen int64) {
 
 	a.storageMu.Lock()
 	changed := a.diskGen != diskGen || len(a.disabledDisks) != len(disSet)
+	if maxDiskUsagePct > 0 {
+		normPct := transfer.NormalizeMaxDiskUsagePct(maxDiskUsagePct)
+		if a.maxDiskUsagePct != normPct {
+			a.maxDiskUsagePct = normPct
+			changed = true
+		}
+	}
 	if !changed {
 		for k := range disSet {
 			if _, ok := a.disabledDisks[k]; !ok {
@@ -427,9 +446,10 @@ func (a *Agent) applyDiskConfig(dirs, disabled []string, diskGen int64) {
 	if diskGen > a.diskGen {
 		a.diskGen = diskGen
 	}
+	effWM := a.maxDiskUsagePct
 	a.storageMu.Unlock()
 	if changed {
-		a.logger.Info("updated dispatch cache disk config from center", "storage_dirs", a.activeCacheDirs(), "disabled_disks", len(disSet), "disk_gen", diskGen)
+		a.logger.Info("updated dispatch cache disk config from center", "storage_dirs", a.activeCacheDirs(), "disabled_disks", len(disSet), "disk_gen", diskGen, "max_disk_usage_pct", effWM)
 	}
 }
 
@@ -440,8 +460,9 @@ func (a *Agent) reconcileOnStartup() error {
 		roots = []string{a.cfg.DataDir}
 	}
 	detachedRoots := make(map[string]bool, len(roots))
+	maxPct := a.effectiveMaxDiskUsagePct()
 	for _, root := range roots {
-		probe := a.diskHealth.ProbeRoot(root, !a.isDiskDisabled(root), a.cfg.MaxDiskUsagePct, a.cfg.MinFreeDiskBytes, 0)
+		probe := a.diskHealth.ProbeRoot(root, !a.isDiskDisabled(root), maxPct, a.cfg.MinFreeDiskBytes, 0)
 		if probe.Detached || !probe.Mounted {
 			detachedRoots[filepath.Clean(root)] = true
 			a.logger.Warn("skipping startup reconcile for detached cache disk", "root", root, "reason", probe.StatusReason)
@@ -514,11 +535,12 @@ func (a *Agent) readyPathForRecord(rec FileRecord) string {
 
 func (a *Agent) checkSingleDiskWatermark(dir string, extraBytes uint64) (total, free, usable uint64, usedPct float64, alarm bool, err error) {
 	enabled := !a.isDiskDisabled(dir)
-	probe := a.diskHealth.ProbeRoot(dir, enabled, a.cfg.MaxDiskUsagePct, a.cfg.MinFreeDiskBytes, 0)
+	maxPct := a.effectiveMaxDiskUsagePct()
+	probe := a.diskHealth.ProbeRoot(dir, enabled, maxPct, a.cfg.MinFreeDiskBytes, 0)
 	if probe.Detached || probe.UnplugLatched || !probe.Mounted || !probe.Writable {
 		return 0, 0, 0, 0, true, fmt.Errorf("cache disk %s unavailable: %s", dir, probe.StatusReason)
 	}
-	usable, overWM := transfer.MandatoryWatermarkFree(probe.TotalBytes, probe.FreeBytes, a.cfg.MaxDiskUsagePct, a.cfg.MinFreeDiskBytes)
+	usable, overWM := transfer.MandatoryWatermarkFree(probe.TotalBytes, probe.FreeBytes, maxPct, a.cfg.MinFreeDiskBytes)
 	if overWM || (extraBytes > 0 && usable < extraBytes) {
 		alarm = true
 	}
@@ -593,15 +615,16 @@ func (a *Agent) diskWatermarkStatus(extraBytes uint64) (total, free uint64, used
 	seenDev := make(map[uint64]struct{}, len(roots))
 	healthyCount := 0
 	var lastErr error
+	maxPct := a.effectiveMaxDiskUsagePct()
 	for _, r := range roots {
 		enabled := !a.isDiskDisabled(r)
-		probe := a.diskHealth.ProbeRoot(r, enabled, a.cfg.MaxDiskUsagePct, a.cfg.MinFreeDiskBytes, 0)
+		probe := a.diskHealth.ProbeRoot(r, enabled, maxPct, a.cfg.MinFreeDiskBytes, 0)
 		if probe.Detached || !probe.Mounted {
 			lastErr = fmt.Errorf("cache disk %s: %s", r, probe.StatusReason)
 			continue
 		}
 		if enabled && !probe.UnplugLatched && probe.Writable {
-			usable, overWM := transfer.MandatoryWatermarkFree(probe.TotalBytes, probe.FreeBytes, a.cfg.MaxDiskUsagePct, a.cfg.MinFreeDiskBytes)
+			usable, overWM := transfer.MandatoryWatermarkFree(probe.TotalBytes, probe.FreeBytes, maxPct, a.cfg.MinFreeDiskBytes)
 			if !overWM && (extraBytes == 0 || usable >= extraBytes) {
 				healthyCount++
 			}
@@ -628,13 +651,14 @@ func (a *Agent) diskWatermarkStatus(extraBytes uint64) (total, free uint64, used
 func (a *Agent) collectActiveDiskStatuses() []protocol.DiskStatus {
 	roots := a.activeCacheDirs()
 	out := make([]protocol.DiskStatus, 0, len(roots))
+	maxPct := a.effectiveMaxDiskUsagePct()
 	for _, r := range roots {
 		enabled := !a.isDiskDisabled(r)
 		queued := 0
 		if !enabled {
 			queued = a.store.CountFilesInRoot(r, a.readyDir)
 		}
-		probe := a.diskHealth.ProbeRoot(r, enabled, a.cfg.MaxDiskUsagePct, a.cfg.MinFreeDiskBytes, queued)
+		probe := a.diskHealth.ProbeRoot(r, enabled, maxPct, a.cfg.MinFreeDiskBytes, queued)
 		out = append(out, protocol.DiskStatus{
 			Path:          r,
 			TotalBytes:    probe.TotalBytes,
@@ -1707,7 +1731,7 @@ func (a *Agent) handleStream(w http.ResponseWriter, r *http.Request) {
 	f, err := os.Open(filePath)
 	if err != nil {
 		a.reportDiskWriteErr(diskRoot, err)
-		probe := a.diskHealth.ProbeRoot(diskRoot, !a.isDiskDisabled(diskRoot), a.cfg.MaxDiskUsagePct, a.cfg.MinFreeDiskBytes, 0)
+		probe := a.diskHealth.ProbeRoot(diskRoot, !a.isDiskDisabled(diskRoot), a.effectiveMaxDiskUsagePct(), a.cfg.MinFreeDiskBytes, 0)
 		if probe.Detached || !probe.Mounted || transfer.IsDiskIOError(err) {
 			a.triggerHeartbeat()
 			w.Header().Set("Retry-After", "5")
@@ -2121,6 +2145,7 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 		DiskFreeBytes:        free,
 		DiskUsedPct:          pct,
 		DiskAlarm:            alarm,
+		MaxDiskUsagePct:      a.effectiveMaxDiskUsagePct(),
 		StorageDirs:          a.activeCacheDirs(),
 		Disks:                a.collectActiveDiskStatuses(),
 		HostDisks:            transfer.DiscoverHostDisks("relay-cache"),
@@ -2155,8 +2180,8 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 		if prev := a.paused.Swap(hbResp.Paused); prev != hbResp.Paused {
 			a.logger.Info("dispatch node pause state updated from center", "paused", hbResp.Paused)
 		}
-		if len(hbResp.StorageDirs) > 0 || hbResp.DiskGen > 0 || len(hbResp.DisabledDisks) > 0 {
-			a.applyDiskConfig(hbResp.StorageDirs, hbResp.DisabledDisks, hbResp.DiskGen)
+		if len(hbResp.StorageDirs) > 0 || hbResp.DiskGen > 0 || len(hbResp.DisabledDisks) > 0 || hbResp.MaxDiskUsagePct > 0 {
+			a.applyDiskConfig(hbResp.StorageDirs, hbResp.DisabledDisks, hbResp.DiskGen, hbResp.MaxDiskUsagePct)
 		}
 		if hbResp.ActiveReceivers != nil || hbResp.ProjectAffinity != nil {
 			a.store.SetRoutingState(hbResp.ActiveReceivers, hbResp.ProjectAffinity)

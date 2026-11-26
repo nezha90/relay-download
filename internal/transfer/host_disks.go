@@ -39,33 +39,38 @@ func IsSafeStorageDir(raw string) bool {
 	return true
 }
 
+const (
+	DefaultMaxDiskUsagePct = 85.0
+	MinMaxDiskUsagePct     = 1.0
+	MaxMaxDiskUsagePct     = 99.0
+)
+
+// NormalizeMaxDiskUsagePct clamps a disk watermark ceiling into [1, 99], defaulting to 85 when <=0.
+func NormalizeMaxDiskUsagePct(pct float64) float64 {
+	if pct <= 0 {
+		return DefaultMaxDiskUsagePct
+	}
+	if pct < MinMaxDiskUsagePct {
+		return MinMaxDiskUsagePct
+	}
+	if pct > MaxMaxDiskUsagePct {
+		return MaxMaxDiskUsagePct
+	}
+	return pct
+}
+
 // MandatoryWatermarkFree enforces a mandatory safety watermark on EVERY disk (both data disks
 // and the system "/" disk) so no transfer can ever exhaust disk space or crash the host OS.
-//   - Always enforces maxUsedPct (clamped to [50, 95], default 90 if <=0).
-//   - On disks >= 50 GiB, always reserves at least 10 GiB free (in addition to configured minFreeBytes).
-//   - On smaller disks (e.g., compact test disks), reserves at least (100 - maxUsedPct)% + minFreeBytes.
+//   - Always enforces maxUsedPct (clamped to [1, 99], default 85 if <=0).
+//   - Also honors any explicit minFreeBytes reserve if larger than the percentage reserve.
 //
 // Returns usable bytes available above the watermark and whether the disk has already hit/exceeded it.
 func MandatoryWatermarkFree(total, free uint64, maxUsedPct float64, minFreeBytes uint64) (usable uint64, overWatermark bool) {
 	if total == 0 {
 		return 0, true
 	}
-	if maxUsedPct <= 0 {
-		maxUsedPct = 90.0
-	}
-	if maxUsedPct > 95.0 {
-		maxUsedPct = 95.0
-	}
-	if maxUsedPct < 50.0 {
-		maxUsedPct = 50.0
-	}
-	pctReserve := uint64(float64(total) * (100.0 - maxUsedPct) / 100.0)
-	reserve := pctReserve
-	const fiftyGiB = 50 << 30
-	const tenGiB = 10 << 30
-	if total >= fiftyGiB && reserve < tenGiB {
-		reserve = tenGiB
-	}
+	maxUsedPct = NormalizeMaxDiskUsagePct(maxUsedPct)
+	reserve := uint64(float64(total) * (100.0 - maxUsedPct) / 100.0)
 	if minFreeBytes > reserve {
 		reserve = minFreeBytes
 	}

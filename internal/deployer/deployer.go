@@ -24,6 +24,7 @@ import (
 	"relay-download/internal/agentb"
 	"relay-download/internal/pki"
 	"relay-download/internal/protocol"
+	"relay-download/internal/transfer"
 )
 
 var (
@@ -610,9 +611,7 @@ func (d *Deployer) InstallAgentA(ctx context.Context, p InstallAgentAParams) err
 	if req.DataDir == "" {
 		req.DataDir = "/data/relay-a"
 	}
-	if req.MaxDiskUsagePct <= 0 {
-		req.MaxDiskUsagePct = 85.0
-	}
+	req.MaxDiskUsagePct = transfer.NormalizeMaxDiskUsagePct(req.MaxDiskUsagePct)
 	if req.LeaseTTLSec <= 0 {
 		req.LeaseTTLSec = 300
 	}
@@ -977,6 +976,11 @@ func RenderAgentBInstallScript(centerPublicURL string, caCertPEM []byte, node pr
 		tokVal = "<REPLACE_WITH_RECEIVER_NODE_TOKEN>"
 	}
 
+	bMaxDiskPct := req.MaxDiskUsagePct
+	if bMaxDiskPct <= 0 {
+		bMaxDiskPct = node.MaxDiskUsagePct
+	}
+	bMaxDiskPct = transfer.NormalizeMaxDiskUsagePct(bMaxDiskPct)
 	bCfg := agentb.Config{
 		NodeID:               node.ID,
 		NodeName:             node.Name,
@@ -993,7 +997,7 @@ func RenderAgentBInstallScript(centerPublicURL string, caCertPEM []byte, node pr
 		StateDir:             stateDir,
 		MaxConcurrent:        maxConc,
 		AckBatchIntervalMs:   req.AckBatchIntervalMs,
-		MaxDiskUsagePct:      90.0,
+		MaxDiskUsagePct:      bMaxDiskPct,
 		MinFreeDiskBytes:     req.MinFreeDiskBytes,
 		PollIntervalSec:      10,
 		HeartbeatIntervalSec: 2,
@@ -1146,8 +1150,9 @@ func RenderAgentAInstallScript(
 	}
 	maxDiskPct := req.MaxDiskUsagePct
 	if maxDiskPct <= 0 {
-		maxDiskPct = 85.0
+		maxDiskPct = node.MaxDiskUsagePct
 	}
+	maxDiskPct = transfer.NormalizeMaxDiskUsagePct(maxDiskPct)
 	leaseTTL := req.LeaseTTLSec
 	if leaseTTL <= 0 {
 		leaseTTL = 300
