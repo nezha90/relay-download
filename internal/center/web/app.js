@@ -153,6 +153,24 @@ function openModal(id) { document.getElementById(id).classList.remove('hidden');
 function closeModal(id) { document.getElementById(id).classList.add('hidden'); }
 window.closeModal = closeModal;
 
+function showToast(msg, type = 'info', durationMs = 3200) {
+  const stack = document.getElementById('toast-stack');
+  if (!stack || !msg) return;
+  const el = document.createElement('div');
+  el.className = `toast ${type}`;
+  el.innerHTML = `<span class="toast-dot"></span><span>${esc(msg)}</span>`;
+  stack.appendChild(el);
+  const remove = () => {
+    el.classList.add('leaving');
+    setTimeout(() => el.remove(), 240);
+  };
+  const timer = setTimeout(remove, durationMs);
+  el.addEventListener('click', () => {
+    clearTimeout(timer);
+    remove();
+  });
+}
+
 function populateProjectSelect(selectEl, currentValue = '', includeCustomOption = true) {
   if (!selectEl) return;
   const opts = [];
@@ -177,7 +195,10 @@ function populateProjectSelect(selectEl, currentValue = '', includeCustomOption 
 
 async function refreshAll() {
   const btn = document.getElementById('refresh-now');
-  if (btn) btn.disabled = true;
+  if (btn) {
+    btn.disabled = true;
+    btn.classList.add('is-loading');
+  }
   try {
     const { hours, bucketMin } = getWindowSpec();
     const ovQS = new URLSearchParams({
@@ -214,7 +235,10 @@ async function refreshAll() {
   } catch (e) {
     if (e.message !== 'unauthorized') console.error(e);
   } finally {
-    if (btn) btn.disabled = false;
+    if (btn) {
+      btn.disabled = false;
+      btn.classList.remove('is-loading');
+    }
   }
 }
 
@@ -516,19 +540,24 @@ function renderSpeedCurve(data) {
     <svg class="speed-svg" viewBox="0 0 ${w} ${h}">
       <defs>
         <linearGradient id="speedAreaGrad" x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" stop-color="#3b82f6" stop-opacity="0.38" />
-          <stop offset="85%" stop-color="#3b82f6" stop-opacity="0.04" />
+          <stop offset="0%" stop-color="#38bdf8" stop-opacity="0.34" />
+          <stop offset="52%" stop-color="#3b82f6" stop-opacity="0.14" />
           <stop offset="100%" stop-color="#3b82f6" stop-opacity="0" />
+        </linearGradient>
+        <linearGradient id="speedStrokeGrad" x1="0" y1="0" x2="1" y2="0">
+          <stop offset="0%" stop-color="#3b82f6" />
+          <stop offset="50%" stop-color="#38bdf8" />
+          <stop offset="100%" stop-color="#60a5fa" />
         </linearGradient>
       </defs>
       ${yTicks}
       ${xTicks}
       ${refLines}
       <path d="${areaD}" fill="url(#speedAreaGrad)" />
-      <path d="${lineD}" fill="none" stroke="#3b82f6" stroke-width="2.4" stroke-linejoin="round" stroke-linecap="round" />
+      <path class="speed-line-glow" d="${lineD}" fill="none" stroke="url(#speedStrokeGrad)" stroke-width="2.6" stroke-linejoin="round" stroke-linecap="round" />
       ${dots}
       <line id="curve-hover-line" x1="0" y1="${padT}" x2="0" y2="${baseY}" stroke="#38bdf8" stroke-width="1" stroke-dasharray="3 3" visibility="hidden" />
-      <circle id="curve-hover-dot" cx="0" cy="0" r="5" fill="#38bdf8" stroke="#ffffff" stroke-width="2" visibility="hidden" />
+      <circle id="curve-hover-dot" cx="0" cy="0" r="5.5" fill="#38bdf8" stroke="#ffffff" stroke-width="2" visibility="hidden" />
       ${hitBands}
     </svg>
     <div class="curve-legend">
@@ -636,9 +665,9 @@ function renderTrendChart(days) {
     const fill = bytes > 0 ? '#3b82f6' : '#2d3645';
     const dayAvg = bytes / 86400;
     return `
-      <g>
+      <g class="trend-bar">
         <title>${esc(d.date)} (UTC): 完成 ${fmtNum(d.files_completed)} 文件 · ${fmtBytes(bytes)} · 日均 ${fmtSpeed(dayAvg)}</title>
-        <rect x="${x.toFixed(1)}" y="${y}" width="${barW}" height="${bh}" rx="4" fill="${fill}" />
+        <rect x="${x.toFixed(1)}" y="${y}" width="${barW}" height="${bh}" rx="5" fill="${fill}" />
         <text x="${cx.toFixed(1)}" y="${h - 10}" text-anchor="middle" fill="#8b949e" font-size="10">${esc(label)}</text>
       </g>
     `;
@@ -836,7 +865,7 @@ function renderNodes(nodes, winHours) {
         <td><strong>${esc(n.name)}</strong><div class="mono muted">${esc(n.id)}</div></td>
         <td>
           <div style="display:flex;gap:4px;flex-wrap:wrap;align-items:center">
-            <span class="badge ${n.online ? 'online' : 'offline'}">${n.online ? '在线' : '离线'}</span>
+            <span class="badge ${n.online ? 'online pulse' : 'offline'}">${n.online ? '在线' : '离线'}</span>
             ${n.disk_alarm ? '<span class="badge alarm">水位告警</span>' : ''}
             ${renderUpgradeBadge(n)}
           </div>
@@ -873,7 +902,7 @@ function renderNodes(nodes, winHours) {
         <td><strong>${esc(n.name)}</strong><div class="mono muted">${esc(n.id)}</div></td>
         <td>
           <div style="display:flex;gap:4px;flex-wrap:wrap;align-items:center">
-            <span class="badge ${n.online ? 'online' : 'offline'}">${n.online ? '在线' : '离线'}</span>
+            <span class="badge ${n.online ? 'online pulse' : 'offline'}">${n.online ? '在线' : '离线'}</span>
             ${renderUpgradeBadge(n)}
           </div>
           <div class="mono muted" style="margin-top:3px">${esc(verStr)}</div>
@@ -970,9 +999,10 @@ async function deleteNode(id) {
   if (!confirm(`确认删除节点 ${id} 吗？`)) return;
   try {
     await api(`/api/v1/admin/nodes/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    showToast(`已删除节点 ${id}`, 'success');
     refreshAll();
   } catch (e) {
-    if (e.message !== 'unauthorized') alert(`删除节点失败: ${e.message}`);
+    if (e.message !== 'unauthorized') showToast(`删除节点失败: ${e.message}`, 'error');
   }
 }
 
@@ -980,9 +1010,10 @@ async function deleteProject(id) {
   if (!confirm(`确认删除项目 ${id} 吗？`)) return;
   try {
     await api(`/api/v1/admin/projects/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    showToast(`已删除项目 ${id}`, 'success');
     refreshAll();
   } catch (e) {
-    if (e.message !== 'unauthorized') alert(`删除项目失败: ${e.message}`);
+    if (e.message !== 'unauthorized') showToast(`删除项目失败: ${e.message}`, 'error');
   }
 }
 
@@ -990,9 +1021,10 @@ async function deleteRelease(id) {
   if (!confirm('确认删除该发布包吗？')) return;
   try {
     await api(`/api/v1/admin/releases/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    showToast('发布包已删除', 'success');
     refreshAll();
   } catch (e) {
-    if (e.message !== 'unauthorized') alert(`删除发布包失败: ${e.message}`);
+    if (e.message !== 'unauthorized') showToast(`删除发布包失败: ${e.message}`, 'error');
   }
 }
 
@@ -1002,11 +1034,11 @@ async function runBatchUpgrade(role) {
   const releaseID = document.getElementById(selectId).value;
   const nodeIDs = Array.from(selectedNodes[role]);
   if (!releaseID) {
-    alert('请先选择目标发布包（如为空，请先在「部署与版本」页签上传）');
+    showToast('请先选择目标发布包（如为空，请先在「部署与版本」上传）', 'error');
     return;
   }
   if (!nodeIDs.length) {
-    alert('请先勾选至少一个节点');
+    showToast('请先勾选至少一个节点', 'error');
     return;
   }
   if (!confirm(`确认向 ${nodeIDs.length} 个节点下发批量更新指令吗？\n目标节点: ${nodeIDs.join(', ')}`)) return;
@@ -1021,10 +1053,11 @@ async function runBatchUpgrade(role) {
       txt += `，跳过 ${skippedKeys.length} 个 (${skippedKeys.map(k => `${k}: ${res.skipped[k]}`).join('; ')})`;
     }
     document.getElementById(msgId).textContent = txt;
+    showToast(txt, 'success');
     selectedNodes[role].clear();
     refreshAll();
   } catch (e) {
-    if (e.message !== 'unauthorized') alert(`批量更新下发失败: ${e.message}`);
+    if (e.message !== 'unauthorized') showToast(`批量更新下发失败: ${e.message}`, 'error');
   }
 }
 
@@ -1410,6 +1443,30 @@ function setupEvents() {
     openModal('project-modal');
   });
 
+  // Backdrop click & Escape key to close any open modal (except login overlay).
+  document.querySelectorAll('.overlay').forEach(ov => {
+    if (ov.id === 'login-overlay') return;
+    ov.addEventListener('click', (e) => {
+      if (e.target === ov) ov.classList.add('hidden');
+    });
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape') return;
+    document.querySelectorAll('.overlay:not(.hidden)').forEach(ov => {
+      if (ov.id !== 'login-overlay') ov.classList.add('hidden');
+    });
+  });
+
+  document.getElementById('edit-disks-list').addEventListener('change', (e) => {
+    const chk = e.target.closest('input.edit-disk-chk');
+    if (!chk) return;
+    const row = chk.closest('.disk-toggle-row');
+    const sub = row && row.querySelector('.disk-toggle-left .muted');
+    if (sub) {
+      sub.textContent = chk.checked ? '启用中 · 允许落盘' : '已停用 · 不再写入新文件';
+    }
+  });
+
   document.getElementById('create-project-form').addEventListener('submit', async (e) => {
     e.preventDefault();
     const fd = new FormData(e.target);
@@ -1425,9 +1482,10 @@ function setupEvents() {
         }),
       });
       closeModal('project-modal');
+      showToast(`项目 ${fd.get('id')} 已保存`, 'success');
       refreshAll();
     } catch (err) {
-      if (err.message !== 'unauthorized') alert(`保存项目失败: ${err.message}`);
+      if (err.message !== 'unauthorized') showToast(`保存项目失败: ${err.message}`, 'error');
     }
   });
 
@@ -1485,7 +1543,7 @@ function setupEvents() {
           chosen = String(fd.get('single_project_custom') || '').trim();
         }
         if (!chosen) {
-          alert('请选择或输入该接收节点要专享下载的项目 ID');
+          showToast('请选择或输入该接收节点要专享下载的项目 ID', 'error');
           return;
         }
         projs = [chosen];
@@ -1520,6 +1578,7 @@ function setupEvents() {
         : '';
       box.innerHTML = `<strong>节点已创建！请妥善保存接入 Token（仅展示一次）：</strong><div class="mono" style="margin-top:6px">${esc(res.token)}</div>${extraBtn}`;
       box.classList.remove('hidden');
+      showToast(`节点 ${res.node.id} 创建成功`, 'success');
       await refreshAll();
       if (role === 'agent_b') {
         document.getElementById('btn-gen-b-after-create').addEventListener('click', () => {
@@ -1528,7 +1587,7 @@ function setupEvents() {
         });
       }
     } catch (err) {
-      if (err.message !== 'unauthorized') alert(`创建节点失败: ${err.message}`);
+      if (err.message !== 'unauthorized') showToast(`创建节点失败: ${err.message}`, 'error');
     }
   });
 
@@ -1549,14 +1608,14 @@ function setupEvents() {
         chosen = String(fd.get('single_project_custom') || '').trim();
       }
       if (!chosen) {
-        alert('请选择或输入该接收节点专享下载的项目 ID');
+        showToast('请选择或输入该接收节点专享下载的项目 ID', 'error');
         return;
       }
       projs = [chosen];
     } else if (mode === 'multi') {
       projs = String(fd.get('projects') || '').split(',').map(s => s.trim()).filter(Boolean);
       if (!projs.length) {
-        alert('请至少勾选或输入一个项目，或切换为「全部项目」模式');
+        showToast('请至少勾选或输入一个项目，或切换为「全部项目」模式', 'error');
         return;
       }
     } else {
@@ -1586,9 +1645,10 @@ function setupEvents() {
         body: JSON.stringify(body),
       });
       closeModal('edit-node-modal');
+      showToast(`节点 ${nodeId} 配置已保存，2 秒内下发热生效`, 'success');
       refreshAll();
     } catch (err) {
-      if (err.message !== 'unauthorized') alert(`更新节点配置失败: ${err.message}`);
+      if (err.message !== 'unauthorized') showToast(`更新节点配置失败: ${err.message}`, 'error');
     }
   });
 
@@ -1601,12 +1661,14 @@ function setupEvents() {
     try {
       const rel = await api('/api/v1/admin/releases', { method: 'POST', body: fd });
       const roleLbl = rel.role === 'agent_a' ? '分发节点' : '接收节点';
-      msgEl.textContent = `上传成功: ${roleLbl} ${rel.version} (${rel.os}/${rel.arch}, ${fmtBytes(rel.size)})`;
+      const okMsg = `上传成功: ${roleLbl} ${rel.version} (${rel.os}/${rel.arch}, ${fmtBytes(rel.size)})`;
+      msgEl.textContent = okMsg;
+      showToast(okMsg, 'success');
       e.target.reset();
       refreshAll();
     } catch (err) {
       msgEl.textContent = '';
-      if (err.message !== 'unauthorized') alert(`上传发布包失败: ${err.message}`);
+      if (err.message !== 'unauthorized') showToast(`上传发布包失败: ${err.message}`, 'error');
     }
   });
 
@@ -1623,7 +1685,7 @@ function setupEvents() {
   document.getElementById('btn-run-precheck').addEventListener('click', async () => {
     const payload = readDeployAForm();
     if (!payload.host) {
-      alert('请先输入目标服务器公网 IP');
+      showToast('请先输入目标服务器公网 IP', 'error');
       return;
     }
     const btn = document.getElementById('btn-run-precheck');
@@ -1652,11 +1714,11 @@ function setupEvents() {
     e.preventDefault();
     const payload = readDeployAForm();
     if (!payload.node_id) {
-      alert('请输入节点 ID');
+      showToast('请输入节点 ID', 'error');
       return;
     }
     if (!lastPrecheck || (!lastPrecheck.ok && !(lastPrecheck.can_force && payload.force_overwrite))) {
-      alert('请先完成环境预检并确认通过');
+      showToast('请先完成环境预检并确认通过', 'error');
       return;
     }
     document.getElementById('btn-confirm-deploy-a').disabled = true;
@@ -1668,8 +1730,9 @@ function setupEvents() {
       activeDeployTaskId = task.id;
       document.getElementById('btn-refresh-deploy-status').classList.remove('hidden');
       renderDeployTaskDetail(task, document.getElementById('deploy-progress-box'));
+      showToast(`已启动节点 ${payload.node_id} 一键部署任务`, 'info');
     } catch (err) {
-      if (err.message !== 'unauthorized') alert(`启动部署失败: ${err.message}`);
+      if (err.message !== 'unauthorized') showToast(`启动部署失败: ${err.message}`, 'error');
       document.getElementById('btn-confirm-deploy-a').disabled = false;
     }
   });
@@ -1694,14 +1757,14 @@ function setupEvents() {
         .map(s => s.trim())
         .filter(Boolean);
       if (!storageDirs.length) {
-        alert('请至少填写一个物理磁盘根目录 (storage_dirs)');
+        showToast('请至少填写一个物理磁盘根目录 (storage_dirs)', 'error');
         return;
       }
       body.storage_dirs = storageDirs;
     } else if (scriptMode === 'single') {
       const onlyProj = String(fd.get('only_project') || '').trim();
       if (!onlyProj || onlyProj === '__custom__') {
-        alert('请选择要绑定的单个项目');
+        showToast('请选择要绑定的单个项目', 'error');
         return;
       }
       body.only_project = onlyProj;
@@ -1731,8 +1794,9 @@ function setupEvents() {
       out.innerHTML = `<div class="log-box">${esc(lastBScript)}</div>`;
       out.classList.remove('hidden');
       document.getElementById('btn-copy-b-script').classList.remove('hidden');
+      showToast('接收节点安装脚本已生成', 'success');
     } catch (err) {
-      if (err.message !== 'unauthorized') alert(`生成安装脚本失败: ${err.message}`);
+      if (err.message !== 'unauthorized') showToast(`生成安装脚本失败: ${err.message}`, 'error');
     }
   });
 
@@ -1741,10 +1805,11 @@ function setupEvents() {
     try {
       await navigator.clipboard.writeText(lastBScript);
       const b = document.getElementById('btn-copy-b-script');
-      b.textContent = '已复制！';
+      b.textContent = '已复制 ✓';
+      showToast('一键安装脚本已复制到剪贴板', 'success');
       setTimeout(() => { b.textContent = '复制脚本'; }, 1500);
     } catch {
-      alert('剪贴板复制失败，请手动选中下方脚本复制');
+      showToast('剪贴板复制失败，请手动选中下方脚本复制', 'error');
     }
   });
 }
