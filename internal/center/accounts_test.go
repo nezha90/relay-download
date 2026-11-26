@@ -319,3 +319,153 @@ func TestCustomerAccountRBACAndProjectScoping(t *testing.T) {
 		t.Fatalf("delete account failed: %d", res.Code)
 	}
 }
+
+func TestNodePauseResumeAndAgentAScript(t *testing.T) {
+	dir := t.TempDir()
+	caPath := filepath.Join(dir, "ca.crt")
+	caKeyPath := filepath.Join(dir, "ca.key")
+	if err := pki.InitCA(caPath, caKeyPath, "relay-pause-test-ca", 365); err != nil {
+		t.Fatalf("InitCA: %v", err)
+	}
+	srvCert := filepath.Join(dir, "center.crt")
+	srvKey := filepath.Join(dir, "center.key")
+	if err := pki.IssueCert(caPath, caKeyPath, srvCert, srvKey, "center", []string{"127.0.0.1"}, nil, 365); err != nil {
+		t.Fatalf("IssueCert: %v", err)
+	}
+
+	srv, err := New(&Config{
+		Listen:       "127.0.0.1:0",
+		TLSCert:      srvCert,
+		TLSKey:       srvKey,
+		CACert:       caPath,
+		CAKey:        caKeyPath,
+		PublicURL:    "https://center.test:8440",
+		ReleasesDir:  filepath.Join(dir, "releases"),
+		DBPath:       filepath.Join(dir, "center.db"),
+		JWTSecret:    "jwt-secret-pause-test",
+		CenterSecret: "center-secret-pause-test",
+		AdminToken:   "admin-tok-pause-test",
+	}, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer srv.Shutdown(context.Background())
+
+	ctx := context.Background()
+	now := time.Now().UTC()
+	_ = srv.store.UpsertProject(ctx, protocol.Project{ID: "proj-1", Name: "P1", ConflictPolicy: protocol.ConflictOverwrite, LeaseTTLSec: 300, CreatedAt: now})
+	_ = srv.store.UpsertNode(ctx, protocol.NodeRecord{ID: "a-1", Name: "A1", Role: protocol.RoleAgentA, PublicAddr: "https://203.0.113.10:8443", CreatedAt: now}, "tok-a1")
+	_ = srv.store.UpsertNode(ctx, protocol.NodeRecord{ID: "b-1", Name: "B1", Role: protocol.RoleAgentB, Projects: []string{"proj-1"}, CreatedAt: now}, "tok-b1")
+	_ = srv.store.InsertRelease(ctx, protocol.ReleaseRecord{
+		ID: "rel-a", Role: protocol.RoleAgentA, Version: "v1.11.0", OS: "linux", Arch: "amd64",
+		SHA256: strings.Repeat("a", 64), Size: 123, Filename: "a.bin", CreatedAt: now,
+	})
+	_ = srv.store.CreateAccount(ctx, protocol.AccountRecord{ID: "c1", Name: "Cust1", Role: protocol.AccountRoleCustomer, Enabled: true, CreatedAt: now}, "rcust_test_pause_token_123456")
+
+	srv.hub.UpdateA(protocol.AgentAHeartbeatReq{
+		NodeID: "a-1", Name: "A1", PublicAddr: "https://203.0.113.10:8443",
+		Availability: []protocol.ProjectAvailability{{ProjectID: "proj-1", ReadyCount: 5, ReadyBytes: 500}},
+	})
+	srv.hub.UpdateB(protocol.AgentBHeartbeatReq{NodeID: "b-1", Name: "B1", Projects: []string{"proj-1"}})
+
+	h := srv.routes()
+	reqJSON := func(method, path string, headers map[string]string, body any) *httptest.ResponseRecorder {
+		var buf bytes.Buffer
+		if body != nil {
+			_ = json.NewEncoder(&buf).Encode(body)
+		}
+		r := httptest.NewRequest(method, "https://center.test:8440"+path, &buf)
+		r.Host = "center.test:8440"
+		r.RemoteAddr = "198.51.100.5:9999"
+		if body != nil {
+			r.Header.Set("Content-Type", "application/json")
+		}
+		for k, v := range headers {
+			r.Header.Set(k, v)
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, r)
+		return rec
+	}
+
+	adminHdr := map[string]string{protocol.HeaderAdminToken: "admin-tok-pause-test"}
+	custHdr := map[string]string{protocol.HeaderAdminToken: "rcust_test_pause_token_123456"}
+	bNodeHdr := map[string]string{protocol.HeaderNodeID: "b-1", protocol.HeaderNodeToken: "tok-b1"}
+	aNodeHdr := map[string]string{protocol.HeaderNodeID: "a-1", protocol.HeaderNodeToken: "tok-a1"}
+
+	// 1. Pause receiver b-1 via customer account -> discover returns 0 candidates, heartbeat echoes paused=true, excluded from ActiveReceivers.
+	if res := reqJSON(http.MethodPut, "/api/v1/admin/nodes/b-1", custHdr, map[string]any{"paused": true}); res.Code != http.StatusOK {
+		t.Fatalf("customer pause b-1 failed: %d %s", res.Code, res.Body.String())
+	}
+	if res := reqJSON(http.MethodPut, "/api/v1/admin/nodes/a-1", custHdr, map[string]any{"paused": true}); res.Code != http.StatusForbidden {
+		t.Fatalf("customer must not pause a-1, got %d", res.Code)
+	}
+	rDisc := reqJSON(http.MethodGet, "/api/v1/b/discover?project=proj-1", bNodeHdr, nil)
+	var disc protocol.DiscoverResp
+	_ = json.Unmarshal(rDisc.Body.Bytes(), &disc)
+	if len(disc.Candidates) != 0 {
+		t.Fatalf("paused receiver should get 0 candidates, got %d", len(disc.Candidates))
+	}
+	rHB := reqJSON(http.MethodPost, "/api/v1/b/heartbeat", bNodeHdr, protocol.AgentBHeartbeatReq{NodeID: "b-1", Projects: []string{"proj-1"}})
+	var hb protocol.HeartbeatResp
+	_ = json.Unmarshal(rHB.Body.Bytes(), &hb)
+	if !hb.Paused || hb.Directive == nil || !hb.Directive.Paused {
+		t.Fatalf("expected paused=true in b heartbeat directive, got %+v", hb)
+	}
+	dbNodes, _ := srv.store.ListNodes(ctx)
+	if active := srv.hub.ActiveReceiversByProject([]string{"proj-1"}, dbNodes); len(active["proj-1"]) != 0 {
+		t.Fatalf("paused receiver b-1 must be excluded from ActiveReceiversByProject, got %+v", active)
+	}
+
+	// Resume b-1 -> discover returns a-1 again!
+	if res := reqJSON(http.MethodPut, "/api/v1/admin/nodes/b-1", custHdr, map[string]any{"paused": false}); res.Code != http.StatusOK {
+		t.Fatalf("customer resume b-1 failed: %d %s", res.Code, res.Body.String())
+	}
+	rDisc2 := reqJSON(http.MethodGet, "/api/v1/b/discover?project=proj-1", bNodeHdr, nil)
+	disc = protocol.DiscoverResp{}
+	_ = json.Unmarshal(rDisc2.Body.Bytes(), &disc)
+	if len(disc.Candidates) != 1 || disc.Candidates[0].ANodeID != "a-1" {
+		t.Fatalf("resumed receiver should discover a-1, got %+v", disc.Candidates)
+	}
+
+	// 2. Pause dispatch node a-1 via admin -> excluded from DiscoverCandidates and heartbeat reports paused=true.
+	if res := reqJSON(http.MethodPut, "/api/v1/admin/nodes/a-1", adminHdr, map[string]any{"paused": true}); res.Code != http.StatusOK {
+		t.Fatalf("admin pause a-1 failed: %d %s", res.Code, res.Body.String())
+	}
+	rDisc3 := reqJSON(http.MethodGet, "/api/v1/b/discover?project=proj-1", bNodeHdr, nil)
+	disc = protocol.DiscoverResp{}
+	_ = json.Unmarshal(rDisc3.Body.Bytes(), &disc)
+	if len(disc.Candidates) != 0 {
+		t.Fatalf("paused dispatch node a-1 must not be returned in discover, got %+v", disc.Candidates)
+	}
+	rAHB := reqJSON(http.MethodPost, "/api/v1/a/heartbeat", aNodeHdr, protocol.AgentAHeartbeatReq{
+		NodeID: "a-1", PublicAddr: "https://203.0.113.10:8443",
+		Availability: []protocol.ProjectAvailability{{ProjectID: "proj-1", ReadyCount: 5, ReadyBytes: 500}},
+	})
+	var aHB protocol.HeartbeatResp
+	_ = json.Unmarshal(rAHB.Body.Bytes(), &aHB)
+	if !aHB.Paused {
+		t.Fatalf("expected paused=true in a-1 heartbeat resp")
+	}
+
+	// 3. Dispatch node automated install script API: forbidden for customer, valid script for admin.
+	if res := reqJSON(http.MethodPost, "/api/v1/admin/deploy/agent-a-script", custHdr, map[string]any{"node_id": "a-1"}); res.Code != http.StatusForbidden {
+		t.Fatalf("customer must not generate agent-a script, got %d", res.Code)
+	}
+	rAS := reqJSON(http.MethodPost, "/api/v1/admin/deploy/agent-a-script", adminHdr, map[string]any{
+		"node_id": "a-1", "public_addr": "https://frp.example.com:9443", "rotate_token": true,
+	})
+	if rAS.Code != http.StatusOK {
+		t.Fatalf("admin agent-a-script failed: %d %s", rAS.Code, rAS.Body.String())
+	}
+	var asResp protocol.AgentAScriptResp
+	_ = json.Unmarshal(rAS.Body.Bytes(), &asResp)
+	for _, must := range []string{"--tlsv1.3", "sha256sum", "relay-agent-a.service", "frp.example.com:9443", "BEGIN CERTIFICATE", "BEGIN EC PRIVATE KEY"} {
+		if !strings.Contains(asResp.Script, must) {
+			t.Fatalf("agent-a script missing %q", must)
+		}
+	}
+	if asResp.LocalToken == "" || asResp.RotatedToken == "" {
+		t.Fatalf("expected non-empty local_token and rotated_token")
+	}
+}

@@ -115,6 +115,60 @@ function esc(s) {
   return String(s ?? '').replace(/[&<>"']/g, m => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[m]));
 }
 
+async function copyText(text, okMsg = '已复制到剪贴板') {
+  if (!text) return false;
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(text);
+    } else {
+      throw new Error('clipboard api unavailable');
+    }
+    showToast(okMsg, 'success');
+    return true;
+  } catch {
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.setAttribute('readonly', '');
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand('copy');
+      ta.remove();
+      if (ok) {
+        showToast(okMsg, 'success');
+        return true;
+      }
+    } catch {}
+    showToast('剪贴板复制失败，请手动选中文本复制', 'error');
+    return false;
+  }
+}
+
+function buildTerminalExecCommand(script, nodeId, rolePrefix) {
+  const safeId = String(nodeId || 'node').replace(/[^A-Za-z0-9._-]/g, '_');
+  const tmpFile = `/tmp/install-${rolePrefix}-${safeId}.sh`;
+  let delim = `RELAY_RUN_${Math.random().toString(16).slice(2, 10).toUpperCase()}`;
+  while (script.includes(delim)) {
+    delim += 'X';
+  }
+  const body = script.endsWith('\n') ? script : script + '\n';
+  return `cat > ${tmpFile} <<'${delim}'\n${body}${delim}\nchmod +x ${tmpFile} && $(command -v sudo || true) bash ${tmpFile} && rm -f ${tmpFile}`;
+}
+
+function downloadTextFile(filename, content) {
+  const blob = new Blob([content], { type: 'text/x-shellscript;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
 async function api(path, opts = {}) {
   const isFormData = opts.body instanceof FormData;
   const headers = {
@@ -977,6 +1031,9 @@ function renderNodes(nodes, winHours) {
     const pct = (n.disk_used_pct || 0).toFixed(1);
     const verStr = n.version ? `${n.version}${n.arch ? ' · ' + n.arch : ''}` : '-';
     const checked = selectedNodes.agent_a.has(n.id) ? 'checked' : '';
+    const pauseBtn = n.paused
+      ? `<button class="btn sm success" data-action="toggle-pause-node" data-id="${esc(n.id)}" data-paused="1">启动</button>`
+      : `<button class="btn sm warn" data-action="toggle-pause-node" data-id="${esc(n.id)}" data-paused="0">暂停</button>`;
     return `
       <tr>
         <td><input type="checkbox" class="node-chk" data-role="agent_a" data-id="${esc(n.id)}" ${checked} /></td>
@@ -984,6 +1041,7 @@ function renderNodes(nodes, winHours) {
         <td>
           <div style="display:flex;gap:4px;flex-wrap:wrap;align-items:center">
             <span class="badge ${n.online ? 'online pulse' : 'offline'}">${n.online ? '在线' : '离线'}</span>
+            ${n.paused ? '<span class="badge alarm">已暂停</span>' : ''}
             ${n.disk_alarm ? '<span class="badge alarm">水位告警</span>' : ''}
             ${renderUpgradeBadge(n)}
           </div>
@@ -1004,6 +1062,8 @@ function renderNodes(nodes, winHours) {
         </td>
         <td>
           <div class="btn-row">
+            ${pauseBtn}
+            <button class="btn sm" data-action="open-a-script" data-id="${esc(n.id)}">安装脚本</button>
             <button class="btn sm danger" data-action="delete-node" data-id="${esc(n.id)}">删除</button>
           </div>
         </td>
@@ -1014,6 +1074,9 @@ function renderNodes(nodes, winHours) {
   document.getElementById('nodes-b-tbody').innerHTML = bs.length ? bs.map(n => {
     const verStr = n.version ? `${n.version}${n.arch ? ' · ' + n.arch : ''}` : '-';
     const checked = selectedNodes.agent_b.has(n.id) ? 'checked' : '';
+    const pauseBtn = n.paused
+      ? `<button class="btn sm success" data-action="toggle-pause-node" data-id="${esc(n.id)}" data-paused="1">启动</button>`
+      : `<button class="btn sm warn" data-action="toggle-pause-node" data-id="${esc(n.id)}" data-paused="0">暂停</button>`;
     return `
       <tr>
         <td><input type="checkbox" class="node-chk" data-role="agent_b" data-id="${esc(n.id)}" ${checked} /></td>
@@ -1021,6 +1084,7 @@ function renderNodes(nodes, winHours) {
         <td>
           <div style="display:flex;gap:4px;flex-wrap:wrap;align-items:center">
             <span class="badge ${n.online ? 'online pulse' : 'offline'}">${n.online ? '在线' : '离线'}</span>
+            ${n.paused ? '<span class="badge alarm">已暂停</span>' : ''}
             ${renderUpgradeBadge(n)}
           </div>
           <div class="mono muted" style="margin-top:3px">${esc(verStr)}</div>
@@ -1037,6 +1101,7 @@ function renderNodes(nodes, winHours) {
         </td>
         <td>
           <div class="btn-row">
+            ${pauseBtn}
             <button class="btn sm primary" data-action="edit-node-projects" data-id="${esc(n.id)}">配置项目与磁盘</button>
             <button class="btn sm" data-action="open-b-script" data-id="${esc(n.id)}">安装脚本</button>
             <button class="btn sm danger" data-action="delete-node" data-id="${esc(n.id)}">删除</button>
@@ -1072,6 +1137,7 @@ function renderReleases(list) {
   populateReleaseSelect(document.getElementById('batch-rel-a'), 'agent_a', '');
   populateReleaseSelect(document.getElementById('batch-rel-b'), 'agent_b', '');
   populateReleaseSelect(document.getElementById('deploy-a-release-select'), 'agent_a', '自动匹配最新分发节点发布包');
+  populateReleaseSelect(document.getElementById('a-script-release-select'), 'agent_a', '自动匹配最新分发节点发布包');
   populateReleaseSelect(document.getElementById('b-script-release-select'), 'agent_b', '自动匹配最新接收节点发布包');
 
   const tbody = document.getElementById('releases-tbody');
@@ -1227,6 +1293,28 @@ async function deleteAccount(id) {
     refreshAll();
   } catch (e) {
     if (e.message !== 'unauthorized') showToast(`删除客户账号失败: ${e.message}`, 'error');
+  }
+}
+
+async function togglePauseNode(id, currentlyPaused) {
+  const nextPaused = !currentlyPaused;
+  const node = cachedNodes.find(n => n.id === id);
+  const roleName = node && node.role === 'agent_a' ? '分发节点' : '接收节点';
+  const actionTxt = nextPaused ? '暂停' : '启动';
+  try {
+    await api(`/api/v1/admin/nodes/${encodeURIComponent(id)}`, {
+      method: 'PUT',
+      body: JSON.stringify({ paused: nextPaused }),
+    });
+    showToast(
+      nextPaused
+        ? `${roleName} ${id} 已暂停（停止分配新任务，在途传输安全落盘后即静止）`
+        : `${roleName} ${id} 已启动，2 秒内自动恢复传输`,
+      nextPaused ? 'info' : 'success'
+    );
+    refreshAll();
+  } catch (e) {
+    if (e.message !== 'unauthorized') showToast(`${actionTxt}节点失败: ${e.message}`, 'error');
   }
 }
 
@@ -1564,9 +1652,15 @@ function openBScriptModal(nodeId, presetToken = '') {
   form.reset();
   form.elements.node_id.value = nodeId;
   form.elements.node_token.value = presetToken;
+  if (!presetToken && node && !node.online) {
+    form.elements.rotate_token.checked = true;
+  }
   document.getElementById('b-script-title').textContent = `内网接收节点一键安装脚本: ${nodeId}`;
   document.getElementById('b-script-output').classList.add('hidden');
+  document.getElementById('b-script-steps-tip').classList.add('hidden');
+  document.getElementById('btn-copy-b-exec').classList.add('hidden');
   document.getElementById('btn-copy-b-script').classList.add('hidden');
+  document.getElementById('btn-download-b-script').classList.add('hidden');
   populateReleaseSelect(document.getElementById('b-script-release-select'), 'agent_b', '自动匹配最新接收节点发布包');
 
   const nodeProjs = (node && node.projects) || [];
@@ -1581,6 +1675,25 @@ function openBScriptModal(nodeId, presetToken = '') {
   }
   syncBScriptMode();
   openModal('b-script-modal');
+}
+
+function openAScriptModal(nodeId, presetToken = '') {
+  const node = cachedNodes.find(n => n.id === nodeId);
+  const form = document.getElementById('a-script-form');
+  if (!form) return;
+  form.reset();
+  form.elements.node_id.value = nodeId;
+  form.elements.node_token.value = presetToken;
+  form.elements.public_addr.value = (node && node.public_addr) || '';
+  form.elements.rotate_token.checked = !presetToken && !(node && node.online);
+  document.getElementById('a-script-title').textContent = `分发节点自动化安装脚本: ${nodeId}`;
+  document.getElementById('a-script-output').classList.add('hidden');
+  document.getElementById('a-script-token-box').classList.add('hidden');
+  document.getElementById('btn-copy-a-exec').classList.add('hidden');
+  document.getElementById('btn-copy-a-script').classList.add('hidden');
+  document.getElementById('btn-download-a-script').classList.add('hidden');
+  populateReleaseSelect(document.getElementById('a-script-release-select'), 'agent_a', '自动匹配最新分发节点发布包');
+  openModal('a-script-modal');
 }
 
 function setupEvents() {
@@ -1610,21 +1723,66 @@ function setupEvents() {
       closeModal(closeBtn.dataset.closeModal);
       return;
     }
+    const guideToggle = e.target.closest('button[data-toggle-guide]');
+    if (guideToggle) {
+      const bodyEl = document.getElementById(guideToggle.dataset.toggleGuide);
+      if (bodyEl) {
+        const nowHidden = bodyEl.classList.toggle('hidden');
+        guideToggle.textContent = nowHidden ? '展开指南' : '收起指南';
+      }
+      return;
+    }
+    const guideModeBtn = e.target.closest('button[data-guide-a-mode]');
+    if (guideModeBtn) {
+      const mode = guideModeBtn.dataset.guideAMode;
+      document.querySelectorAll('button[data-guide-a-mode]').forEach(b => {
+        b.classList.toggle('active', b.dataset.guideAMode === mode);
+      });
+      document.getElementById('guide-a-steps-ssh')?.classList.toggle('hidden', mode !== 'ssh');
+      document.getElementById('guide-a-steps-manual')?.classList.toggle('hidden', mode !== 'manual');
+      return;
+    }
+    const copyBtn = e.target.closest('button[data-copy-text]');
+    if (copyBtn) {
+      copyText(copyBtn.dataset.copyText, '命令已复制到剪贴板');
+      return;
+    }
+    const swTabBtn = e.target.closest('button[data-switch-tab]');
+    if (swTabBtn) {
+      const targetTab = document.querySelector(`.tab[data-tab="${swTabBtn.dataset.switchTab}"]`);
+      if (targetTab) targetTab.click();
+      return;
+    }
+    const trigBtn = e.target.closest('button[data-trigger-click]');
+    if (trigBtn) {
+      document.getElementById(trigBtn.dataset.triggerClick)?.click();
+      return;
+    }
     const btn = e.target.closest('button[data-action]');
     if (!btn) return;
     const id = btn.dataset.id || '';
     switch (btn.dataset.action) {
       case 'edit-project': openProjectModal(id); break;
       case 'delete-project': deleteProject(id); break;
+      case 'toggle-pause-node': togglePauseNode(id, btn.dataset.paused === '1'); break;
       case 'delete-node': deleteNode(id); break;
       case 'delete-release': deleteRelease(id); break;
       case 'view-deploy-task': viewDeployTaskLog(id); break;
+      case 'open-a-script': openAScriptModal(id); break;
       case 'open-b-script': openBScriptModal(id); break;
       case 'edit-node-projects': openEditNodeProjectsModal(id); break;
       case 'edit-account': openAccountModal(id); break;
       case 'rotate-account': rotateAccountToken(id); break;
       case 'delete-account': deleteAccount(id); break;
     }
+  });
+
+  // Dynamic center healthz probe command in receiver onboarding guide
+  const checkCmd = `curl -kI ${window.location.origin}/healthz`;
+  const checkCmdEl = document.getElementById('guide-b-check-cmd');
+  if (checkCmdEl) checkCmdEl.textContent = checkCmd;
+  document.getElementById('btn-copy-b-check-cmd')?.addEventListener('click', () => {
+    copyText(checkCmd, '连通性探测命令已复制到剪贴板');
   });
 
   document.addEventListener('change', (e) => {
@@ -1778,7 +1936,13 @@ function setupEvents() {
     const form = document.getElementById('create-node-form');
     form.reset();
     form.elements.role.value = role;
-    document.getElementById('node-modal-title').textContent = role === 'agent_a' ? '手动注册公网分发节点' : '注册内网接收节点';
+    document.getElementById('node-modal-title').textContent = role === 'agent_a' ? '手动注册分发节点' : '注册内网接收节点';
+    const expEl = document.getElementById('node-modal-explainer');
+    if (expEl) {
+      expEl.innerHTML = role === 'agent_a'
+        ? '<strong>什么是分发节点？</strong> 负责接收上游文件并对外高速直传的中转机。注册后点「生成一键安装脚本」即可全自动安装并签发证书（若无公网 IP，公网地址请填 NAT/FRP 映射后的 <code>https://IP或域名:端口</code>）。'
+        : '<strong>什么是接收节点？</strong> 你本地机房/NAS 上用来落盘存文件的 Linux 机器（<strong>无需公网 IP</strong>）。这里先登记节点编号并生成密钥，创建后直接点「生成一键安装脚本」放到目标机执行即可自动上线。';
+    }
     document.getElementById('node-public-addr-wrap').classList.toggle('hidden', role !== 'agent_a');
     document.getElementById('node-token-result').classList.add('hidden');
     const scopedCust = isScopedCustomer();
@@ -1860,19 +2024,20 @@ function setupEvents() {
         body: JSON.stringify(payload),
       });
       const box = document.getElementById('node-token-result');
-      const extraBtn = role === 'agent_b'
-        ? '<div style="margin-top:8px"><button type="button" class="btn sm primary" id="btn-gen-b-after-create">生成一键安装脚本</button></div>'
-        : '';
+      const genBtnId = role === 'agent_b' ? 'btn-gen-b-after-create' : 'btn-gen-a-after-create';
+      const extraBtn = `<div class="btn-row" style="margin-top:8px"><button type="button" class="btn sm primary" id="${genBtnId}">下一步：生成一键安装脚本</button><button type="button" class="btn sm" data-copy-text="${esc(res.token)}">复制 Token</button></div>`;
       box.innerHTML = `<strong>节点已创建！请妥善保存接入 Token（仅展示一次）：</strong><div class="mono" style="margin-top:6px">${esc(res.token)}</div>${extraBtn}`;
       box.classList.remove('hidden');
-      showToast(`节点 ${res.node.id} 创建成功`, 'success');
+      showToast(`节点 ${res.node.id} 创建成功，请点击生成一键安装脚本`, 'success');
       await refreshAll();
-      if (role === 'agent_b') {
-        document.getElementById('btn-gen-b-after-create').addEventListener('click', () => {
-          closeModal('node-modal');
+      document.getElementById(genBtnId).addEventListener('click', () => {
+        closeModal('node-modal');
+        if (role === 'agent_b') {
           openBScriptModal(res.node.id, res.token);
-        });
-      }
+        } else {
+          openAScriptModal(res.node.id, res.token);
+        }
+      });
     } catch (err) {
       if (err.message !== 'unauthorized') showToast(`创建节点失败: ${err.message}`, 'error');
     }
@@ -2029,6 +2194,7 @@ function setupEvents() {
 
   // Receiver Install Script generator
   let lastBScript = '';
+  let lastBScriptNodeId = '';
   document.getElementById('b-script-form').addEventListener('submit', async (e) => {
     e.preventDefault();
     const fd = new FormData(e.target);
@@ -2080,28 +2246,94 @@ function setupEvents() {
         body: JSON.stringify(body),
       });
       lastBScript = res.script || '';
+      lastBScriptNodeId = res.node_id || String(body.node_id || 'receiver');
       const out = document.getElementById('b-script-output');
       out.innerHTML = `<div class="log-box">${esc(lastBScript)}</div>`;
       out.classList.remove('hidden');
+      document.getElementById('b-script-steps-tip').classList.remove('hidden');
+      document.getElementById('btn-copy-b-exec').classList.remove('hidden');
       document.getElementById('btn-copy-b-script').classList.remove('hidden');
-      showToast('接收节点安装脚本已生成', 'success');
+      document.getElementById('btn-download-b-script').classList.remove('hidden');
+      showToast('接收节点自动化安装脚本已生成', 'success');
     } catch (err) {
       if (err.message !== 'unauthorized') showToast(`生成安装脚本失败: ${err.message}`, 'error');
     }
   });
 
-  document.getElementById('btn-copy-b-script').addEventListener('click', async () => {
+  document.getElementById('btn-copy-b-exec').addEventListener('click', () => {
     if (!lastBScript) return;
-    try {
-      await navigator.clipboard.writeText(lastBScript);
-      const b = document.getElementById('btn-copy-b-script');
-      b.textContent = '已复制 ✓';
-      showToast('一键安装脚本已复制到剪贴板', 'success');
-      setTimeout(() => { b.textContent = '复制脚本'; }, 1500);
-    } catch {
-      showToast('剪贴板复制失败，请手动选中下方脚本复制', 'error');
-    }
+    copyText(buildTerminalExecCommand(lastBScript, lastBScriptNodeId, 'agent-b'), '一键终端执行命令已复制，直接粘贴到接收机终端回车即可');
   });
+  document.getElementById('btn-copy-b-script').addEventListener('click', () => {
+    if (!lastBScript) return;
+    copyText(lastBScript, '完整安装脚本已复制到剪贴板');
+  });
+  document.getElementById('btn-download-b-script').addEventListener('click', () => {
+    if (!lastBScript) return;
+    downloadTextFile(`install-agent-b-${lastBScriptNodeId}.sh`, lastBScript);
+  });
+
+  // Dispatch Node Automated Install Script generator (Admin only)
+  let lastAScript = '';
+  let lastAScriptNodeId = '';
+  const aScriptForm = document.getElementById('a-script-form');
+  if (aScriptForm) {
+    aScriptForm.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const fd = new FormData(e.target);
+      const body = {
+        node_id: String(fd.get('node_id') || '').trim(),
+        node_token: String(fd.get('node_token') || '').trim(),
+        rotate_token: fd.get('rotate_token') === 'on',
+        public_addr: String(fd.get('public_addr') || '').trim(),
+        public_port: Number(fd.get('public_port') || 8443),
+        local_port: Number(fd.get('local_port') || 18081),
+        install_dir: String(fd.get('install_dir') || '/opt/relay-agent-a').trim(),
+        data_dir: String(fd.get('data_dir') || '/data/relay-a').trim(),
+        release_id: String(fd.get('release_id') || '').trim(),
+      };
+      try {
+        const res = await api('/api/v1/admin/deploy/agent-a-script', {
+          method: 'POST',
+          body: JSON.stringify(body),
+        });
+        lastAScript = res.script || '';
+        lastAScriptNodeId = res.node_id || body.node_id || 'dispatch';
+        const uploadCmd = `curl -fsS -X PUT -H "X-Local-Token: ${res.local_token}" --data-binary @test.bin "http://127.0.0.1:${body.local_port}/local/v1/files/my-project/test.bin"`;
+        const tokBox = document.getElementById('a-script-token-box');
+        tokBox.innerHTML = `
+          <div><strong>请保存该分发节点的本机上传密钥 X-Local-Token（已内嵌到下方脚本）：</strong></div>
+          <div class="mono" style="margin:6px 0">${esc(res.local_token)}</div>
+          <div class="btn-row">
+            <button type="button" class="btn sm" data-copy-text="${esc(res.local_token)}">复制上传密钥</button>
+            <button type="button" class="btn sm" data-copy-text="${esc(uploadCmd)}">复制本机推送测试命令</button>
+          </div>
+        `;
+        tokBox.classList.remove('hidden');
+        const out = document.getElementById('a-script-output');
+        out.innerHTML = `<div class="log-box">${esc(lastAScript)}</div>`;
+        out.classList.remove('hidden');
+        document.getElementById('btn-copy-a-exec').classList.remove('hidden');
+        document.getElementById('btn-copy-a-script').classList.remove('hidden');
+        document.getElementById('btn-download-a-script').classList.remove('hidden');
+        showToast('分发节点自动化安装脚本已生成', 'success');
+      } catch (err) {
+        if (err.message !== 'unauthorized') showToast(`生成分发脚本失败: ${err.message}`, 'error');
+      }
+    });
+    document.getElementById('btn-copy-a-exec')?.addEventListener('click', () => {
+      if (!lastAScript) return;
+      copyText(buildTerminalExecCommand(lastAScript, lastAScriptNodeId, 'agent-a'), '一键终端执行命令已复制，直接粘贴到分发机终端回车即可');
+    });
+    document.getElementById('btn-copy-a-script')?.addEventListener('click', () => {
+      if (!lastAScript) return;
+      copyText(lastAScript, '完整分发安装脚本已复制到剪贴板');
+    });
+    document.getElementById('btn-download-a-script')?.addEventListener('click', () => {
+      if (!lastAScript) return;
+      downloadTextFile(`install-agent-a-${lastAScriptNodeId}.sh`, lastAScript);
+    });
+  }
 
   // Customer Account management (Admin only)
   const openAccBtn = document.getElementById('open-create-account');
@@ -2171,26 +2403,14 @@ function setupEvents() {
   }
   const copyUrlBtn = document.getElementById('btn-copy-account-url');
   if (copyUrlBtn) {
-    copyUrlBtn.addEventListener('click', async () => {
-      if (!lastAccountLoginURL) return;
-      try {
-        await navigator.clipboard.writeText(lastAccountLoginURL);
-        showToast('免输直达登录链接已复制到剪贴板', 'success');
-      } catch {
-        showToast('剪贴板复制失败，请手动复制', 'error');
-      }
+    copyUrlBtn.addEventListener('click', () => {
+      if (lastAccountLoginURL) copyText(lastAccountLoginURL, '免输直达登录链接已复制到剪贴板');
     });
   }
   const copyTokBtn = document.getElementById('btn-copy-account-token');
   if (copyTokBtn) {
-    copyTokBtn.addEventListener('click', async () => {
-      if (!lastAccountToken) return;
-      try {
-        await navigator.clipboard.writeText(lastAccountToken);
-        showToast('客户 Token 已复制到剪贴板', 'success');
-      } catch {
-        showToast('剪贴板复制失败，请手动复制', 'error');
-      }
+    copyTokBtn.addEventListener('click', () => {
+      if (lastAccountToken) copyText(lastAccountToken, '客户 Token 已复制到剪贴板');
     });
   }
 }

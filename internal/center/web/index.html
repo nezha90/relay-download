@@ -124,12 +124,89 @@
     <!-- Dispatch (Source/Edge) Nodes Tab -->
     <section id="tab-nodes-a" class="tab-panel" data-admin-only="1">
       <div class="section-bar">
-        <h2>公网分发节点列表 (源端服务)</h2>
+        <h2>分发节点列表 (源端缓存与高速出站)</h2>
         <div class="btn-row">
           <button id="open-deploy-a-from-tab" class="btn primary">一键部署分发节点 (SSH)</button>
           <button id="open-create-node-a" class="btn">+ 手动注册分发节点</button>
         </div>
       </div>
+
+      <!-- Dispatch Node Step-by-Step Guide -->
+      <div class="card guide-card" id="guide-a-card">
+        <div class="guide-head">
+          <div class="guide-head-left">
+            <span class="badge accent">操作指南</span>
+            <h3>什么是分发节点？如何 4 步新增部署（支持 SSH 全自动 / 无公网 NAT·FRP 脚本）</h3>
+          </div>
+          <button type="button" class="btn sm ghost" data-toggle-guide="guide-a-body">收起指南</button>
+        </div>
+        <div id="guide-a-body" class="guide-body">
+          <div class="concept-box">
+            <strong>什么是「分发节点」？</strong> 分发节点是部署在源端/中转机上的服务程序（<code>relay-agent-a</code>）：它在本机 <code>127.0.0.1:18081</code> 接收业务方或采集器推送的文件，并通过 TLS 1.3 加密端口（默认 <code>8443</code>）高速分发给所有内网接收节点；文件确认安全落盘后自动清理中转缓存。
+          </div>
+          <div class="guide-subtabs" role="tablist">
+            <button type="button" class="guide-subtab active" data-guide-a-mode="ssh">方式 A：有公网 IP + SSH（全自动一键部署）</button>
+            <button type="button" class="guide-subtab" data-guide-a-mode="manual">方式 B：无公网 IP / 无直连 SSH（NAT·FRP 映射 + 自动化脚本）</button>
+          </div>
+
+          <div id="guide-a-steps-ssh" class="step-grid">
+            <div class="step-item">
+              <div class="step-title"><span class="step-num">1</span>确认已有 Linux 发布包</div>
+              <div class="step-desc">前往「部署与版本」确认已上传 <code>分发节点 (linux/amd64)</code> 二进制包（通常已预置最新版，无需重复上传）。</div>
+              <button type="button" class="btn sm" data-switch-tab="deploy">查看发布包</button>
+            </div>
+            <div class="step-item">
+              <div class="step-title"><span class="step-num">2</span>填写目标机与目录参数</div>
+              <div class="step-desc">点击「一键部署分发节点 (SSH)」，填写目标机公网 IP、节点 ID（如 <code>edge-02</code>）、数据缓存盘路径（如 <code>/data/relay-a</code>）。</div>
+              <button type="button" class="btn sm primary" data-trigger-click="open-deploy-a-from-tab">打开一键部署</button>
+            </div>
+            <div class="step-item">
+              <div class="step-title"><span class="step-num">3</span>执行环境预检</div>
+              <div class="step-desc">点击「1. 执行环境预检」，自动检测 root 权限、systemd、8443/18081 端口占用与磁盘剩余空间。</div>
+            </div>
+            <div class="step-item">
+              <div class="step-title"><span class="step-num">4</span>一键安装并保存上传密钥</div>
+              <div class="step-desc">点击「2. 确认一键部署」，自动签发 IP 证书并拉起服务；复制弹窗里的 <code>X-Local-Token</code> 给业务方即可开始推送。</div>
+            </div>
+          </div>
+
+          <div id="guide-a-steps-manual" class="step-grid hidden">
+            <div class="step-item">
+              <div class="step-title"><span class="step-num">1</span>无公网机先映射 8443 端口</div>
+              <div class="step-desc">若分发机无独立公网 IP，请先用路由器 NAT / 云 LB / FRP 将该机 TCP <code>8443</code> 映射到外部接收机可达的 <code>公网IP:端口</code> 或域名（有公网 IP 仅需放行防火墙 8443）。</div>
+              <div class="cmd-copy-row">
+                <code>frpc tcp: local_port=8443 -&gt; remote_port=8443</code>
+                <button type="button" class="btn sm" data-copy-text="[[proxies]]&#10;name = &quot;relay-agent-a&quot;&#10;type = &quot;tcp&quot;&#10;localIP = &quot;127.0.0.1&quot;&#10;localPort = 8443&#10;remotePort = 8443">复制FRP示例</button>
+              </div>
+            </div>
+            <div class="step-item">
+              <div class="step-title"><span class="step-num">2</span>控制台手动注册分发节点</div>
+              <div class="step-desc">点击「+ 手动注册分发节点」，填写节点 ID，并在「公网地址」填入外部可达地址（如 <code>https://映射IP或域名:8443</code>），保存生成的接入密钥。</div>
+              <button type="button" class="btn sm primary" data-trigger-click="open-create-node-a">手动注册分发节点</button>
+            </div>
+            <div class="step-item">
+              <div class="step-title"><span class="step-num">3</span>生成并执行自动化安装脚本</div>
+              <div class="step-desc">在下方列表点该节点的「安装脚本」，中心自动签发对应 IP/域名证书并生成全自动安装脚本；一键复制「终端一键执行命令」到目标机粘贴回车。</div>
+            </div>
+            <div class="step-item">
+              <div class="step-title"><span class="step-num">4</span>上线验证与本机推流测试</div>
+              <div class="step-desc">3 秒内本页自动变为「在线」。可随时点「暂停/启动」控制是否允许下游拉取，或一键复制服务状态排查命令。</div>
+              <div class="cmd-copy-row">
+                <code>sudo systemctl status relay-agent-a --no-pager</code>
+                <button type="button" class="btn sm" data-copy-text="sudo systemctl status relay-agent-a --no-pager">复制</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="quick-cmd-bar">
+            <span class="muted">常用排查命令一键复制：</span>
+            <button type="button" class="btn sm" data-copy-text="sudo systemctl status relay-agent-a --no-pager">查看分发服务状态</button>
+            <button type="button" class="btn sm" data-copy-text="sudo journalctl -u relay-agent-a -n 50 --no-pager">查看最近 50 行日志</button>
+            <button type="button" class="btn sm" data-copy-text="sudo systemctl restart relay-agent-a">重启分发服务</button>
+          </div>
+        </div>
+      </div>
+
       <div class="batch-bar">
         <span class="muted">批量更新 (节点主动 HTTPS 自更新)：</span>
         <select id="batch-rel-a"></select>
@@ -161,6 +238,59 @@
         <h2>内网接收节点列表 (目标落盘 · 项目/调度/磁盘全托管)</h2>
         <button id="open-create-node-b" class="btn primary">+ 注册接收节点</button>
       </div>
+
+      <!-- Receiver Node Step-by-Step Guide (Visible to BOTH Admin & Customer) -->
+      <div class="card guide-card" id="guide-b-card">
+        <div class="guide-head">
+          <div class="guide-head-left">
+            <span class="badge online">新手必看 · 无需公网 IP</span>
+            <h3>什么是接收节点？如何 4 步接入一台新的内网落盘机器</h3>
+          </div>
+          <button type="button" class="btn sm ghost" data-toggle-guide="guide-b-body">收起指南</button>
+        </div>
+        <div id="guide-b-body" class="guide-body">
+          <div class="concept-box">
+            <strong>什么是「接收节点」？</strong> 接收节点就是你<strong>本地机房 / NAS / 用来最终存文件的 Linux 硬盘服务器</strong>（上面运行 <code>relay-agent-b</code> 客户端）。它<strong>完全不需要公网 IP，也不需要路由器端口映射或开放任何入站防火墙</strong>——只要机器能正常访问外网 HTTPS，就会主动向中心拉取任务并高速写盘，落盘校验完成后自动通知上游释放空间。
+          </div>
+
+          <div class="step-grid">
+            <div class="step-item">
+              <div class="step-title"><span class="step-num">1</span>准备 Linux 接收机与挂载盘</div>
+              <div class="step-desc">登录你的本地 Linux 机器，确认硬盘已挂载好落盘目录（例如 <code>/mnt/sda/relay-delivery</code>），并可访问本中心。</div>
+              <div class="cmd-copy-row">
+                <code id="guide-b-check-cmd">curl -kI https://.../healthz</code>
+                <button type="button" class="btn sm" id="btn-copy-b-check-cmd">复制检测</button>
+              </div>
+            </div>
+            <div class="step-item">
+              <div class="step-title"><span class="step-num">2</span>在页面注册接收节点</div>
+              <div class="step-desc">点击下方按钮给这台机器取个编号（如 <code>nas-02</code>）和备注名，选好要下载的项目（单项目专享/全部项目），生成专属接入密钥。</div>
+              <button type="button" class="btn sm primary" data-trigger-click="open-create-node-b">+ 立即注册接收节点</button>
+            </div>
+            <div class="step-item">
+              <div class="step-title"><span class="step-num">3</span>一键生成并运行自动化脚本</div>
+              <div class="step-desc">在创建成功提示里点「生成一键安装脚本」（或下方列表点「安装脚本」），填入本地磁盘挂载目录，点「复制一键执行命令」粘贴到接收机终端回车即可全自动安装并开机自启。</div>
+            </div>
+            <div class="step-item">
+              <div class="step-title"><span class="step-num">4</span>上线验证与网页随时管控</div>
+              <div class="step-desc">安装完 3 秒内，本页列表该机器自动变「在线」并显示各硬盘余量。之后切换项目、启停单盘、限速、<strong>暂停/启动下载</strong>、升级版本全在网页点按钮生效，无需再 SSH。</div>
+              <div class="cmd-copy-row">
+                <code>sudo systemctl status relay-agent-b --no-pager</code>
+                <button type="button" class="btn sm" data-copy-text="sudo systemctl status relay-agent-b --no-pager">复制</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="quick-cmd-bar">
+            <span class="muted">接收机常用命令一键复制：</span>
+            <button type="button" class="btn sm" data-copy-text="df -hT | grep -E 'Filesystem|/mnt|/data'">查看挂载盘与剩余空间</button>
+            <button type="button" class="btn sm" data-copy-text="sudo mkdir -p /mnt/sda/relay-delivery /mnt/sdb/relay-delivery">创建示例落盘目录</button>
+            <button type="button" class="btn sm" data-copy-text="sudo journalctl -u relay-agent-b -n 50 --no-pager">查看接收服务最近 50 行日志</button>
+            <button type="button" class="btn sm" data-copy-text="sudo systemctl restart relay-agent-b">重启接收服务</button>
+          </div>
+        </div>
+      </div>
+
       <div class="batch-bar">
         <span class="muted">批量更新 (内网接收节点主动 HTTPS 拉取自更新)：</span>
         <select id="batch-rel-b"></select>
@@ -368,6 +498,7 @@
         <h3 id="node-modal-title">注册节点</h3>
         <button class="btn ghost" type="button" data-close-modal="node-modal">关闭</button>
       </div>
+      <div id="node-modal-explainer" class="concept-box" style="margin-bottom:12px"></div>
       <form id="create-node-form" class="form-stack">
         <input type="hidden" name="role" />
         <label>节点 ID
@@ -665,11 +796,69 @@
             <input name="rotate_token" type="checkbox" />
             <span>重新生成并直接内嵌新接入 Token (会断开该接收节点旧连接)</span>
           </label>
-          <button type="submit" class="btn primary">生成安装脚本</button>
-          <button type="button" id="btn-copy-b-script" class="btn hidden">复制脚本</button>
+          <button type="submit" class="btn primary">生成自动化安装脚本</button>
+          <button type="button" id="btn-copy-b-exec" class="btn success hidden">复制一键执行命令</button>
+          <button type="button" id="btn-copy-b-script" class="btn hidden">复制完整脚本</button>
+          <button type="button" id="btn-download-b-script" class="btn hidden">下载 .sh</button>
         </div>
       </form>
-      <div id="b-script-output" class="hidden" style="margin-top:14px"></div>
+      <div id="b-script-steps-tip" class="banner pass hidden" style="margin-top:12px;margin-bottom:0">
+        <strong>执行步骤：</strong> 1) SSH 登录你的内网接收机 → 2) 点击上方「复制一键执行命令」直接粘贴到终端回车（非 root 用户请先 <code>sudo -i</code>）→ 3) 等待 5 秒，本页面该节点自动变「在线」并开始拉取文件。
+      </div>
+      <div id="b-script-output" class="hidden" style="margin-top:10px"></div>
+    </div>
+  </div>
+
+  <!-- Dispatch Node Automated Install Script Modal (Admin Only · Works without Center SSH / Behind NAT or FRP) -->
+  <div id="a-script-modal" class="overlay hidden">
+    <div class="modal-card wide">
+      <div class="modal-head">
+        <div>
+          <h3 id="a-script-title">分发节点自动化安装脚本</h3>
+          <p class="muted">适用于无直连 SSH 或无公网 IP（经 NAT / FRP 映射）的分发机；自动签发 TLS 证书、下载校验二进制并配置 systemd</p>
+        </div>
+        <button class="btn ghost" type="button" data-close-modal="a-script-modal">关闭</button>
+      </div>
+      <form id="a-script-form" class="form-stack">
+        <input type="hidden" name="node_id" />
+        <input type="hidden" name="node_token" />
+        <div class="form-grid-2">
+          <label>公网 / 映射访问地址 * (接收节点将连接此地址)
+            <input name="public_addr" required placeholder="https://公网IP或域名:8443" autocomplete="off" />
+          </label>
+          <label>选择分发节点版本包
+            <select id="a-script-release-select" name="release_id">
+              <option value="">自动匹配最新分发节点发布包</option>
+            </select>
+          </label>
+        </div>
+        <div class="form-grid-4">
+          <label>本机监听端口 (TLS)
+            <input name="public_port" type="number" value="8443" min="1" max="65535" />
+          </label>
+          <label>本机上传端口 (127.0.0.1)
+            <input name="local_port" type="number" value="18081" min="1" max="65535" />
+          </label>
+          <label>安装目录
+            <input name="install_dir" value="/opt/relay-agent-a" autocomplete="off" />
+          </label>
+          <label>中转缓存数据目录
+            <input name="data_dir" value="/data/relay-a" autocomplete="off" />
+          </label>
+        </div>
+        <div class="btn-row">
+          <label class="toggle">
+            <input name="rotate_token" type="checkbox" checked />
+            <span>自动生成并内嵌接入 Token (如该节点尚未运行请保持勾选)</span>
+          </label>
+          <button type="submit" class="btn primary">生成自动化安装脚本</button>
+          <button type="button" id="btn-copy-a-exec" class="btn success hidden">复制一键执行命令</button>
+          <button type="button" id="btn-copy-a-script" class="btn hidden">复制完整脚本</button>
+          <button type="button" id="btn-download-a-script" class="btn hidden">下载 .sh</button>
+        </div>
+      </form>
+      <div id="a-script-token-box" class="token-box hidden"></div>
+      <div id="a-script-output" class="hidden" style="margin-top:10px"></div>
     </div>
   </div>
 

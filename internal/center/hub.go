@@ -22,6 +22,7 @@ type LiveAState struct {
 	DiskFreeBytes        uint64
 	DiskUsedPct          float64
 	DiskAlarm            bool
+	Paused               bool
 	ActiveStreams        int
 	MaxConcurrentStreams int
 	Availability         map[string]protocol.ProjectAvailability // project_id -> availability
@@ -49,6 +50,7 @@ type LiveBState struct {
 	DiskTotalBytes      uint64
 	DiskFreeBytes       uint64
 	DiskUsedPct         float64
+	Paused              bool
 	ActiveCount         int
 	LastSeen            time.Time
 }
@@ -102,6 +104,7 @@ func (h *Hub) UpdateA(hb protocol.AgentAHeartbeatReq) {
 		DiskFreeBytes:        hb.DiskFreeBytes,
 		DiskUsedPct:          hb.DiskUsedPct,
 		DiskAlarm:            hb.DiskAlarm,
+		Paused:               hb.Paused,
 		ActiveStreams:        hb.ActiveStreams,
 		MaxConcurrentStreams: hb.MaxConcurrentStreams,
 		Availability:         availMap,
@@ -109,8 +112,10 @@ func (h *Hub) UpdateA(hb protocol.AgentAHeartbeatReq) {
 	}
 	h.mu.Unlock()
 
-	for _, av := range wakeupProjects {
-		h.WakeupB(av.ProjectID, av.ReadyCount)
+	if !hb.Paused {
+		for _, av := range wakeupProjects {
+			h.WakeupB(av.ProjectID, av.ReadyCount)
+		}
 	}
 }
 
@@ -142,6 +147,7 @@ func (h *Hub) UpdateB(hb protocol.AgentBHeartbeatReq) {
 		DiskTotalBytes:      hb.DiskTotalBytes,
 		DiskFreeBytes:       hb.DiskFreeBytes,
 		DiskUsedPct:         hb.DiskUsedPct,
+		Paused:              hb.Paused,
 		ActiveCount:         activeCnt,
 		LastSeen:            now,
 	}
@@ -226,6 +232,31 @@ func (h *Hub) UpdateNodeProjects(nodeID string, projects []string) {
 	h.DisconnectSSE(nodeID)
 }
 
+// SetNodePaused updates in-memory pause state immediately so discovery, wakeups, and HRW routing
+// reflect pause/resume in real time without waiting for the next heartbeat cycle.
+func (h *Hub) SetNodePaused(nodeID string, paused bool) {
+	var wakeupProjects []protocol.ProjectAvailability
+	h.mu.Lock()
+	if st, ok := h.aNodes[nodeID]; ok {
+		st.Paused = paused
+		if !paused && h.IsOnline(st.LastSeen) {
+			for _, av := range st.Availability {
+				if av.ReadyCount > 0 {
+					wakeupProjects = append(wakeupProjects, av)
+				}
+			}
+		}
+	}
+	if st, ok := h.bNodes[nodeID]; ok {
+		st.Paused = paused
+	}
+	h.mu.Unlock()
+
+	for _, av := range wakeupProjects {
+		h.WakeupB(av.ProjectID, av.ReadyCount)
+	}
+}
+
 // WakeupB wakes up at most readyCount+1 subscribed B nodes for projectID (including wildcard "*"
 // subscribers running in all-projects mode), preferring currently idle B nodes to prevent thundering herd.
 func (h *Hub) WakeupB(projectID string, readyCount int) {
@@ -250,6 +281,9 @@ func (h *Hub) WakeupB(projectID string, readyCount int) {
 		seen[bID] = struct{}{}
 		active := 0
 		if st, ok := h.bNodes[bID]; ok {
+			if st.Paused {
+				return
+			}
 			active = st.ActiveCount
 		}
 		subs = append(subs, subInfo{bNodeID: bID, active: active, ch: sub.ch})
@@ -290,7 +324,7 @@ func (h *Hub) DiscoverCandidates(projectID string) []protocol.DiscoverCandidate 
 	h.mu.RLock()
 	list := make([]protocol.DiscoverCandidate, 0)
 	for _, st := range h.aNodes {
-		if !h.IsOnline(st.LastSeen) {
+		if !h.IsOnline(st.LastSeen) || st.Paused {
 			continue
 		}
 		av, ok := st.Availability[projectID]
@@ -353,16 +387,18 @@ func (h *Hub) Snapshot() (map[string]*LiveAState, map[string]*LiveBState) {
 // eligible for each project so all dispatch nodes compute the exact same HRW asset-group owner.
 func (h *Hub) ActiveReceiversByProject(projectIDs []string, dbNodes []protocol.NodeRecord) map[string][]string {
 	nodePolicy := make(map[string][]string, len(dbNodes))
+	nodePaused := make(map[string]bool, len(dbNodes))
 	for _, n := range dbNodes {
 		if n.Role == protocol.RoleAgentB {
 			nodePolicy[n.ID] = n.Projects
+			nodePaused[n.ID] = n.Paused
 		}
 	}
 
 	h.mu.RLock()
 	onlineB := make([]*LiveBState, 0, len(h.bNodes))
 	for _, st := range h.bNodes {
-		if h.IsOnline(st.LastSeen) {
+		if h.IsOnline(st.LastSeen) && !st.Paused && !nodePaused[st.NodeID] {
 			onlineB = append(onlineB, st)
 		}
 	}
@@ -396,22 +432,24 @@ func (h *Hub) ComputeClusterQuotas(node *StoredNode, projects []protocol.Project
 	rateLimitMBps = node.RateLimitMBps
 
 	nodePolicy := make(map[string][]string, len(dbNodes))
+	nodePaused := make(map[string]bool, len(dbNodes))
 	for _, n := range dbNodes {
 		if n.Role == protocol.RoleAgentB {
 			nodePolicy[n.ID] = n.Projects
+			nodePaused[n.ID] = n.Paused
 		}
 	}
 
 	h.mu.RLock()
 	var totalDispatchStreams int
 	for _, aSt := range h.aNodes {
-		if h.IsOnline(aSt.LastSeen) && aSt.MaxConcurrentStreams > 0 {
+		if h.IsOnline(aSt.LastSeen) && !aSt.Paused && aSt.MaxConcurrentStreams > 0 {
 			totalDispatchStreams += aSt.MaxConcurrentStreams
 		}
 	}
 	onlineB := make([]*LiveBState, 0, len(h.bNodes))
 	for _, bSt := range h.bNodes {
-		if h.IsOnline(bSt.LastSeen) {
+		if h.IsOnline(bSt.LastSeen) && !bSt.Paused && !nodePaused[bSt.NodeID] {
 			onlineB = append(onlineB, bSt)
 		}
 	}

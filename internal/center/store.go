@@ -198,6 +198,7 @@ CREATE TABLE IF NOT EXISTS accounts (
 		`ALTER TABLE projects ADD COLUMN group_affinity INTEGER NOT NULL DEFAULT 1`,
 		`ALTER TABLE projects ADD COLUMN max_total_concurrent INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE projects ADD COLUMN max_total_rate_mbps REAL NOT NULL DEFAULT 0`,
+		`ALTER TABLE nodes ADD COLUMN paused INTEGER NOT NULL DEFAULT 0`,
 	}
 	for _, stmt := range migrations {
 		if _, err := db.Exec(stmt); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
@@ -420,10 +421,14 @@ func (s *Store) UpsertNode(ctx context.Context, n protocol.NodeRecord, rawToken 
 	if n.DisabledDisks == nil {
 		disDisksJSON = []byte("[]")
 	}
+	pausedInt := 0
+	if n.Paused {
+		pausedInt = 1
+	}
 	tokHash := auth.HashToken(rawToken)
 	_, err := s.db.ExecContext(ctx, `
-INSERT INTO nodes (id, name, role, projects_json, project_schedule, disk_policy, disabled_disks_json, concurrency_mode, max_concurrent_override, rate_limit_mbps, public_addr, token_hash, created_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO nodes (id, name, role, projects_json, project_schedule, disk_policy, disabled_disks_json, concurrency_mode, max_concurrent_override, rate_limit_mbps, paused, public_addr, token_hash, created_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
 	name=excluded.name,
 	role=excluded.role,
@@ -434,25 +439,28 @@ ON CONFLICT(id) DO UPDATE SET
 	concurrency_mode=excluded.concurrency_mode,
 	max_concurrent_override=excluded.max_concurrent_override,
 	rate_limit_mbps=excluded.rate_limit_mbps,
+	paused=excluded.paused,
 	public_addr=excluded.public_addr,
 	token_hash=CASE WHEN ? != '' THEN excluded.token_hash ELSE nodes.token_hash END
-`, n.ID, n.Name, n.Role, string(projJSON), n.ProjectSchedule, n.DiskPolicy, string(disDisksJSON), n.ConcurrencyMode, n.MaxConcurrentOverride, n.RateLimitMBps, n.PublicAddr, tokHash, n.CreatedAt, rawToken)
+`, n.ID, n.Name, n.Role, string(projJSON), n.ProjectSchedule, n.DiskPolicy, string(disDisksJSON), n.ConcurrencyMode, n.MaxConcurrentOverride, n.RateLimitMBps, pausedInt, n.PublicAddr, tokHash, n.CreatedAt, rawToken)
 	return err
 }
 
 func (s *Store) AuthenticateNode(ctx context.Context, id, rawToken, expectedRole string) (*StoredNode, error) {
 	var sn StoredNode
 	var projJSON, disDisksJSON string
+	var pausedInt int
 	err := s.db.QueryRowContext(ctx, `
-SELECT id, name, role, projects_json, project_schedule, disk_policy, disabled_disks_json, concurrency_mode, max_concurrent_override, rate_limit_mbps, public_addr, token_hash, created_at
+SELECT id, name, role, projects_json, project_schedule, disk_policy, disabled_disks_json, concurrency_mode, max_concurrent_override, rate_limit_mbps, paused, public_addr, token_hash, created_at
 FROM nodes WHERE id = ?
-`, id).Scan(&sn.ID, &sn.Name, &sn.Role, &projJSON, &sn.ProjectSchedule, &sn.DiskPolicy, &disDisksJSON, &sn.ConcurrencyMode, &sn.MaxConcurrentOverride, &sn.RateLimitMBps, &sn.PublicAddr, &sn.TokenHash, &sn.CreatedAt)
+`, id).Scan(&sn.ID, &sn.Name, &sn.Role, &projJSON, &sn.ProjectSchedule, &sn.DiskPolicy, &disDisksJSON, &sn.ConcurrencyMode, &sn.MaxConcurrentOverride, &sn.RateLimitMBps, &pausedInt, &sn.PublicAddr, &sn.TokenHash, &sn.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
 		return nil, err
 	}
+	sn.Paused = pausedInt != 0
 	if expectedRole != "" && sn.Role != expectedRole {
 		return nil, errors.New("role mismatch")
 	}
@@ -475,7 +483,7 @@ FROM nodes WHERE id = ?
 
 func (s *Store) ListNodes(ctx context.Context) ([]protocol.NodeRecord, error) {
 	rows, err := s.db.QueryContext(ctx, `
-SELECT id, name, role, projects_json, project_schedule, disk_policy, disabled_disks_json, concurrency_mode, max_concurrent_override, rate_limit_mbps, public_addr, created_at
+SELECT id, name, role, projects_json, project_schedule, disk_policy, disabled_disks_json, concurrency_mode, max_concurrent_override, rate_limit_mbps, paused, public_addr, created_at
 FROM nodes ORDER BY role ASC, created_at ASC
 `)
 	if err != nil {
@@ -486,9 +494,11 @@ FROM nodes ORDER BY role ASC, created_at ASC
 	for rows.Next() {
 		var n protocol.NodeRecord
 		var projJSON, disDisksJSON string
-		if err := rows.Scan(&n.ID, &n.Name, &n.Role, &projJSON, &n.ProjectSchedule, &n.DiskPolicy, &disDisksJSON, &n.ConcurrencyMode, &n.MaxConcurrentOverride, &n.RateLimitMBps, &n.PublicAddr, &n.CreatedAt); err != nil {
+		var pausedInt int
+		if err := rows.Scan(&n.ID, &n.Name, &n.Role, &projJSON, &n.ProjectSchedule, &n.DiskPolicy, &disDisksJSON, &n.ConcurrencyMode, &n.MaxConcurrentOverride, &n.RateLimitMBps, &pausedInt, &n.PublicAddr, &n.CreatedAt); err != nil {
 			return nil, err
 		}
+		n.Paused = pausedInt != 0
 		_ = json.Unmarshal([]byte(projJSON), &n.Projects)
 		_ = json.Unmarshal([]byte(disDisksJSON), &n.DisabledDisks)
 		if n.ProjectSchedule == "" {
@@ -508,16 +518,18 @@ FROM nodes ORDER BY role ASC, created_at ASC
 func (s *Store) GetNode(ctx context.Context, id string) (*protocol.NodeRecord, error) {
 	var n protocol.NodeRecord
 	var projJSON, disDisksJSON string
+	var pausedInt int
 	err := s.db.QueryRowContext(ctx, `
-SELECT id, name, role, projects_json, project_schedule, disk_policy, disabled_disks_json, concurrency_mode, max_concurrent_override, rate_limit_mbps, public_addr, created_at
+SELECT id, name, role, projects_json, project_schedule, disk_policy, disabled_disks_json, concurrency_mode, max_concurrent_override, rate_limit_mbps, paused, public_addr, created_at
 FROM nodes WHERE id = ?
-`, id).Scan(&n.ID, &n.Name, &n.Role, &projJSON, &n.ProjectSchedule, &n.DiskPolicy, &disDisksJSON, &n.ConcurrencyMode, &n.MaxConcurrentOverride, &n.RateLimitMBps, &n.PublicAddr, &n.CreatedAt)
+`, id).Scan(&n.ID, &n.Name, &n.Role, &projJSON, &n.ProjectSchedule, &n.DiskPolicy, &disDisksJSON, &n.ConcurrencyMode, &n.MaxConcurrentOverride, &n.RateLimitMBps, &pausedInt, &n.PublicAddr, &n.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
 		return nil, err
 	}
+	n.Paused = pausedInt != 0
 	_ = json.Unmarshal([]byte(projJSON), &n.Projects)
 	_ = json.Unmarshal([]byte(disDisksJSON), &n.DisabledDisks)
 	if n.ProjectSchedule == "" {

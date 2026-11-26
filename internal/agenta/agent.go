@@ -48,6 +48,7 @@ type Agent struct {
 
 	streamSem     chan struct{}
 	activeStreams atomic.Int32
+	paused        atomic.Bool
 
 	hbWakeCh     chan struct{}
 	eventWakeCh  chan struct{}
@@ -1190,6 +1191,10 @@ func (a *Agent) handleClaim(w http.ResponseWriter, r *http.Request) {
 		protocol.WriteError(w, http.StatusForbidden, "token claims mismatch")
 		return
 	}
+	if a.paused.Load() {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 
 	leaseTTL, err := a.validateLeaseTTL(req.LeaseTTLSec)
 	if err != nil {
@@ -1236,6 +1241,10 @@ func (a *Agent) handleClaimBatch(w http.ResponseWriter, r *http.Request) {
 	}
 	if claims.ANodeID != a.cfg.NodeID || claims.ProjectID != req.ProjectID || claims.BNodeID != req.BNodeID {
 		protocol.WriteError(w, http.StatusForbidden, "token claims mismatch")
+		return
+	}
+	if a.paused.Load() {
+		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 	leaseTTL, err := a.validateLeaseTTL(req.LeaseTTLSec)
@@ -1715,8 +1724,9 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 		UpgradeError:     upgErr,
 		DiskTotalBytes:   total,
 		DiskFreeBytes:    free,
-		DiskUsedPct:      pct,
+		DiskUsedPct:          pct,
 		DiskAlarm:            alarm,
+		Paused:               a.paused.Load(),
 		ActiveStreams:        int(a.activeStreams.Load()),
 		MaxConcurrentStreams: a.cfg.MaxConcurrentStreams,
 		Availability:         avail,
@@ -1743,6 +1753,9 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 	}
 	var hbResp protocol.HeartbeatResp
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 256*1024)).Decode(&hbResp); err == nil {
+		if prev := a.paused.Swap(hbResp.Paused); prev != hbResp.Paused {
+			a.logger.Info("dispatch node pause state updated from center", "paused", hbResp.Paused)
+		}
 		if hbResp.ActiveReceivers != nil || hbResp.ProjectAffinity != nil {
 			a.store.SetRoutingState(hbResp.ActiveReceivers, hbResp.ProjectAffinity)
 		}

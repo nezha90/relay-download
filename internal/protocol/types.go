@@ -83,6 +83,7 @@ type DiskStatus struct {
 }
 
 type ReceiverDirective struct {
+	Paused             bool     `json:"paused,omitempty"`               // true: stop claiming new files (in-flight drains cleanly)
 	ProjectMode        string   `json:"project_mode,omitempty"`         // "all" | "selected"
 	AllowedProjects    []string `json:"allowed_projects,omitempty"`     // explicit ordered allowlist when project_mode=="selected"
 	KnownProjects      []string `json:"known_projects,omitempty"`       // all projects ordered by created_at ASC
@@ -125,6 +126,7 @@ type NodeRecord struct {
 	ConcurrencyMode       string    `json:"concurrency_mode,omitempty"`
 	MaxConcurrentOverride int       `json:"max_concurrent_override,omitempty"`
 	RateLimitMBps         float64   `json:"rate_limit_mbps,omitempty"`
+	Paused                bool      `json:"paused,omitempty"`
 	PublicAddr            string    `json:"public_addr,omitempty"`
 	CreatedAt             time.Time `json:"created_at"`
 }
@@ -151,6 +153,7 @@ type AgentAHeartbeatReq struct {
 	DiskFreeBytes    uint64                `json:"disk_free_bytes"`
 	DiskUsedPct      float64               `json:"disk_used_pct"`
 	DiskAlarm            bool                  `json:"disk_alarm"`
+	Paused               bool                  `json:"paused,omitempty"`
 	ActiveStreams        int                   `json:"active_streams,omitempty"`
 	MaxConcurrentStreams int                   `json:"max_concurrent_streams,omitempty"`
 	Availability         []ProjectAvailability `json:"availability"`
@@ -195,6 +198,7 @@ type AgentBHeartbeatReq struct {
 	DiskTotalBytes        uint64            `json:"disk_total_bytes"`
 	DiskFreeBytes         uint64            `json:"disk_free_bytes"`
 	DiskUsedPct           float64           `json:"disk_used_pct"`
+	Paused                bool              `json:"paused,omitempty"`
 	ActiveCount           int               `json:"active_count"`
 	LegacyActiveTransfers []json.RawMessage `json:"active_transfers,omitempty"`
 }
@@ -208,6 +212,7 @@ type UpgradeDirective struct {
 }
 
 type HeartbeatResp struct {
+	Paused          bool                `json:"paused,omitempty"`
 	Upgrade         *UpgradeDirective   `json:"upgrade,omitempty"`
 	AllowedProjects []string            `json:"allowed_projects,omitempty"`
 	Directive       *ReceiverDirective  `json:"directive,omitempty"`
@@ -455,6 +460,7 @@ type LiveNodeView struct {
 	ConcurrencyMode       string                `json:"concurrency_mode,omitempty"`
 	MaxConcurrentOverride int                   `json:"max_concurrent_override,omitempty"`
 	RateLimitMBps         float64               `json:"rate_limit_mbps,omitempty"`
+	Paused                bool                  `json:"paused,omitempty"`
 	EffectiveConcurrent   int                   `json:"effective_concurrent,omitempty"`
 	MaxConcurrentCap      int                   `json:"max_concurrent_cap,omitempty"`
 	EffectiveStreams      int                   `json:"effective_streams,omitempty"`
@@ -662,5 +668,29 @@ type AgentBScriptReq struct {
 type AgentBScriptResp struct {
 	NodeID       string `json:"node_id"`
 	Script       string `json:"script"`
+	RotatedToken string `json:"rotated_token,omitempty"`
+}
+
+type AgentAScriptReq struct {
+	NodeID               string  `json:"node_id"`
+	NodeToken            string  `json:"node_token,omitempty"`
+	RotateToken          bool    `json:"rotate_token,omitempty"`
+	PublicAddr           string  `json:"public_addr,omitempty"`
+	PublicPort           int     `json:"public_port,omitempty"`
+	LocalPort            int     `json:"local_port,omitempty"`
+	InstallDir           string  `json:"install_dir,omitempty"`
+	DataDir              string  `json:"data_dir,omitempty"`
+	MaxDiskUsagePct      float64 `json:"max_disk_usage_pct,omitempty"`
+	LeaseTTLSec          int     `json:"lease_ttl_sec,omitempty"`
+	MaxConcurrentStreams int     `json:"max_concurrent_streams,omitempty"`
+	RateLimitMBps        float64 `json:"rate_limit_mbps,omitempty"`
+	ReleaseID            string  `json:"release_id,omitempty"`
+}
+
+type AgentAScriptResp struct {
+	NodeID       string `json:"node_id"`
+	Script       string `json:"script"`
+	PublicAddr   string `json:"public_addr"`
+	LocalToken   string `json:"local_token"`
 	RotatedToken string `json:"rotated_token,omitempty"`
 }

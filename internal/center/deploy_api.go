@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -18,6 +19,7 @@ import (
 
 	"relay-download/internal/auth"
 	"relay-download/internal/deployer"
+	"relay-download/internal/pki"
 	"relay-download/internal/protocol"
 	"relay-download/internal/transfer"
 )
@@ -777,6 +779,120 @@ func (s *Server) handleAdminAgentBInstallScript(w http.ResponseWriter, r *http.R
 	protocol.WriteJSON(w, http.StatusOK, protocol.AgentBScriptResp{
 		NodeID:       node.ID,
 		Script:       script,
+		RotatedToken: rotatedTok,
+	})
+}
+
+func (s *Server) handleAdminAgentAInstallScript(w http.ResponseWriter, r *http.Request) {
+	var req protocol.AgentAScriptReq
+	if err := protocol.DecodeJSON(r.Body, &req); err != nil {
+		protocol.WriteError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	req.NodeID = strings.TrimSpace(req.NodeID)
+	if req.NodeID == "" {
+		protocol.WriteError(w, http.StatusBadRequest, "node_id is required")
+		return
+	}
+	if s.cfg.PublicURL == "" || s.cfg.CACert == "" || s.cfg.CAKey == "" {
+		protocol.WriteError(w, http.StatusBadRequest, "center config requires public_url, ca_cert, and ca_key")
+		return
+	}
+	node, err := s.store.GetNode(r.Context(), req.NodeID)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			protocol.WriteError(w, http.StatusNotFound, "node not found")
+			return
+		}
+		protocol.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if node.Role != protocol.RoleAgentA {
+		protocol.WriteError(w, http.StatusBadRequest, "node is not an agent_a dispatch node")
+		return
+	}
+
+	pubAddr := strings.TrimSpace(req.PublicAddr)
+	if pubAddr == "" {
+		pubAddr = strings.TrimSpace(node.PublicAddr)
+	}
+	if err := validateHTTPSAddr(pubAddr); err != nil {
+		protocol.WriteError(w, http.StatusBadRequest, "请先填写公网/映射访问地址 (https://<IP或域名>:端口)")
+		return
+	}
+	u, err := url.Parse(pubAddr)
+	if err != nil || u.Hostname() == "" {
+		protocol.WriteError(w, http.StatusBadRequest, "invalid public_addr host")
+		return
+	}
+	host := u.Hostname()
+	ips := []string{"127.0.0.1"}
+	var dnsNames []string
+	if ip := net.ParseIP(host); ip != nil {
+		if ip.String() != "127.0.0.1" {
+			ips = append(ips, ip.String())
+		}
+	} else {
+		dnsNames = append(dnsNames, host)
+	}
+
+	var rel *protocol.ReleaseRecord
+	if req.ReleaseID != "" {
+		rel, err = s.store.GetRelease(r.Context(), req.ReleaseID)
+	} else {
+		rel, err = s.store.LatestReleaseFor(r.Context(), protocol.RoleAgentA, "linux", "amd64")
+	}
+	if err != nil || rel.Role != protocol.RoleAgentA {
+		protocol.WriteError(w, http.StatusBadRequest, "no matching agent_a release found: please upload a Linux agent_a binary first")
+		return
+	}
+
+	caBytes, err := os.ReadFile(s.cfg.CACert)
+	if err != nil {
+		protocol.WriteError(w, http.StatusInternalServerError, "read ca_cert: "+err.Error())
+		return
+	}
+	leafCertPEM, leafKeyPEM, err := pki.IssueCertBytes(s.cfg.CACert, s.cfg.CAKey, node.ID, ips, dnsNames, 825)
+	if err != nil {
+		protocol.WriteError(w, http.StatusInternalServerError, "issue node TLS cert: "+err.Error())
+		return
+	}
+
+	rawTok := strings.TrimSpace(req.NodeToken)
+	var rotatedTok string
+	needSave := false
+	if pubAddr != node.PublicAddr {
+		node.PublicAddr = pubAddr
+		needSave = true
+	}
+	if req.RotateToken {
+		rotatedTok = auth.GenerateRandomToken(24)
+		rawTok = rotatedTok
+		needSave = true
+	}
+	if needSave {
+		if err := s.store.UpsertNode(r.Context(), *node, rotatedTok); err != nil {
+			protocol.WriteError(w, http.StatusInternalServerError, "update dispatch node: "+err.Error())
+			return
+		}
+	}
+
+	localTok := auth.GenerateRandomToken(24)
+	req.PublicAddr = pubAddr
+	script, err := deployer.RenderAgentAInstallScript(
+		s.cfg.PublicURL, caBytes, leafCertPEM, leafKeyPEM,
+		s.cfg.JWTSecret, s.cfg.CenterSecret,
+		*node, rawTok, localTok, *rel, req,
+	)
+	if err != nil {
+		protocol.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	protocol.WriteJSON(w, http.StatusOK, protocol.AgentAScriptResp{
+		NodeID:       node.ID,
+		Script:       script,
+		PublicAddr:   pubAddr,
+		LocalToken:   localTok,
 		RotatedToken: rotatedTok,
 	})
 }

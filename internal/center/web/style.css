@@ -544,6 +544,19 @@ body {
   box-shadow: 0 6px 16px rgba(239, 68, 68, 0.24);
 }
 
+.btn.warn {
+  background: rgba(245, 158, 11, 0.13);
+  border-color: rgba(245, 158, 11, 0.4);
+  color: #fcd34d;
+  box-shadow: none;
+}
+.btn.warn:hover:not(:disabled) {
+  background: rgba(245, 158, 11, 0.22);
+  border-color: rgba(251, 191, 36, 0.72);
+  color: #fffbeb;
+  box-shadow: 0 6px 16px rgba(245, 158, 11, 0.24);
+}
+
 .btn.ghost {
   background: transparent;
   border-color: transparent;
@@ -1105,4 +1118,165 @@ input[type="checkbox"], input[type="radio"] {
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
   }
+}
+
+/* ---------------- Onboarding Guide & 1-2-3-4 Stepper Cards ---------------- */
+.guide-card {
+  margin-bottom: 16px;
+  border-color: rgba(59, 130, 246, 0.26);
+  background: linear-gradient(180deg, rgba(20, 31, 52, 0.88) 0%, rgba(14, 21, 36, 0.94) 100%);
+}
+.guide-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.guide-head-left {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.guide-head h3 {
+  margin: 0;
+  font-size: 14.5px;
+  font-weight: 650;
+}
+.guide-body {
+  margin-top: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.concept-box {
+  padding: 11px 14px;
+  border-radius: 10px;
+  background: rgba(59, 130, 246, 0.09);
+  border: 1px solid rgba(96, 165, 250, 0.28);
+  color: var(--text-soft);
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+.concept-box strong {
+  color: #e0f2fe;
+}
+.guide-subtabs {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px;
+  background: rgba(8, 12, 20, 0.78);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  width: fit-content;
+  flex-wrap: wrap;
+}
+.guide-subtab {
+  appearance: none;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 500;
+  padding: 6px 12px;
+  border-radius: 7px;
+  cursor: pointer;
+  transition: background 0.18s, color 0.18s, border-color 0.18s;
+}
+.guide-subtab:hover {
+  color: var(--text);
+  background: rgba(148, 163, 184, 0.08);
+}
+.guide-subtab.active {
+  color: #fff;
+  background: rgba(59, 130, 246, 0.22);
+  border-color: rgba(96, 165, 250, 0.45);
+}
+.step-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+@media (max-width: 1120px) {
+  .step-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 680px) {
+  .step-grid { grid-template-columns: 1fr; }
+}
+.step-item {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 13px;
+  background: rgba(8, 12, 20, 0.72);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  transition: border-color 0.2s var(--ease-smooth), transform 0.2s var(--ease-spring);
+}
+.step-item:hover {
+  border-color: rgba(96, 165, 250, 0.36);
+  transform: translateY(-1px);
+}
+.step-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+.step-num {
+  width: 22px;
+  height: 22px;
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: 700;
+  color: #fff;
+  background: linear-gradient(180deg, #3b82f6, #2563eb);
+  box-shadow: 0 2px 8px rgba(37, 99, 235, 0.4);
+  flex-shrink: 0;
+}
+.step-desc {
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.55;
+}
+.cmd-copy-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 8px;
+  background: #060910;
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  border-radius: 7px;
+  margin-top: auto;
+}
+.cmd-copy-row code {
+  font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  color: #93c5fd;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+  flex: 1;
+}
+.cmd-copy-row .btn.sm {
+  padding: 3px 8px;
+  font-size: 11px;
+  flex-shrink: 0;
+}
+.quick-cmd-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding-top: 8px;
+  border-top: 1px dashed rgba(148, 163, 184, 0.16);
 }

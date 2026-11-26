@@ -314,6 +314,7 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("POST /api/v1/admin/deploy/agent-a", s.requireSuperAdmin(s.handleAdminDeployAgentA))
 	mux.HandleFunc("GET /api/v1/admin/deploy/tasks", s.requireSuperAdmin(s.handleAdminListDeployTasks))
 	mux.HandleFunc("GET /api/v1/admin/deploy/tasks/{id}", s.requireSuperAdmin(s.handleAdminGetDeployTask))
+	mux.HandleFunc("POST /api/v1/admin/deploy/agent-a-script", s.requireSuperAdmin(s.handleAdminAgentAInstallScript))
 	mux.HandleFunc("POST /api/v1/admin/deploy/agent-b-script", s.requireConsole(s.handleAdminAgentBInstallScript))
 
 	// Customer Account Management API (Super-Admin only)
@@ -412,8 +413,10 @@ func (s *Server) handleAHeartbeat(w http.ResponseWriter, r *http.Request, node *
 		}
 		s.ensureKnownProjects(r.Context(), availIDs)
 	}
+	req.Paused = node.Paused
 	s.hub.UpdateA(req)
 	hbResp := s.processNodeHeartbeatUpgrade(r.Context(), node.ID, req.Version, req.UpgradeAttemptID, req.UpgradeStatus, req.UpgradeError)
+	hbResp.Paused = node.Paused
 	if projs, err := s.store.ListProjects(r.Context()); err == nil && len(projs) > 0 {
 		projIDs := make([]string, 0, len(projs))
 		affMap := make(map[string]bool, len(projs))
@@ -494,8 +497,10 @@ func (s *Server) handleBHeartbeat(w http.ResponseWriter, r *http.Request, node *
 		}
 		req.Projects = filtered
 	}
+	req.Paused = node.Paused
 	s.hub.UpdateB(req)
 	hbResp := s.processNodeHeartbeatUpgrade(r.Context(), node.ID, req.Version, req.UpgradeAttemptID, req.UpgradeStatus, req.UpgradeError)
+	hbResp.Paused = node.Paused
 
 	projs, _ := s.store.ListProjects(r.Context())
 	knownIDs := make([]string, 0, len(projs))
@@ -506,6 +511,7 @@ func (s *Server) handleBHeartbeat(w http.ResponseWriter, r *http.Request, node *
 	maxConc, suggestedStreamCap, rateLimitMBps := s.hub.ComputeClusterQuotas(node, projs, dbNodes)
 
 	dir := &protocol.ReceiverDirective{
+		Paused:             node.Paused,
 		ProjectMode:        "all",
 		KnownProjects:      knownIDs,
 		ProjectSchedule:    node.ProjectSchedule,
@@ -574,7 +580,7 @@ func (s *Server) handleBEventsSSE(w http.ResponseWriter, r *http.Request, node *
 		aSnap, _ := s.hub.Snapshot()
 		notified := make(map[string]struct{})
 		for _, aSt := range aSnap {
-			if !s.hub.IsOnline(aSt.LastSeen) {
+			if !s.hub.IsOnline(aSt.LastSeen) || aSt.Paused {
 				continue
 			}
 			for pid, av := range aSt.Availability {
@@ -632,6 +638,16 @@ func (s *Server) handleBDiscover(w http.ResponseWriter, r *http.Request, node *S
 	if proj, err := s.store.GetProject(r.Context(), projectID); err == nil {
 		conflictPolicy = proj.ConflictPolicy
 		leaseTTLSec = proj.LeaseTTLSec
+	}
+	// If receiver is paused in Center, immediately withhold candidates (works even on older agent versions).
+	if node.Paused {
+		protocol.WriteJSON(w, http.StatusOK, protocol.DiscoverResp{
+			ProjectID:      projectID,
+			ConflictPolicy: conflictPolicy,
+			LeaseTTLSec:    leaseTTLSec,
+			Candidates:     []protocol.DiscoverCandidate{},
+		})
+		return
 	}
 
 	candidates := s.hub.DiscoverCandidates(projectID)
@@ -1011,6 +1027,7 @@ func (s *Server) handleAdminListNodes(w http.ResponseWriter, r *http.Request) {
 			ConcurrencyMode:       n.ConcurrencyMode,
 			MaxConcurrentOverride: n.MaxConcurrentOverride,
 			RateLimitMBps:         n.RateLimitMBps,
+			Paused:                n.Paused,
 			PublicAddr:            n.PublicAddr,
 			WindowHours:           hours,
 		}
@@ -1252,6 +1269,7 @@ type updateNodeReq struct {
 	ConcurrencyMode       string    `json:"concurrency_mode,omitempty"`
 	MaxConcurrentOverride *int      `json:"max_concurrent_override,omitempty"`
 	RateLimitMBps         *float64  `json:"rate_limit_mbps,omitempty"`
+	Paused                *bool     `json:"paused,omitempty"`
 	PublicAddr            string    `json:"public_addr,omitempty"`
 }
 
@@ -1338,6 +1356,9 @@ func (s *Server) handleAdminUpdateNode(w http.ResponseWriter, r *http.Request) {
 		}
 		rec.RateLimitMBps = v
 	}
+	if req.Paused != nil {
+		rec.Paused = *req.Paused
+	}
 	if req.Projects != nil {
 		cleanProjects, err := cleanProjectIDList(*req.Projects)
 		if err != nil {
@@ -1356,7 +1377,12 @@ func (s *Server) handleAdminUpdateNode(w http.ResponseWriter, r *http.Request) {
 		protocol.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	s.hub.UpdateNodeProjects(rec.ID, rec.Projects)
+	if req.Paused != nil {
+		s.hub.SetNodePaused(rec.ID, rec.Paused)
+	}
+	if req.Projects != nil {
+		s.hub.UpdateNodeProjects(rec.ID, rec.Projects)
+	}
 	protocol.WriteJSON(w, http.StatusOK, rec)
 }
 

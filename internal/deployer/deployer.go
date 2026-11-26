@@ -1044,3 +1044,195 @@ func RenderAgentBInstallScript(centerPublicURL string, caCertPEM []byte, node pr
 	sb.WriteString("systemctl daemon-reload\nsystemctl enable --now relay-agent-b\nsystemctl status relay-agent-b --no-pager\n")
 	return sb.String(), nil
 }
+
+// RenderAgentAInstallScript generates a self-contained bash installer for dispatch (agent_a) nodes,
+// embedding CA cert + freshly issued IP/DNS-SAN leaf cert/key, pulling the verified binary over TLS 1.3,
+// writing agent-a.yaml, and enabling systemd. Suitable when direct SSH from Center is unavailable or NAT/FRP is used.
+func RenderAgentAInstallScript(
+	centerPublicURL string,
+	caCertPEM, leafCertPEM, leafKeyPEM []byte,
+	jwtSecret, centerSecret string,
+	node protocol.NodeRecord,
+	rawToken, localToken string,
+	rel protocol.ReleaseRecord,
+	req protocol.AgentAScriptReq,
+) (string, error) {
+	if err := ValidateID(node.ID); err != nil {
+		return "", fmt.Errorf("node_id: %w", err)
+	}
+	if err := ValidateSafeSingleLine(node.Name, 128); err != nil {
+		return "", fmt.Errorf("node_name: %w", err)
+	}
+	if u, err := url.Parse(strings.TrimSpace(centerPublicURL)); err != nil || u.Scheme != "https" || u.Host == "" {
+		return "", errors.New("centerPublicURL must be a valid https:// URL")
+	}
+	if err := ValidateSafeSingleLine(centerPublicURL, 512); err != nil {
+		return "", fmt.Errorf("center_url: %w", err)
+	}
+	pubAddr := strings.TrimSpace(req.PublicAddr)
+	if pubAddr == "" {
+		pubAddr = strings.TrimSpace(node.PublicAddr)
+	}
+	pubU, err := url.Parse(pubAddr)
+	if err != nil || pubU.Scheme != "https" || pubU.Host == "" {
+		return "", errors.New("public_addr must be a valid https://host:port URL")
+	}
+	if err := ValidateSafeSingleLine(pubAddr, 512); err != nil {
+		return "", fmt.Errorf("public_addr: %w", err)
+	}
+	if !validVersionRe.MatchString(rel.Version) || (rel.OS != "linux" && rel.OS != "darwin") || (rel.Arch != "amd64" && rel.Arch != "arm64") {
+		return "", errors.New("invalid release metadata")
+	}
+	if !validHexRe.MatchString(rel.SHA256) {
+		return "", errors.New("invalid release sha256")
+	}
+	if !validIDRe.MatchString(rel.ID) {
+		return "", errors.New("invalid release id")
+	}
+	if rawToken != "" {
+		if err := ValidateSafeSingleLine(rawToken, 256); err != nil {
+			return "", fmt.Errorf("node_token: %w", err)
+		}
+	}
+	if err := ValidateSafeSingleLine(localToken, 256); err != nil || localToken == "" {
+		return "", errors.New("invalid local_token")
+	}
+
+	installDir := strings.TrimSpace(req.InstallDir)
+	if installDir == "" {
+		installDir = "/opt/relay-agent-a"
+	}
+	dataDir := strings.TrimSpace(req.DataDir)
+	if dataDir == "" {
+		dataDir = "/data/relay-a"
+	}
+	if err := ValidateAbsDir(installDir); err != nil {
+		return "", fmt.Errorf("install_dir: %w", err)
+	}
+	if err := ValidateAbsDir(dataDir); err != nil {
+		return "", fmt.Errorf("data_dir: %w", err)
+	}
+
+	pubPort := req.PublicPort
+	if pubPort <= 0 {
+		if pStr := pubU.Port(); pStr != "" {
+			if p, pErr := strconv.Atoi(pStr); pErr == nil && p > 0 {
+				pubPort = p
+			}
+		}
+		if pubPort <= 0 {
+			pubPort = 8443
+		}
+	}
+	locPort := req.LocalPort
+	if locPort <= 0 {
+		locPort = 18081
+	}
+	if pubPort < 1 || pubPort > 65535 || locPort < 1 || locPort > 65535 || pubPort == locPort {
+		return "", errors.New("invalid public_port / local_port")
+	}
+	maxDiskPct := req.MaxDiskUsagePct
+	if maxDiskPct <= 0 {
+		maxDiskPct = 85.0
+	}
+	leaseTTL := req.LeaseTTLSec
+	if leaseTTL <= 0 {
+		leaseTTL = 300
+	}
+	maxStreams := req.MaxConcurrentStreams
+	if maxStreams <= 0 {
+		maxStreams = 16
+	}
+	tokVal := rawToken
+	if tokVal == "" {
+		tokVal = "<REPLACE_WITH_DISPATCH_NODE_TOKEN>"
+	}
+
+	certPath := filepath.Join(installDir, "certs", node.ID+".crt")
+	keyPath := filepath.Join(installDir, "certs", node.ID+".key")
+	aCfg := agenta.Config{
+		NodeID:                 node.ID,
+		NodeName:               node.Name,
+		CenterURL:              centerPublicURL,
+		CenterToken:            tokVal,
+		JWTSecret:              jwtSecret,
+		CenterSecret:           centerSecret,
+		LocalToken:             localToken,
+		LocalListen:            fmt.Sprintf("127.0.0.1:%d", locPort),
+		PublicListen:           fmt.Sprintf("0.0.0.0:%d", pubPort),
+		PublicAddr:             pubAddr,
+		TLSCert:                certPath,
+		TLSKey:                 keyPath,
+		CACert:                 filepath.Join(installDir, "certs", "ca.crt"),
+		DataDir:                dataDir,
+		Projects:               append([]string(nil), node.Projects...),
+		MaxDiskUsagePct:        maxDiskPct,
+		LeaseTTLSec:            leaseTTL,
+		MaxConcurrentStreams:   maxStreams,
+		RateLimitMBps:          req.RateLimitMBps,
+		HeartbeatIntervalSec:   2,
+		DeleteBatchIntervalSec: 0,
+	}
+	cfgYAML, err := yaml.Marshal(&aCfg)
+	if err != nil {
+		return "", err
+	}
+
+	binPath := filepath.Join(installDir, "relay-agent-a")
+	cfgPath := filepath.Join(installDir, "agent-a.yaml")
+	unit := RenderSystemdUnit("Relay Download Public Dispatch Node", binPath, cfgPath, installDir)
+	dlURL := strings.TrimRight(centerPublicURL, "/") + "/api/v1/releases/" + rel.ID + "/download"
+
+	caEOF := randomHeredocDelim("RELAY_CA_EOF")
+	certEOF := randomHeredocDelim("RELAY_CERT_EOF")
+	keyEOF := randomHeredocDelim("RELAY_KEY_EOF")
+	cfgEOF := randomHeredocDelim("RELAY_CFG_EOF")
+	svcEOF := randomHeredocDelim("RELAY_SVC_EOF")
+	if bytes.Contains(caCertPEM, []byte(caEOF)) ||
+		bytes.Contains(leafCertPEM, []byte(certEOF)) ||
+		bytes.Contains(leafKeyPEM, []byte(keyEOF)) ||
+		bytes.Contains(cfgYAML, []byte(cfgEOF)) ||
+		strings.Contains(unit, svcEOF) {
+		return "", errors.New("heredoc delimiter collision")
+	}
+
+	verBanner := fmt.Sprintf("[1/5] 从中心服务器下载 relay-agent-a (%s %s/%s)...", rel.Version, rel.OS, rel.Arch)
+	writePEMBlock := func(sb *strings.Builder, destExpr string, data []byte, delim, mode string) {
+		sb.WriteString("cat > " + destExpr + " <<'" + delim + "'\n")
+		sb.Write(data)
+		if len(data) > 0 && data[len(data)-1] != '\n' {
+			sb.WriteByte('\n')
+		}
+		sb.WriteString(delim + "\nchmod " + mode + " " + destExpr + "\n")
+	}
+
+	var sb strings.Builder
+	sb.WriteString("#!/usr/bin/env bash\nset -euo pipefail\n\n")
+	sb.WriteString("if [ \"$(id -u)\" -ne 0 ]; then echo '请使用 root 或 sudo 运行此安装脚本'; exit 1; fi\n\n")
+	sb.WriteString(fmt.Sprintf("INSTALL_DIR=%s\nDATA_DIR=%s\nNODE_ID=%s\nNODE_TOKEN=%s\nEXPECTED_SHA=%s\nDOWNLOAD_URL=%s\n\n",
+		ShellQuote(installDir), ShellQuote(dataDir), ShellQuote(node.ID), ShellQuote(tokVal), ShellQuote(rel.SHA256), ShellQuote(dlURL)))
+	sb.WriteString("mkdir -p \"$INSTALL_DIR/certs\" \"$DATA_DIR\"\n")
+	writePEMBlock(&sb, "\"$INSTALL_DIR/certs/ca.crt\"", caCertPEM, caEOF, "644")
+	sb.WriteString("\necho " + ShellQuote(verBanner) + "\n")
+	sb.WriteString("curl -fsSL --tlsv1.3 --cacert \"$INSTALL_DIR/certs/ca.crt\" \\\n")
+	sb.WriteString("  -H \"X-Node-ID: $NODE_ID\" -H \"X-Node-Token: $NODE_TOKEN\" \\\n")
+	sb.WriteString("  \"$DOWNLOAD_URL\" -o \"$INSTALL_DIR/relay-agent-a.tmp\"\n")
+	sb.WriteString("ACTUAL_SHA=$(sha256sum \"$INSTALL_DIR/relay-agent-a.tmp\" | awk '{print $1}')\n")
+	sb.WriteString("if [ \"$ACTUAL_SHA\" != \"$EXPECTED_SHA\" ]; then echo \"SHA256 校验失败: $ACTUAL_SHA\"; rm -f \"$INSTALL_DIR/relay-agent-a.tmp\"; exit 1; fi\n")
+	sb.WriteString("chmod 755 \"$INSTALL_DIR/relay-agent-a.tmp\"\n")
+	sb.WriteString("\"$INSTALL_DIR/relay-agent-a.tmp\" -version\n")
+	sb.WriteString("systemctl stop relay-agent-a 2>/dev/null || true\n")
+	sb.WriteString("mv -f \"$INSTALL_DIR/relay-agent-a.tmp\" \"$INSTALL_DIR/relay-agent-a\"\n\n")
+	sb.WriteString("echo '[2/5] 写入 TLS 节点证书与私钥 ...'\n")
+	writePEMBlock(&sb, ShellQuote(certPath), leafCertPEM, certEOF, "644")
+	writePEMBlock(&sb, ShellQuote(keyPath), leafKeyPEM, keyEOF, "600")
+	sb.WriteString("\necho '[3/5] 写入 agent-a.yaml ...'\n")
+	writePEMBlock(&sb, "\"$INSTALL_DIR/agent-a.yaml\"", cfgYAML, cfgEOF, "600")
+	sb.WriteString("\necho '[4/5] 写入 systemd 服务 ...'\n")
+	sb.WriteString("cat > /etc/systemd/system/relay-agent-a.service <<'" + svcEOF + "'\n")
+	sb.WriteString(unit)
+	sb.WriteString(svcEOF + "\nchmod 644 /etc/systemd/system/relay-agent-a.service\n\n")
+	sb.WriteString("echo '[5/5] 启动并设置开机自启 ...'\n")
+	sb.WriteString("systemctl daemon-reload\nsystemctl enable --now relay-agent-a\nsystemctl status relay-agent-a --no-pager\n")
+	return sb.String(), nil
+}

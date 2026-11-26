@@ -61,21 +61,21 @@ func InitCA(caCertPath, caKeyPath, org string, validDays int) error {
 	return writePEM(caKeyPath, "EC PRIVATE KEY", keyDER, 0o600)
 }
 
-func IssueCert(caCertPath, caKeyPath, certOutPath, keyOutPath, commonName string, ips []string, dnsNames []string, validDays int) error {
+func IssueCertBytes(caCertPath, caKeyPath, commonName string, ips []string, dnsNames []string, validDays int) ([]byte, []byte, error) {
 	if validDays <= 0 {
 		validDays = 825
 	}
 	caCert, caKey, err := loadCA(caCertPath, caKeyPath)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		return fmt.Errorf("generate leaf key: %w", err)
+		return nil, nil, fmt.Errorf("generate leaf key: %w", err)
 	}
 	serial, err := randomSerial()
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 	var parsedIPs []net.IP
 	for _, raw := range ips {
@@ -85,7 +85,7 @@ func IssueCert(caCertPath, caKeyPath, certOutPath, keyOutPath, commonName string
 		}
 		ip := net.ParseIP(raw)
 		if ip == nil {
-			return fmt.Errorf("invalid IP address: %q", raw)
+			return nil, nil, fmt.Errorf("invalid IP address: %q", raw)
 		}
 		parsedIPs = append(parsedIPs, ip)
 	}
@@ -97,7 +97,7 @@ func IssueCert(caCertPath, caKeyPath, certOutPath, keyOutPath, commonName string
 		}
 	}
 	if len(parsedIPs) == 0 && len(cleanDNS) == 0 {
-		return errors.New("at least one IP or DNS SAN is required")
+		return nil, nil, errors.New("at least one IP or DNS SAN is required")
 	}
 	if commonName == "" {
 		if len(parsedIPs) > 0 {
@@ -124,16 +124,32 @@ func IssueCert(caCertPath, caKeyPath, certOutPath, keyOutPath, commonName string
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, caCert, &key.PublicKey, caKey)
 	if err != nil {
-		return fmt.Errorf("create leaf cert: %w", err)
-	}
-	if err := writePEM(certOutPath, "CERTIFICATE", der, 0o644); err != nil {
-		return err
+		return nil, nil, fmt.Errorf("create leaf cert: %w", err)
 	}
 	keyDER, err := x509.MarshalECPrivateKey(key)
 	if err != nil {
-		return fmt.Errorf("marshal leaf key: %w", err)
+		return nil, nil, fmt.Errorf("marshal leaf key: %w", err)
 	}
-	return writePEM(keyOutPath, "EC PRIVATE KEY", keyDER, 0o600)
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+	return certPEM, keyPEM, nil
+}
+
+func IssueCert(caCertPath, caKeyPath, certOutPath, keyOutPath, commonName string, ips []string, dnsNames []string, validDays int) error {
+	certPEM, keyPEM, err := IssueCertBytes(caCertPath, caKeyPath, commonName, ips, dnsNames, validDays)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(certOutPath), 0o755); err != nil {
+		return err
+	}
+	if err := os.WriteFile(certOutPath, certPEM, 0o644); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(keyOutPath), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(keyOutPath, keyPEM, 0o600)
 }
 
 func ServerTLSConfig(certFile, keyFile string) (*tls.Config, error) {

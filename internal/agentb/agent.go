@@ -82,6 +82,7 @@ type Agent struct {
 	activeCount     atomic.Int32
 	pendingAckCount atomic.Int64
 	hashRAMBytes    atomic.Int64
+	paused          atomic.Bool
 
 	// Optional metrics & test hooks.
 	ResumeCount        atomic.Int64
@@ -696,7 +697,26 @@ func (a *Agent) reconnectSSE() {
 	}
 }
 
+func (a *Agent) setPaused(nextPaused bool) {
+	prevPaused := a.paused.Swap(nextPaused)
+	if prevPaused != nextPaused {
+		a.discMu.Lock()
+		a.discCache = make(map[string]cachedDiscover)
+		a.discMu.Unlock()
+		if a.logger != nil {
+			a.logger.Info("receiver node pause state updated from center", "paused", nextPaused)
+		}
+		if !nextPaused {
+			a.triggerWakeup("")
+		}
+	}
+}
+
 func (a *Agent) applyDirective(dir *protocol.ReceiverDirective, legacyAllowed []string) {
+	if dir != nil {
+		a.setPaused(dir.Paused)
+	}
+
 	var (
 		nextMode     string
 		nextAllowed  []string
@@ -837,6 +857,9 @@ func (a *Agent) adaptiveLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			if a.paused.Load() {
+				continue
+			}
 			snap := a.adaptive.Evaluate(interval, a.workGate.InFlight(), a.pendingAckCount.Load())
 			if snap.EffectiveConcurrent != prevLimit || snap.State != prevState {
 				if a.logger != nil {
@@ -1016,6 +1039,9 @@ func (a *Agent) dispatchLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case proj := <-a.wakeupCh:
+			if a.paused.Load() {
+				continue
+			}
 			if proj == "" {
 				a.scanAllProjects(ctx)
 				continue
@@ -1032,12 +1058,18 @@ func (a *Agent) dispatchLoop(ctx context.Context) {
 				a.scanProject(ctx, proj)
 			}
 		case <-ticker.C:
+			if a.paused.Load() {
+				continue
+			}
 			a.scanAllProjects(ctx)
 		}
 	}
 }
 
 func (a *Agent) scanAllProjects(ctx context.Context) {
+	if a.paused.Load() {
+		return
+	}
 	ids := a.activeProjectIDs()
 	if len(ids) == 0 {
 		return
@@ -2737,6 +2769,7 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 		DiskTotalBytes:   totalDisk,
 		DiskFreeBytes:    freeDisk,
 		DiskUsedPct:      usedPct,
+		Paused:           a.paused.Load(),
 		ActiveCount:      int(a.activeCount.Load()),
 	}
 	body, _ := json.Marshal(payload)
@@ -2759,6 +2792,7 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 	}
 	var hbResp protocol.HeartbeatResp
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 256*1024)).Decode(&hbResp); err == nil {
+		a.setPaused(hbResp.Paused || (hbResp.Directive != nil && hbResp.Directive.Paused))
 		a.applyDirective(hbResp.Directive, hbResp.AllowedProjects)
 		if hbResp.Upgrade != nil && a.updater != nil {
 			a.updater.HandleDirective(ctx, hbResp.Upgrade)
