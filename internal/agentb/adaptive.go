@@ -141,6 +141,7 @@ type AdaptiveController struct {
 	mode               string
 	localMaxConc       int
 	localMaxStreams    int
+	ackBatchSize       int
 	streamRatio        float64
 	minConc            int
 	maxCap             int
@@ -157,14 +158,18 @@ type AdaptiveController struct {
 	cooldownEpochs   int
 	cruiseEpochs     int
 	lowGoodputStreak int
+	cliffStreak      int
 }
 
-func NewAdaptiveController(mode string, localMaxConc, localMaxStreams int, workGate, streamGate *DynamicGate) *AdaptiveController {
+func NewAdaptiveController(mode string, localMaxConc, localMaxStreams, ackBatchSize int, workGate, streamGate *DynamicGate) *AdaptiveController {
 	if localMaxConc < 1 {
 		localMaxConc = 1
 	}
 	if localMaxStreams < localMaxConc {
 		localMaxStreams = localMaxConc
+	}
+	if ackBatchSize < 50 {
+		ackBatchSize = 50
 	}
 	if mode != protocol.ConcurrencyManual {
 		mode = protocol.ConcurrencyAuto
@@ -181,8 +186,8 @@ func NewAdaptiveController(mode string, localMaxConc, localMaxStreams int, workG
 	state := "manual"
 	reason := "固定并发上限"
 	if mode == protocol.ConcurrencyAuto {
-		// Warm start at half of cap (at least minConc) so high-RTT links ramp to 1Gbps+ quickly.
-		initConc = localMaxConc / 2
+		// Warm start at 60% of cap (at least minConc) so high-RTT WAN links hit peak throughput rapidly.
+		initConc = (localMaxConc * 3) / 5
 		if initConc < minC {
 			initConc = minC
 		}
@@ -205,6 +210,7 @@ func NewAdaptiveController(mode string, localMaxConc, localMaxStreams int, workG
 		mode:            mode,
 		localMaxConc:    localMaxConc,
 		localMaxStreams: localMaxStreams,
+		ackBatchSize:    ackBatchSize,
 		streamRatio:     ratio,
 		minConc:         minC,
 		maxCap:          localMaxConc,
@@ -390,32 +396,36 @@ func (c *AdaptiveController) Evaluate(dt time.Duration, inFlight int, pendingAck
 	if c.ewmaGoodput == 0 {
 		c.ewmaGoodput = goodput
 	} else {
-		c.ewmaGoodput = 0.35*goodput + 0.65*c.ewmaGoodput
+		c.ewmaGoodput = 0.45*goodput + 0.55*c.ewmaGoodput
 	}
 	// Gentle decay on historical peak so long-term network shifts are re-learned.
-	c.bestGoodput *= 0.995
+	c.bestGoodput *= 0.996
 
-	// 1. Hard backpressure signals -> immediate multiplicative decrease (AIMD beta = 0.75).
-	highErrs := errs >= 3 && errs*4 > max64(completed, 1)
-	diskLag := pendingAcks > int64(max(128, c.currentConc*3))
-	if bp503 > 0 || highErrs || diskLag {
-		next := int(math.Floor(float64(c.currentConc) * 0.75))
+	// 1. Hard backpressure signals -> immediate multiplicative decrease (AIMD beta = 0.80).
+	// Anchor diskLag to static configured caps (never currentConc!) to prevent death-spiral cascades
+	// when ack_batch_size is large (e.g. 384 files buffered normally every 3s).
+	highErrs := errs >= 8 && errs*3 > max64(completed, 1)
+	diskLagLimit := int64(max(c.ackBatchSize*4, max(c.maxCap*4, 1024)))
+	diskLag := pendingAcks > diskLagLimit
+	if bp503 > 0 || (c.cooldownEpochs == 0 && (highErrs || diskLag)) {
+		next := int(math.Floor(float64(c.currentConc) * 0.80))
 		if next < c.minConc {
 			next = c.minConc
 		}
 		c.currentConc = next
 		c.sweetSpot = next
 		c.state = "backoff"
-		c.cooldownEpochs = 2
+		c.cooldownEpochs = 1
 		c.cruiseEpochs = 0
-		c.probeBaseGoodput = goodput
+		c.cliffStreak = 0
+		c.probeBaseGoodput = c.ewmaGoodput
 		switch {
 		case bp503 > 0:
 			c.reason = "分发端限流(503)，自动降载退避"
 		case diskLag:
 			c.reason = "本地磁盘落盘积压，自动降载保护"
 		default:
-			c.reason = "传输超时率升高，自动降载避障"
+			c.reason = "传输错误率升高，自动降载避障"
 		}
 		c.currentStreams = computeStreamLimit(c.currentConc, c.streamRatio, max(c.localMaxStreams, c.maxCap), c.suggestedStreamCap)
 		c.applyGatesLocked()
@@ -427,7 +437,7 @@ func (c *AdaptiveController) Evaluate(dt time.Duration, inFlight int, pendingAck
 		c.cooldownEpochs--
 		if c.cooldownEpochs == 0 {
 			c.state = "probing"
-			c.probeBaseGoodput = goodput
+			c.probeBaseGoodput = c.ewmaGoodput
 			c.reason = "退避稳定，恢复平滑探优"
 		}
 		return c.snapshotLocked()
@@ -440,9 +450,9 @@ func (c *AdaptiveController) Evaluate(dt time.Duration, inFlight int, pendingAck
 		return c.snapshotLocked()
 	}
 	util := float64(inFlight) / float64(max(c.currentConc, 1))
-	if util < 0.70 {
-		if goodput > c.bestGoodput {
-			c.bestGoodput = goodput
+	if util < 0.65 {
+		if c.ewmaGoodput > c.bestGoodput {
+			c.bestGoodput = c.ewmaGoodput
 			c.sweetSpot = c.currentConc
 		}
 		c.state = "cruising"
@@ -450,25 +460,27 @@ func (c *AdaptiveController) Evaluate(dt time.Duration, inFlight int, pendingAck
 		return c.snapshotLocked()
 	}
 
-	// 4. Saturated & healthy: gradient hill-climbing & plateau cruise.
+	// 4. Saturated & healthy: gradient hill-climbing & plateau cruise using smoothed EWMA goodput
+	// so normal file-size / WAN burst variance never triggers premature rollbacks.
 	if c.state == "cruising" {
 		c.cruiseEpochs++
-		if c.bestGoodput > 0 && goodput < c.bestGoodput*0.82 {
+		if c.bestGoodput > 0 && c.ewmaGoodput < c.bestGoodput*0.85 {
 			c.lowGoodputStreak++
 		} else {
 			c.lowGoodputStreak = 0
-			if goodput > c.bestGoodput {
-				c.bestGoodput = goodput
+			if c.ewmaGoodput > c.bestGoodput {
+				c.bestGoodput = c.ewmaGoodput
 				c.sweetSpot = c.currentConc
 			}
 		}
-		// Re-probe periodically (every 12 epochs ~60s) or promptly if sustained throughput dip while saturated.
-		if c.currentConc < c.maxCap && (c.cruiseEpochs >= 12 || c.lowGoodputStreak >= 2) {
+		// Re-probe periodically (every 6 epochs ~60s) or promptly if sustained throughput dip while saturated.
+		if c.currentConc < c.maxCap && (c.cruiseEpochs >= 6 || c.lowGoodputStreak >= 2) {
 			c.cruiseEpochs = 0
 			c.lowGoodputStreak = 0
-			c.probeBaseGoodput = goodput
+			c.cliffStreak = 0
+			c.probeBaseGoodput = c.ewmaGoodput
 			c.sweetSpot = c.currentConc
-			step := clampInt(int(math.Ceil(float64(c.currentConc)*0.10)), 2, 32)
+			step := clampInt(int(math.Ceil(float64(c.currentConc)*0.15)), 4, 48)
 			c.currentConc = min(c.maxCap, c.currentConc+step)
 			c.state = "probing"
 			c.reason = "周期探优，检测可用剩余带宽"
@@ -478,15 +490,16 @@ func (c *AdaptiveController) Evaluate(dt time.Duration, inFlight int, pendingAck
 		return c.snapshotLocked()
 	}
 
-	// Currently in "probing" state: compare new goodput against pre-probe baseline.
-	if c.probeBaseGoodput <= 0 || goodput >= c.probeBaseGoodput*1.03 {
-		if goodput > c.bestGoodput {
-			c.bestGoodput = goodput
+	// Currently in "probing" state: compare smoothed EWMA goodput against pre-probe baseline.
+	if c.probeBaseGoodput <= 0 || c.ewmaGoodput >= c.probeBaseGoodput*1.02 {
+		c.cliffStreak = 0
+		if c.ewmaGoodput > c.bestGoodput {
+			c.bestGoodput = c.ewmaGoodput
 		}
 		c.sweetSpot = c.currentConc
-		c.probeBaseGoodput = goodput
+		c.probeBaseGoodput = c.ewmaGoodput
 		if c.currentConc < c.maxCap {
-			step := clampInt(int(math.Ceil(float64(c.currentConc)*0.15)), 2, 40)
+			step := clampInt(int(math.Ceil(float64(c.currentConc)*0.18)), 4, 48)
 			c.currentConc = min(c.maxCap, c.currentConc+step)
 			c.state = "probing"
 			c.reason = "吞吐随并发提升，继续探优"
@@ -495,22 +508,27 @@ func (c *AdaptiveController) Evaluate(dt time.Duration, inFlight int, pendingAck
 			c.cruiseEpochs = 0
 			c.reason = "已达上限且健康，稳态巡航"
 		}
-	} else if goodput < c.probeBaseGoodput*0.90 {
-		// Congestion cliff detected: step back to sweetSpot (or -15%).
-		back := int(math.Floor(float64(c.currentConc) * 0.85))
-		if c.sweetSpot >= c.minConc && c.sweetSpot < back {
-			back = c.sweetSpot
+	} else if c.ewmaGoodput < c.probeBaseGoodput*0.80 {
+		// Require 2 consecutive severe drops before rolling back so transient WAN bursts don't oscillate.
+		c.cliffStreak++
+		if c.cliffStreak >= 2 {
+			back := int(math.Floor(float64(c.currentConc) * 0.85))
+			if c.sweetSpot >= c.minConc && c.sweetSpot < back {
+				back = c.sweetSpot
+			}
+			if back < c.minConc {
+				back = c.minConc
+			}
+			c.currentConc = back
+			c.state = "cruising"
+			c.cooldownEpochs = 1
+			c.cruiseEpochs = 0
+			c.cliffStreak = 0
+			c.reason = "检测到拥塞拐点，回调至最优并发"
 		}
-		if back < c.minConc {
-			back = c.minConc
-		}
-		c.currentConc = back
-		c.state = "cruising"
-		c.cooldownEpochs = 1
-		c.cruiseEpochs = 0
-		c.reason = "检测到拥塞拐点，回调至最优并发"
 	} else {
-		// Plateau (0.90 .. 1.03): bandwidth ceiling saturated -> park at lower sweetSpot to save sockets.
+		// Plateau (0.80 .. 1.02): bandwidth ceiling saturated -> park at optimal sweetSpot.
+		c.cliffStreak = 0
 		if c.sweetSpot >= c.minConc && c.sweetSpot <= c.currentConc {
 			c.currentConc = c.sweetSpot
 		}

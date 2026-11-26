@@ -50,40 +50,40 @@ func TestDynamicGateResizeAndCancel(t *testing.T) {
 func TestAdaptiveControllerProbeCruiseBackoffAndManual(t *testing.T) {
 	wg := NewDynamicGate(100)
 	sg := NewDynamicGate(200)
-	ac := NewAdaptiveController(protocol.ConcurrencyAuto, 100, 200, wg, sg)
+	ac := NewAdaptiveController(protocol.ConcurrencyAuto, 100, 200, 50, wg, sg)
 
 	initSnap := ac.Snapshot()
-	if initSnap.EffectiveConcurrent != 50 || initSnap.State != "probing" {
+	if initSnap.EffectiveConcurrent != 60 || initSnap.State != "probing" {
 		t.Fatalf("unexpected initial warm-start snap: %+v", initSnap)
 	}
 
 	// 1. Saturated + scaling throughput -> probes upward cleanly.
-	ac.RecordBytes(50 * 1024 * 1024) // 10 MB/s over 5s
+	ac.RecordBytes(100 * 1024 * 1024) // 10 MB/s over 10s
 	ac.RecordCompleted()
-	s1 := ac.Evaluate(5*time.Second, 48, 0)
+	s1 := ac.Evaluate(10*time.Second, 58, 0)
 	if s1.EffectiveConcurrent <= initSnap.EffectiveConcurrent || s1.State != "probing" {
 		t.Fatalf("expected upward probe on baseline epoch, got %+v", s1)
 	}
 
-	ac.RecordBytes(75 * 1024 * 1024) // 15 MB/s (+50% gain!)
+	ac.RecordBytes(160 * 1024 * 1024) // 16 MB/s (+60% raw, +27% EWMA gain!)
 	ac.RecordCompleted()
-	s2 := ac.Evaluate(5*time.Second, s1.EffectiveConcurrent, 0)
+	s2 := ac.Evaluate(10*time.Second, s1.EffectiveConcurrent, 0)
 	if s2.EffectiveConcurrent <= s1.EffectiveConcurrent || s2.State != "probing" {
-		t.Fatalf("expected continued upward probe on +50%% throughput gain, got %+v", s2)
+		t.Fatalf("expected continued upward probe on throughput gain, got %+v", s2)
 	}
 
-	// 2. Plateau (same ~15 MB/s despite more concurrency) -> parks into cruising at sweetSpot!
-	ac.RecordBytes(75 * 1024 * 1024)
+	// 2. Plateau (flat goodput despite higher concurrency) -> parks into cruising at sweetSpot!
+	ac.RecordBytes(120 * 1024 * 1024) // pulls EWMA flat (~12.4 vs 12.7 MB/s -> plateau)
 	ac.RecordCompleted()
-	s3 := ac.Evaluate(5*time.Second, s2.EffectiveConcurrent, 0)
+	s3 := ac.Evaluate(10*time.Second, s2.EffectiveConcurrent, 0)
 	if s3.State != "cruising" || s3.EffectiveConcurrent != s1.EffectiveConcurrent {
 		t.Fatalf("expected plateau cruise at sweetSpot=%d, got %+v", s1.EffectiveConcurrent, s3)
 	}
 
-	// 3. HTTP 503 backpressure -> immediate AIMD multiplicative decrease (0.75x).
-	ac.RecordBytes(70 * 1024 * 1024)
+	// 3. HTTP 503 backpressure -> immediate AIMD multiplicative decrease (0.80x).
+	ac.RecordBytes(120 * 1024 * 1024)
 	ac.RecordBackpressure()
-	s4 := ac.Evaluate(5*time.Second, s3.EffectiveConcurrent, 0)
+	s4 := ac.Evaluate(10*time.Second, s3.EffectiveConcurrent, 0)
 	if s4.State != "backoff" || s4.EffectiveConcurrent >= s3.EffectiveConcurrent {
 		t.Fatalf("expected AIMD backoff on 503, got %+v (prev=%d)", s4, s3.EffectiveConcurrent)
 	}

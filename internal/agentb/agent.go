@@ -248,7 +248,7 @@ func New(cfg *Config, logger *slog.Logger) (*Agent, error) {
 	limiter := transfer.NewDynamicRateLimiter(int64(cfg.RateLimitMBps * 1024 * 1024))
 	workGate := NewDynamicGate(cfg.MaxConcurrent)
 	streamGate := NewDynamicGate(cfg.MaxTotalStreams)
-	adaptive := NewAdaptiveController(cfg.ConcurrencyMode, cfg.MaxConcurrent, cfg.MaxTotalStreams, workGate, streamGate)
+	adaptive := NewAdaptiveController(cfg.ConcurrencyMode, cfg.MaxConcurrent, cfg.MaxTotalStreams, cfg.AckBatchSize, workGate, streamGate)
 
 	ag := &Agent{
 		cfg:             cfg,
@@ -826,7 +826,7 @@ func (a *Agent) adaptiveLoop(ctx context.Context) {
 	if a.adaptive == nil {
 		return
 	}
-	const interval = 5 * time.Second
+	const interval = 10 * time.Second
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
