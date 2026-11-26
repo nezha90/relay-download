@@ -35,6 +35,79 @@ func validateHTTPSAddr(raw string) error {
 	return nil
 }
 
+func sanitizeSingleLine(s string, maxLen int) string {
+	s = strings.TrimSpace(strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, s))
+	if maxLen > 0 && len(s) > maxLen {
+		// Trim safely on UTF-8 rune boundaries.
+		runes := []rune(s)
+		if len(runes) > maxLen {
+			s = string(runes[:maxLen])
+		}
+	}
+	return s
+}
+
+func validateSafeDiskPath(p string) error {
+	p = strings.TrimSpace(p)
+	if len(p) == 0 || len(p) > 256 || !strings.HasPrefix(p, "/") || strings.Contains(p, "..") {
+		return fmt.Errorf("invalid disk path %q", p)
+	}
+	for _, r := range p {
+		if r < 0x20 || r == 0x7f {
+			return fmt.Errorf("control characters not allowed in disk path %q", p)
+		}
+	}
+	return nil
+}
+
+const strictWebCSP = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+
+func withSecurityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("Content-Security-Policy", strictWebCSP)
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("Referrer-Policy", "no-referrer")
+		h.Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+		if r.TLS != nil {
+			h.Set("Strict-Transport-Security", "max-age=31536000")
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// checkAdminCSRF blocks cross-site browser requests (especially critical when admin_trusted_cidrs
+// enables passwordless console access from an operator's workstation IP).
+func checkAdminCSRF(r *http.Request) error {
+	switch r.Method {
+	case http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodPatch:
+	default:
+		return nil
+	}
+	if sfs := strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site"))); sfs == "cross-site" {
+		return errors.New("cross-site admin request blocked")
+	}
+	if origin := strings.TrimSpace(r.Header.Get("Origin")); origin != "" {
+		u, err := url.Parse(origin)
+		if err != nil || u.Host == "" || !strings.EqualFold(u.Host, r.Host) {
+			return errors.New("cross-origin admin request blocked")
+		}
+	}
+	// Reject CORS-safelisted simple content types on state-changing endpoints so malicious pages
+	// cannot forge no-cors POSTs with text/plain or form-urlencoded payloads.
+	ct := strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Type")))
+	if strings.HasPrefix(ct, "text/plain") || strings.HasPrefix(ct, "application/x-www-form-urlencoded") {
+		return errors.New("unsupported content-type for admin mutation")
+	}
+	return nil
+}
+
 //go:embed web/*
 var embeddedWeb embed.FS
 
@@ -246,7 +319,7 @@ func (s *Server) routes() http.Handler {
 	if err == nil {
 		mux.Handle("/", http.FileServer(http.FS(webSub)))
 	}
-	return mux
+	return withSecurityHeaders(mux)
 }
 
 type nodeHandler func(w http.ResponseWriter, r *http.Request, node *StoredNode)
@@ -291,6 +364,10 @@ func (s *Server) isTrustedAdminRequest(r *http.Request) bool {
 
 func (s *Server) requireAdmin(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if err := checkAdminCSRF(r); err != nil {
+			protocol.WriteError(w, http.StatusForbidden, err.Error())
+			return
+		}
 		if s.isTrustedAdminRequest(r) {
 			next(w, r)
 			return
@@ -314,9 +391,14 @@ func (s *Server) handleAHeartbeat(w http.ResponseWriter, r *http.Request, node *
 		return
 	}
 	req.NodeID = node.ID
+	req.Name = sanitizeSingleLine(req.Name, 128)
 	if req.Name == "" {
 		req.Name = node.Name
 	}
+	req.Version = sanitizeSingleLine(req.Version, 64)
+	req.OS = sanitizeSingleLine(req.OS, 32)
+	req.Arch = sanitizeSingleLine(req.Arch, 32)
+	req.UpgradeError = sanitizeSingleLine(req.UpgradeError, 256)
 	// Pin public_addr to the Center-registered address to prevent SSRF via spoofed heartbeats.
 	if node.PublicAddr != "" {
 		req.PublicAddr = node.PublicAddr
@@ -394,8 +476,27 @@ func (s *Server) handleBHeartbeat(w http.ResponseWriter, r *http.Request, node *
 		return
 	}
 	req.NodeID = node.ID
+	req.Name = sanitizeSingleLine(req.Name, 128)
 	if req.Name == "" {
 		req.Name = node.Name
+	}
+	req.Version = sanitizeSingleLine(req.Version, 64)
+	req.OS = sanitizeSingleLine(req.OS, 32)
+	req.Arch = sanitizeSingleLine(req.Arch, 32)
+	req.UpgradeError = sanitizeSingleLine(req.UpgradeError, 256)
+	req.AdaptiveState = sanitizeSingleLine(req.AdaptiveState, 32)
+	req.AdaptiveReason = sanitizeSingleLine(req.AdaptiveReason, 160)
+	if len(req.StorageDirs) > 64 {
+		req.StorageDirs = req.StorageDirs[:64]
+	}
+	for i := range req.StorageDirs {
+		req.StorageDirs[i] = sanitizeSingleLine(req.StorageDirs[i], 256)
+	}
+	if len(req.Disks) > 64 {
+		req.Disks = req.Disks[:64]
+	}
+	for i := range req.Disks {
+		req.Disks[i].Path = sanitizeSingleLine(req.Disks[i].Path, 256)
 	}
 	if len(node.Projects) > 0 {
 		filtered := make([]string, 0, len(req.Projects))
@@ -490,7 +591,7 @@ func (s *Server) handleBEventsSSE(w http.ResponseWriter, r *http.Request, node *
 				continue
 			}
 			for pid, av := range aSt.Availability {
-				if av.ReadyCount > 0 {
+				if av.ReadyCount > 0 && validIDRe.MatchString(pid) {
 					if _, dup := notified[pid]; !dup {
 						notified[pid] = struct{}{}
 						_, _ = fmt.Fprintf(w, "event: wakeup\ndata: %s\n\n", pid)
@@ -501,7 +602,7 @@ func (s *Server) handleBEventsSSE(w http.ResponseWriter, r *http.Request, node *
 		}
 	} else {
 		for _, p := range projects {
-			if len(s.hub.DiscoverCandidates(p)) > 0 {
+			if validIDRe.MatchString(p) && len(s.hub.DiscoverCandidates(p)) > 0 {
 				_, _ = fmt.Fprintf(w, "event: wakeup\ndata: %s\n\n", p)
 				flusher.Flush()
 			}
@@ -516,6 +617,9 @@ func (s *Server) handleBEventsSSE(w http.ResponseWriter, r *http.Request, node *
 		case <-sseCtx.Done():
 			return
 		case proj := <-ch:
+			if !validIDRe.MatchString(proj) {
+				continue
+			}
 			_, _ = fmt.Fprintf(w, "event: wakeup\ndata: %s\n\n", proj)
 			flusher.Flush()
 		case <-keepalive.C:
@@ -759,7 +863,8 @@ func (s *Server) handleAdminUpsertProject(w http.ResponseWriter, r *http.Request
 		return
 	}
 	p.ID = strings.TrimSpace(p.ID)
-	p.Name = strings.TrimSpace(p.Name)
+	p.Name = sanitizeSingleLine(p.Name, 128)
+	p.Description = sanitizeSingleLine(p.Description, 512)
 	if p.ID == "" {
 		protocol.WriteError(w, http.StatusBadRequest, "project id required")
 		return
@@ -940,7 +1045,7 @@ type createNodeReq struct {
 	Token                 string   `json:"token,omitempty"`
 }
 
-func cleanDiskPathList(raw []string) []string {
+func cleanDiskPathList(raw []string) ([]string, error) {
 	out := make([]string, 0, len(raw))
 	seen := make(map[string]struct{}, len(raw))
 	for _, p := range raw {
@@ -948,12 +1053,34 @@ func cleanDiskPathList(raw []string) []string {
 		if p == "" {
 			continue
 		}
+		if err := validateSafeDiskPath(p); err != nil {
+			return nil, err
+		}
 		if _, dup := seen[p]; !dup {
 			seen[p] = struct{}{}
 			out = append(out, p)
 		}
 	}
-	return out
+	return out, nil
+}
+
+func cleanProjectIDList(raw []string) ([]string, error) {
+	out := make([]string, 0, len(raw))
+	seen := make(map[string]struct{}, len(raw))
+	for _, p := range raw {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if !validIDRe.MatchString(p) {
+			return nil, fmt.Errorf("invalid project id: %s", p)
+		}
+		if _, dup := seen[p]; !dup {
+			seen[p] = struct{}{}
+			out = append(out, p)
+		}
+	}
+	return out, nil
 }
 
 func (s *Server) handleAdminCreateNode(w http.ResponseWriter, r *http.Request) {
@@ -963,7 +1090,7 @@ func (s *Server) handleAdminCreateNode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.ID = strings.TrimSpace(req.ID)
-	req.Name = strings.TrimSpace(req.Name)
+	req.Name = sanitizeSingleLine(req.Name, 128)
 	req.PublicAddr = strings.TrimSpace(req.PublicAddr)
 	if req.ID == "" {
 		protocol.WriteError(w, http.StatusBadRequest, "node id required")
@@ -982,6 +1109,16 @@ func (s *Server) handleAdminCreateNode(w http.ResponseWriter, r *http.Request) {
 			protocol.WriteError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+	}
+	cleanProjects, err := cleanProjectIDList(req.Projects)
+	if err != nil {
+		protocol.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	cleanDisks, err := cleanDiskPathList(req.DisabledDisks)
+	if err != nil {
+		protocol.WriteError(w, http.StatusBadRequest, err.Error())
+		return
 	}
 	sched := normalizeProjectSchedule(req.ProjectSchedule)
 	if sched == "" {
@@ -1017,10 +1154,10 @@ func (s *Server) handleAdminCreateNode(w http.ResponseWriter, r *http.Request) {
 		ID:                    req.ID,
 		Name:                  req.Name,
 		Role:                  req.Role,
-		Projects:              req.Projects,
+		Projects:              cleanProjects,
 		ProjectSchedule:       sched,
 		DiskPolicy:            dp,
-		DisabledDisks:         cleanDiskPathList(req.DisabledDisks),
+		DisabledDisks:         cleanDisks,
 		ConcurrencyMode:       cm,
 		MaxConcurrentOverride: req.MaxConcurrentOverride,
 		RateLimitMBps:         req.RateLimitMBps,
@@ -1070,7 +1207,7 @@ func (s *Server) handleAdminUpdateNode(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rec := *existing
-	if name := strings.TrimSpace(req.Name); name != "" {
+	if name := sanitizeSingleLine(req.Name, 128); name != "" {
 		rec.Name = name
 	}
 	if req.PublicAddr != "" && rec.Role == protocol.RoleAgentA {
@@ -1098,7 +1235,12 @@ func (s *Server) handleAdminUpdateNode(w http.ResponseWriter, r *http.Request) {
 		rec.DiskPolicy = dp
 	}
 	if req.DisabledDisks != nil {
-		rec.DisabledDisks = cleanDiskPathList(*req.DisabledDisks)
+		cleanDisks, err := cleanDiskPathList(*req.DisabledDisks)
+		if err != nil {
+			protocol.WriteError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		rec.DisabledDisks = cleanDisks
 	}
 	if req.ConcurrencyMode != "" {
 		cm := normalizeConcurrencyMode(req.ConcurrencyMode)
@@ -1125,21 +1267,10 @@ func (s *Server) handleAdminUpdateNode(w http.ResponseWriter, r *http.Request) {
 		rec.RateLimitMBps = v
 	}
 	if req.Projects != nil {
-		cleanProjects := make([]string, 0, len(*req.Projects))
-		seen := make(map[string]struct{}, len(*req.Projects))
-		for _, p := range *req.Projects {
-			p = strings.TrimSpace(p)
-			if p == "" {
-				continue
-			}
-			if !validIDRe.MatchString(p) {
-				protocol.WriteError(w, http.StatusBadRequest, "invalid project id: "+p)
-				return
-			}
-			if _, dup := seen[p]; !dup {
-				seen[p] = struct{}{}
-				cleanProjects = append(cleanProjects, p)
-			}
+		cleanProjects, err := cleanProjectIDList(*req.Projects)
+		if err != nil {
+			protocol.WriteError(w, http.StatusBadRequest, err.Error())
+			return
 		}
 		rec.Projects = cleanProjects
 	}

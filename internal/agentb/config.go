@@ -200,13 +200,21 @@ func (c *Config) Validate() error {
 	return nil
 }
 
-// SafeProjectSubdir rejects path traversal characters when dynamically joining <storage_dir>/<project_id>.
+// SafeProjectSubdir enforces a strict identifier allowlist ([A-Za-z0-9._-], 1-64 chars)
+// when dynamically joining <storage_dir>/<project_id> to prevent path traversal or shell metacharacters.
 func SafeProjectSubdir(projectID string) bool {
 	p := strings.TrimSpace(projectID)
-	if p == "" || p == "." || p == ".." {
+	if len(p) == 0 || len(p) > 64 || p == "." || p == ".." || strings.Contains(p, "..") {
 		return false
 	}
-	return !strings.ContainsAny(p, `/\`) && !strings.Contains(p, "..")
+	for i := 0; i < len(p); i++ {
+		ch := p[i]
+		ok := (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '.' || ch == '_' || ch == '-'
+		if !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // DestDirsFor returns all configured destination directories for a project (deduplicated, preserving order).

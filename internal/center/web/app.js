@@ -111,6 +111,7 @@ function esc(s) {
 async function api(path, opts = {}) {
   const isFormData = opts.body instanceof FormData;
   const headers = {
+    'X-Relay-UI': '1',
     ...(adminToken ? { 'X-Admin-Token': adminToken } : {}),
     ...(isFormData ? {} : { 'Content-Type': 'application/json' }),
     ...(opts.headers || {}),
@@ -151,7 +152,6 @@ function hideLogin() {
 
 function openModal(id) { document.getElementById(id).classList.remove('hidden'); }
 function closeModal(id) { document.getElementById(id).classList.add('hidden'); }
-window.closeModal = closeModal;
 
 function showToast(msg, type = 'info', durationMs = 3200) {
   const stack = document.getElementById('toast-stack');
@@ -1402,6 +1402,11 @@ function setupEvents() {
   });
 
   document.addEventListener('click', (e) => {
+    const closeBtn = e.target.closest('button[data-close-modal]');
+    if (closeBtn) {
+      closeModal(closeBtn.dataset.closeModal);
+      return;
+    }
     const btn = e.target.closest('button[data-action]');
     if (!btn) return;
     const id = btn.dataset.id || '';
@@ -1508,7 +1513,6 @@ function setupEvents() {
     }
     openModal('project-modal');
   };
-  window.openProjectModal = openProjectModal;
 
   document.getElementById('open-create-project').addEventListener('click', () => openProjectModal(''));
 

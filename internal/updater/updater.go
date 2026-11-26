@@ -143,10 +143,13 @@ func (u *Updater) apply(ctx context.Context, d protocol.UpgradeDirective) error 
 		}
 	}
 
-	dlURL := d.DownloadURL
-	if strings.HasPrefix(dlURL, "/") {
-		dlURL = strings.TrimRight(u.opts.CenterURL, "/") + dlURL
+	dlURL := strings.TrimSpace(d.DownloadURL)
+	// Security invariant: only pull releases from a relative /api/v1/releases/... path on the configured CenterURL
+	// to prevent SSRF or exfiltrating CenterToken to untrusted hosts.
+	if !isSafeReleaseDownloadPath(dlURL) {
+		return fmt.Errorf("refusing untrusted upgrade download_url %q", dlURL)
 	}
+	dlURL = strings.TrimRight(u.opts.CenterURL, "/") + dlURL
 
 	dlCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
@@ -210,4 +213,19 @@ func (u *Updater) apply(ctx context.Context, d protocol.UpgradeDirective) error 
 
 	u.opts.Logger.Info("binary atomically upgraded, scheduling restart", "version", d.Version, "path", exePath)
 	return nil
+}
+
+func isSafeReleaseDownloadPath(p string) bool {
+	if !strings.HasPrefix(p, "/api/v1/releases/") || strings.HasPrefix(p, "//") {
+		return false
+	}
+	if strings.Contains(p, "..") || strings.ContainsAny(p, "\\?#@ \t\r\n\x00") {
+		return false
+	}
+	for _, r := range p {
+		if r < 0x20 || r == 0x7f {
+			return false
+		}
+	}
+	return len(p) > len("/api/v1/releases/")
 }

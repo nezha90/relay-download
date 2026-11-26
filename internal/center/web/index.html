@@ -273,7 +273,7 @@
         </div>
         <div class="btn-row">
           <button id="btn-refresh-log-modal" class="btn sm">刷新日志</button>
-          <button class="btn ghost" onclick="closeModal('deploy-log-modal')">关闭</button>
+          <button class="btn ghost" type="button" data-close-modal="deploy-log-modal">关闭</button>
         </div>
       </div>
       <div id="deploy-log-body"></div>
@@ -285,7 +285,7 @@
     <div class="modal-card">
       <div class="modal-head">
         <h3 id="project-modal-title">新建项目</h3>
-        <button class="btn ghost" onclick="closeModal('project-modal')">关闭</button>
+        <button class="btn ghost" type="button" data-close-modal="project-modal">关闭</button>
       </div>
       <form id="create-project-form" class="form-stack">
         <label>项目 ID (英文/数字)
@@ -335,7 +335,7 @@
     <div class="modal-card">
       <div class="modal-head">
         <h3 id="node-modal-title">注册节点</h3>
-        <button class="btn ghost" onclick="closeModal('node-modal')">关闭</button>
+        <button class="btn ghost" type="button" data-close-modal="node-modal">关闭</button>
       </div>
       <form id="create-node-form" class="form-stack">
         <input type="hidden" name="role" />
@@ -404,7 +404,7 @@
           <h3 id="edit-node-title">配置接收节点项目与磁盘</h3>
           <p class="muted">保存后 2 秒内自动下发至接收节点热生效（无需 SSH、无需改配置文件、无需更换密钥）</p>
         </div>
-        <button class="btn ghost" onclick="closeModal('edit-node-modal')">关闭</button>
+        <button class="btn ghost" type="button" data-close-modal="edit-node-modal">关闭</button>
       </div>
       <form id="edit-node-form" class="form-stack">
         <input type="hidden" name="node_id" />
@@ -506,7 +506,7 @@
           <h3>一键部署公网分发节点 (SSH 环境预检 → 确认安装)</h3>
           <p class="muted">默认使用中心服务器本机 SSH 私钥免密以 root 连接目标机，自动签发 IP-SAN 证书并配置 systemd</p>
         </div>
-        <button class="btn ghost" onclick="closeModal('deploy-a-modal')">关闭</button>
+        <button class="btn ghost" type="button" data-close-modal="deploy-a-modal">关闭</button>
       </div>
 
       <form id="deploy-a-form" class="form-stack">
@@ -581,7 +581,7 @@
           <h3 id="b-script-title">内网接收节点一键安装脚本</h3>
           <p class="muted">脚本内嵌 Root CA 证书，采用严格 TLS 1.3 从中心拉取二进制并自动配置 systemd</p>
         </div>
-        <button class="btn ghost" onclick="closeModal('b-script-modal')">关闭</button>
+        <button class="btn ghost" type="button" data-close-modal="b-script-modal">关闭</button>
       </div>
       <form id="b-script-form" class="form-stack">
         <input type="hidden" name="node_id" />

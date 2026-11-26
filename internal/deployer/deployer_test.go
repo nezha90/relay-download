@@ -394,7 +394,7 @@ func TestRenderAgentBInstallScript(t *testing.T) {
 		[]byte("-----BEGIN CERTIFICATE-----\nTESTCA\n-----END CERTIFICATE-----\n"),
 		protocol.NodeRecord{ID: "b1", Name: "B1", Role: protocol.RoleAgentB, Projects: []string{"proj-alpha"}},
 		"secret-b-tok",
-		protocol.ReleaseRecord{ID: "rel-b", Role: protocol.RoleAgentB, Version: "v1.2.0", OS: "linux", Arch: "amd64", SHA256: "deadbeef"},
+		protocol.ReleaseRecord{ID: "rel-b", Role: protocol.RoleAgentB, Version: "v1.2.0", OS: "linux", Arch: "amd64", SHA256: strings.Repeat("de", 32)},
 		protocol.AgentBScriptReq{NodeID: "b1"},
 	)
 	if err != nil {

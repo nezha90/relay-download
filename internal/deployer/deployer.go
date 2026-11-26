@@ -3,10 +3,13 @@ package deployer
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -24,9 +27,13 @@ import (
 )
 
 var (
-	validHostRe = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,253}$`)
-	validUserRe = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
-	validPathRe = regexp.MustCompile(`^/[A-Za-z0-9/._-]{1,255}$`)
+	validHostRe    = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,253}$`)
+	validUserRe    = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
+	validIDRe      = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
+	validVersionRe = regexp.MustCompile(`^[A-Za-z0-9._+-]{1,64}$`)
+	validHexRe     = regexp.MustCompile(`^[0-9a-fA-F]{64}$`)
+	validModeRe    = regexp.MustCompile(`^0?[0-7]{3,4}$`)
+	validPathRe    = regexp.MustCompile(`^/[A-Za-z0-9/._-]{1,255}$`)
 )
 
 var forbiddenDirs = map[string]bool{
@@ -77,6 +84,31 @@ func ValidateAbsDir(dir string) error {
 		return fmt.Errorf("refusing unsafe system directory %q", cleaned)
 	}
 	return nil
+}
+
+func ValidateID(id string) error {
+	if !validIDRe.MatchString(strings.TrimSpace(id)) {
+		return fmt.Errorf("invalid identifier %q: only [A-Za-z0-9._-] (1-64 chars) allowed", id)
+	}
+	return nil
+}
+
+func ValidateSafeSingleLine(s string, maxLen int) error {
+	if len(s) > maxLen {
+		return fmt.Errorf("value exceeds max length %d", maxLen)
+	}
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f {
+			return errors.New("control characters and newlines are not allowed")
+		}
+	}
+	return nil
+}
+
+func randomHeredocDelim(prefix string) string {
+	var b [8]byte
+	_, _ = rand.Read(b[:])
+	return prefix + "_" + strings.ToUpper(hex.EncodeToString(b[:]))
 }
 
 func ShellQuote(s string) string {
@@ -220,6 +252,12 @@ func runRemoteCmd(ctx context.Context, client *ssh.Client, cmd string) (string, 
 func uploadFile(ctx context.Context, client *ssh.Client, r io.Reader, remotePath string, mode string) error {
 	if err := ValidateAbsDir(filepath.Dir(remotePath)); err != nil {
 		return err
+	}
+	if !validModeRe.MatchString(mode) {
+		return fmt.Errorf("invalid file mode %q", mode)
+	}
+	if strings.ContainsAny(remotePath, "\r\n\x00") || strings.Contains(remotePath, "..") {
+		return fmt.Errorf("invalid remote path %q", remotePath)
 	}
 	tmpPath := remotePath + ".relaytmp"
 	cmd := fmt.Sprintf("umask 077 && cat > %s && chmod %s %s && mv -f %s %s",
@@ -584,6 +622,29 @@ func (d *Deployer) InstallAgentA(ctx context.Context, p InstallAgentAParams) err
 	if req.NodeName == "" {
 		req.NodeName = req.NodeID
 	}
+	if err := ValidateHost(req.Host); err != nil {
+		return err
+	}
+	if err := ValidateID(req.NodeID); err != nil {
+		return fmt.Errorf("node_id: %w", err)
+	}
+	if err := ValidateSafeSingleLine(req.NodeName, 128); err != nil {
+		return fmt.Errorf("node_name: %w", err)
+	}
+	if req.SSHPort < 1 || req.SSHPort > 65535 || req.PublicPort < 1 || req.PublicPort > 65535 || req.LocalPort < 1 || req.LocalPort > 65535 || req.PublicPort == req.LocalPort {
+		return errors.New("invalid SSH / public / local port range")
+	}
+	if err := ValidateAbsDir(req.InstallDir); err != nil {
+		return fmt.Errorf("install_dir: %w", err)
+	}
+	if err := ValidateAbsDir(req.DataDir); err != nil {
+		return fmt.Errorf("data_dir: %w", err)
+	}
+	for _, pid := range req.Projects {
+		if err := ValidateID(pid); err != nil {
+			return fmt.Errorf("project %q: %w", pid, err)
+		}
+	}
 
 	// Step 1: Issue TLS cert for target host IP/DNS using Center CA.
 	logf("issue_cert", fmt.Sprintf("正在为节点 %s (%s) 签发专属 TLS 1.3 IP-SAN 证书...", req.NodeID, req.Host))
@@ -730,6 +791,15 @@ func (d *Deployer) InstallAgentA(ctx context.Context, p InstallAgentAParams) err
 	return nil
 }
 
+func sanitizeUnitField(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, s)
+}
+
 func RenderSystemdUnit(desc, binPath, cfgPath, workDir string) string {
 	return fmt.Sprintf(`[Unit]
 Description=%s
@@ -748,12 +818,40 @@ StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
-`, desc, workDir, binPath, cfgPath)
+`, sanitizeUnitField(desc), sanitizeUnitField(workDir), sanitizeUnitField(binPath), sanitizeUnitField(cfgPath))
 }
 
-// RenderAgentBInstallScript generates a self-contained bash installer for intranet Agent B nodes
+// RenderAgentBInstallScript generates a self-contained bash installer for intranet receiver nodes
 // with embedded ca.crt so binary download enforces strict TLS 1.3 verification without -k/--insecure.
+// All inputs are strictly validated and heredocs use cryptographically random delimiters to prevent script injection.
 func RenderAgentBInstallScript(centerPublicURL string, caCertPEM []byte, node protocol.NodeRecord, rawToken string, rel protocol.ReleaseRecord, req protocol.AgentBScriptReq) (string, error) {
+	if err := ValidateID(node.ID); err != nil {
+		return "", fmt.Errorf("node_id: %w", err)
+	}
+	if err := ValidateSafeSingleLine(node.Name, 128); err != nil {
+		return "", fmt.Errorf("node_name: %w", err)
+	}
+	if u, err := url.Parse(strings.TrimSpace(centerPublicURL)); err != nil || u.Scheme != "https" || u.Host == "" {
+		return "", errors.New("centerPublicURL must be a valid https:// URL")
+	}
+	if err := ValidateSafeSingleLine(centerPublicURL, 512); err != nil {
+		return "", fmt.Errorf("center_url: %w", err)
+	}
+	if !validVersionRe.MatchString(rel.Version) || (rel.OS != "linux" && rel.OS != "darwin") || (rel.Arch != "amd64" && rel.Arch != "arm64") {
+		return "", errors.New("invalid release metadata")
+	}
+	if !validHexRe.MatchString(rel.SHA256) {
+		return "", errors.New("invalid release sha256")
+	}
+	if !validIDRe.MatchString(rel.ID) {
+		return "", errors.New("invalid release id")
+	}
+	if rawToken != "" {
+		if err := ValidateSafeSingleLine(rawToken, 256); err != nil {
+			return "", fmt.Errorf("node_token: %w", err)
+		}
+	}
+
 	installDir := req.InstallDir
 	if installDir == "" {
 		installDir = "/opt/relay-agent-b"
@@ -769,6 +867,11 @@ func RenderAgentBInstallScript(centerPublicURL string, caCertPEM []byte, node pr
 		return "", err
 	}
 	onlyProject := strings.TrimSpace(req.OnlyProject)
+	if onlyProject != "" {
+		if err := ValidateID(onlyProject); err != nil {
+			return "", fmt.Errorf("only_project: %w", err)
+		}
+	}
 	storageDirs := make([]string, 0, len(req.StorageDirs))
 	for _, d := range req.StorageDirs {
 		d = strings.TrimSpace(d)
@@ -790,8 +893,46 @@ func RenderAgentBInstallScript(centerPublicURL string, caCertPEM []byte, node pr
 		}
 	}
 
-	projects := req.Projects
-	projectDirs := req.ProjectDirs
+	var projects map[string]string
+	if len(req.Projects) > 0 {
+		projects = make(map[string]string, len(req.Projects))
+		for k, v := range req.Projects {
+			k = strings.TrimSpace(k)
+			v = strings.TrimSpace(v)
+			if err := ValidateID(k); err != nil {
+				return "", fmt.Errorf("projects key %q: %w", k, err)
+			}
+			if err := ValidateAbsDir(v); err != nil {
+				return "", fmt.Errorf("projects[%s] dir: %w", k, err)
+			}
+			projects[k] = v
+		}
+	}
+	var projectDirs map[string][]string
+	if len(req.ProjectDirs) > 0 {
+		projectDirs = make(map[string][]string, len(req.ProjectDirs))
+		for k, dirs := range req.ProjectDirs {
+			k = strings.TrimSpace(k)
+			if err := ValidateID(k); err != nil {
+				return "", fmt.Errorf("project_dirs key %q: %w", k, err)
+			}
+			clean := make([]string, 0, len(dirs))
+			for _, d := range dirs {
+				d = strings.TrimSpace(d)
+				if d == "" {
+					continue
+				}
+				if err := ValidateAbsDir(d); err != nil {
+					return "", fmt.Errorf("project_dirs[%s]: %w", k, err)
+				}
+				clean = append(clean, d)
+			}
+			if len(clean) > 0 {
+				projectDirs[k] = clean
+			}
+		}
+	}
+
 	var destDir string
 	if len(storageDirs) > 0 && onlyProject == "" {
 		// Managed disk-pool mode (recommended): Center controls projects, scheduling, and disk toggles dynamically.
@@ -819,6 +960,9 @@ func RenderAgentBInstallScript(centerPublicURL string, caCertPEM []byte, node pr
 	maxConc := req.MaxConcurrent
 	if maxConc <= 0 {
 		maxConc = 3
+	}
+	if maxConc > 1024 {
+		maxConc = 1024
 	}
 	tokVal := rawToken
 	if tokVal == "" {
@@ -851,8 +995,17 @@ func RenderAgentBInstallScript(centerPublicURL string, caCertPEM []byte, node pr
 
 	binPath := filepath.Join(installDir, "relay-agent-b")
 	cfgPath := filepath.Join(installDir, "agent-b.yaml")
-	unit := RenderSystemdUnit("Relay Download Intranet Agent B", binPath, cfgPath, installDir)
+	unit := RenderSystemdUnit("Relay Download Intranet Receiver", binPath, cfgPath, installDir)
 	dlURL := strings.TrimRight(centerPublicURL, "/") + "/api/v1/releases/" + rel.ID + "/download"
+
+	caEOF := randomHeredocDelim("RELAY_CA_EOF")
+	cfgEOF := randomHeredocDelim("RELAY_CFG_EOF")
+	svcEOF := randomHeredocDelim("RELAY_SVC_EOF")
+	if bytes.Contains(caCertPEM, []byte(caEOF)) || bytes.Contains(cfgYAML, []byte(cfgEOF)) || strings.Contains(unit, svcEOF) {
+		return "", errors.New("heredoc delimiter collision")
+	}
+
+	verBanner := fmt.Sprintf("[1/4] 从中心服务器下载 relay-agent-b (%s %s/%s)...", rel.Version, rel.OS, rel.Arch)
 
 	var sb strings.Builder
 	sb.WriteString("#!/usr/bin/env bash\nset -euo pipefail\n\n")
@@ -860,13 +1013,13 @@ func RenderAgentBInstallScript(centerPublicURL string, caCertPEM []byte, node pr
 	sb.WriteString(fmt.Sprintf("INSTALL_DIR=%s\nSTATE_DIR=%s\nNODE_ID=%s\nNODE_TOKEN=%s\nEXPECTED_SHA=%s\nDOWNLOAD_URL=%s\n\n",
 		ShellQuote(installDir), ShellQuote(stateDir), ShellQuote(node.ID), ShellQuote(tokVal), ShellQuote(rel.SHA256), ShellQuote(dlURL)))
 	sb.WriteString("mkdir -p \"$INSTALL_DIR/certs\" \"$STATE_DIR\"\n")
-	sb.WriteString("cat > \"$INSTALL_DIR/certs/ca.crt\" <<'RELAY_CA_EOF'\n")
+	sb.WriteString("cat > \"$INSTALL_DIR/certs/ca.crt\" <<'" + caEOF + "'\n")
 	sb.Write(caCertPEM)
 	if len(caCertPEM) > 0 && caCertPEM[len(caCertPEM)-1] != '\n' {
 		sb.WriteByte('\n')
 	}
-	sb.WriteString("RELAY_CA_EOF\nchmod 644 \"$INSTALL_DIR/certs/ca.crt\"\n\n")
-	sb.WriteString("echo \"[1/4] 从中心服务器下载 relay-agent-b (" + rel.Version + " " + rel.OS + "/" + rel.Arch + ")...\"\n")
+	sb.WriteString(caEOF + "\nchmod 644 \"$INSTALL_DIR/certs/ca.crt\"\n\n")
+	sb.WriteString("echo " + ShellQuote(verBanner) + "\n")
 	sb.WriteString("curl -fsSL --tlsv1.3 --cacert \"$INSTALL_DIR/certs/ca.crt\" \\\n")
 	sb.WriteString("  -H \"X-Node-ID: $NODE_ID\" -H \"X-Node-Token: $NODE_TOKEN\" \\\n")
 	sb.WriteString("  \"$DOWNLOAD_URL\" -o \"$INSTALL_DIR/relay-agent-b.tmp\"\n")
@@ -876,15 +1029,18 @@ func RenderAgentBInstallScript(centerPublicURL string, caCertPEM []byte, node pr
 	sb.WriteString("\"$INSTALL_DIR/relay-agent-b.tmp\" -version\n")
 	sb.WriteString("systemctl stop relay-agent-b 2>/dev/null || true\n")
 	sb.WriteString("mv -f \"$INSTALL_DIR/relay-agent-b.tmp\" \"$INSTALL_DIR/relay-agent-b\"\n\n")
-	sb.WriteString("echo \"[2/4] 写入 agent-b.yaml ...\"\n")
-	sb.WriteString("cat > \"$INSTALL_DIR/agent-b.yaml\" <<'RELAY_CFG_EOF'\n")
+	sb.WriteString("echo '[2/4] 写入 agent-b.yaml ...'\n")
+	sb.WriteString("cat > \"$INSTALL_DIR/agent-b.yaml\" <<'" + cfgEOF + "'\n")
 	sb.Write(cfgYAML)
-	sb.WriteString("RELAY_CFG_EOF\nchmod 600 \"$INSTALL_DIR/agent-b.yaml\"\n\n")
-	sb.WriteString("echo \"[3/4] 写入 systemd 服务 ...\"\n")
-	sb.WriteString("cat > /etc/systemd/system/relay-agent-b.service <<'RELAY_SVC_EOF'\n")
+	if len(cfgYAML) > 0 && cfgYAML[len(cfgYAML)-1] != '\n' {
+		sb.WriteByte('\n')
+	}
+	sb.WriteString(cfgEOF + "\nchmod 600 \"$INSTALL_DIR/agent-b.yaml\"\n\n")
+	sb.WriteString("echo '[3/4] 写入 systemd 服务 ...'\n")
+	sb.WriteString("cat > /etc/systemd/system/relay-agent-b.service <<'" + svcEOF + "'\n")
 	sb.WriteString(unit)
-	sb.WriteString("RELAY_SVC_EOF\nchmod 644 /etc/systemd/system/relay-agent-b.service\n\n")
-	sb.WriteString("echo \"[4/4] 启动并设置开机自启 ...\"\n")
+	sb.WriteString(svcEOF + "\nchmod 644 /etc/systemd/system/relay-agent-b.service\n\n")
+	sb.WriteString("echo '[4/4] 启动并设置开机自启 ...'\n")
 	sb.WriteString("systemctl daemon-reload\nsystemctl enable --now relay-agent-b\nsystemctl status relay-agent-b --no-pager\n")
 	return sb.String(), nil
 }

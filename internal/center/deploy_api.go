@@ -96,6 +96,8 @@ func (s *Server) handleAdminListReleases(w http.ResponseWriter, r *http.Request)
 }
 
 func (s *Server) handleAdminUploadRelease(w http.ResponseWriter, r *http.Request) {
+	// Cap upload size at 256 MiB to prevent disk/memory exhaustion via oversized multipart uploads.
+	r.Body = http.MaxBytesReader(w, r.Body, 256<<20)
 	ct := r.Header.Get("Content-Type")
 	if !strings.HasPrefix(ct, "multipart/form-data") {
 		protocol.WriteError(w, http.StatusBadRequest, "multipart/form-data required")
@@ -158,8 +160,8 @@ func (s *Server) handleAdminUploadRelease(w http.ResponseWriter, r *http.Request
 			}
 			_ = part.Close()
 		case "notes":
-			b, _ := io.ReadAll(io.LimitReader(part, 4096))
-			notes = strings.TrimSpace(string(b))
+			b, _ := io.ReadAll(io.LimitReader(part, 1024))
+			notes = sanitizeSingleLine(string(b), 512)
 			_ = part.Close()
 		case "file":
 			if sawFile {
@@ -427,15 +429,39 @@ func (s *Server) handleAdminDeployAgentA(w http.ResponseWriter, r *http.Request)
 		protocol.WriteError(w, http.StatusBadRequest, "invalid node_id: only [A-Za-z0-9._-] (1-64 chars) allowed")
 		return
 	}
+	if err := deployer.ValidateSafeSingleLine(req.NodeName, 128); err != nil {
+		protocol.WriteError(w, http.StatusBadRequest, "invalid node_name: "+err.Error())
+		return
+	}
+	cleanProjs := make([]string, 0, len(req.Projects))
+	for _, pid := range req.Projects {
+		pid = strings.TrimSpace(pid)
+		if pid == "" {
+			continue
+		}
+		if !validIDRe.MatchString(pid) {
+			protocol.WriteError(w, http.StatusBadRequest, "invalid project id: "+pid)
+			return
+		}
+		cleanProjs = append(cleanProjs, pid)
+	}
+	req.Projects = cleanProjs
 	if s.cfg.CAKey == "" || s.cfg.CACert == "" || s.cfg.PublicURL == "" {
 		protocol.WriteError(w, http.StatusBadRequest, "center config requires ca_cert, ca_key, and public_url for one-click deployment")
 		return
+	}
+	if req.SSHPort <= 0 {
+		req.SSHPort = 22
 	}
 	if req.PublicPort <= 0 {
 		req.PublicPort = 8443
 	}
 	if req.LocalPort <= 0 {
 		req.LocalPort = 18081
+	}
+	if req.SSHPort < 1 || req.SSHPort > 65535 || req.PublicPort < 1 || req.PublicPort > 65535 || req.LocalPort < 1 || req.LocalPort > 65535 || req.PublicPort == req.LocalPort {
+		protocol.WriteError(w, http.StatusBadRequest, "invalid ssh_port / public_port / local_port")
+		return
 	}
 	if req.InstallDir == "" {
 		req.InstallDir = "/opt/relay-agent-a"

@@ -490,6 +490,20 @@ func (a *Agent) requireLocalAuth(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+func isValidProjectID(id string) bool {
+	p := strings.TrimSpace(id)
+	if len(p) == 0 || len(p) > 64 || p == "." || p == ".." || strings.Contains(p, "..") {
+		return false
+	}
+	for i := 0; i < len(p); i++ {
+		c := p[i]
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-') {
+			return false
+		}
+	}
+	return true
+}
+
 func (a *Agent) handleLocalPutFile(w http.ResponseWriter, r *http.Request) {
 	projectID := strings.TrimSpace(r.PathValue("project"))
 	filename := strings.TrimSpace(r.PathValue("filename"))
@@ -512,8 +526,8 @@ func (a *Agent) ingestRawBody(w http.ResponseWriter, r *http.Request, projectID,
 		protocol.WriteError(w, http.StatusInsufficientStorage, "disk watermark exceeded on agent-a")
 		return
 	}
-	if projectID == "" {
-		protocol.WriteError(w, http.StatusBadRequest, "project is required")
+	if !isValidProjectID(projectID) {
+		protocol.WriteError(w, http.StatusBadRequest, "invalid project id: only [A-Za-z0-9._-] (1-64 chars) allowed")
 		return
 	}
 	if !a.cfg.AllowsProject(projectID) {
@@ -698,9 +712,9 @@ func (a *Agent) handleLocalUpload(w http.ResponseWriter, r *http.Request) {
 		if filename == "" {
 			filename = partFilename
 		}
-		if projectID == "" {
+		if !isValidProjectID(projectID) {
 			_ = os.Remove(tmpPath)
-			protocol.WriteError(w, http.StatusBadRequest, "project is required")
+			protocol.WriteError(w, http.StatusBadRequest, "invalid project id: only [A-Za-z0-9._-] (1-64 chars) allowed")
 			return
 		}
 		if !a.cfg.AllowsProject(projectID) {
@@ -709,8 +723,8 @@ func (a *Agent) handleLocalUpload(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	} else {
-		if projectID == "" {
-			protocol.WriteError(w, http.StatusBadRequest, "project is required")
+		if !isValidProjectID(projectID) {
+			protocol.WriteError(w, http.StatusBadRequest, "invalid project id: only [A-Za-z0-9._-] (1-64 chars) allowed")
 			return
 		}
 		if !a.cfg.AllowsProject(projectID) {
@@ -810,8 +824,8 @@ func (a *Agent) handleLocalRegister(w http.ResponseWriter, r *http.Request) {
 		protocol.WriteError(w, http.StatusBadRequest, "invalid json: "+err.Error())
 		return
 	}
-	if req.ProjectID == "" || req.LocalPath == "" {
-		protocol.WriteError(w, http.StatusBadRequest, "project_id and local_path are required")
+	if !isValidProjectID(req.ProjectID) || req.LocalPath == "" || strings.ContainsRune(req.LocalPath, 0) {
+		protocol.WriteError(w, http.StatusBadRequest, "valid project_id ([A-Za-z0-9._-]) and local_path are required")
 		return
 	}
 	if !a.cfg.AllowsProject(req.ProjectID) {
@@ -982,8 +996,8 @@ func (a *Agent) handleLocalRegisterBatch(w http.ResponseWriter, r *http.Request)
 
 	for i, it := range req.Items {
 		results[i].Index = i
-		if it.ProjectID == "" || it.LocalPath == "" {
-			results[i].Error = "project_id and local_path are required"
+		if !isValidProjectID(it.ProjectID) || it.LocalPath == "" || strings.ContainsRune(it.LocalPath, 0) {
+			results[i].Error = "valid project_id ([A-Za-z0-9._-]) and local_path are required"
 			continue
 		}
 		if !a.cfg.AllowsProject(it.ProjectID) {
