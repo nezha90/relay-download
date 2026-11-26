@@ -16,6 +16,7 @@ import (
 
 	"relay-download/internal/auth"
 	"relay-download/internal/protocol"
+	"relay-download/internal/transfer"
 )
 
 var (
@@ -65,6 +66,19 @@ type deletedEntry struct {
 	deletedAt      time.Time
 }
 
+type affinityEntry struct {
+	bNodeID   string
+	expiresAt time.Time
+}
+
+const (
+	maxAffinityEntries  = 200_000
+	affinityTTL         = 10 * time.Minute
+	stickyGraceWindow   = 45 * time.Second
+	hrwGraceWindow      = 15 * time.Second
+	receiverAliveWindow = 30 * time.Second
+)
+
 type Store struct {
 	db      *bolt.DB
 	claimMu sync.Mutex
@@ -75,6 +89,13 @@ type Store struct {
 	mu          sync.Mutex
 	deleted     map[string]deletedEntry
 	deletedList []string
+
+	affMu           sync.RWMutex
+	groupAffinity   map[string]affinityEntry // projectID+"\x00"+groupKey -> sticky receiver
+	receiverSeen    map[string]time.Time     // bNodeID -> last claim activity
+	activeReceivers map[string][]string      // projectID -> sorted online receiver IDs from Center
+	projectAffinity map[string]bool          // projectID -> group_affinity enabled (default true)
+	affClaimCounter uint64
 }
 
 func OpenStore(dbPath string) (*Store, error) {
@@ -109,10 +130,74 @@ func OpenStore(dbPath string) (*Store, error) {
 		return nil, err
 	}
 	return &Store{
-		db:      db,
-		records: records,
-		deleted: make(map[string]deletedEntry),
+		db:              db,
+		records:         records,
+		deleted:         make(map[string]deletedEntry),
+		groupAffinity:   make(map[string]affinityEntry),
+		receiverSeen:    make(map[string]time.Time),
+		activeReceivers: make(map[string][]string),
+		projectAffinity: make(map[string]bool),
 	}, nil
+}
+
+// SetRoutingState updates the Center-reported active receiver list and per-project affinity flags
+// so ClaimBatch can route paired media assets (<video_id>.*) to the same receiver across nodes.
+func (s *Store) SetRoutingState(activeReceivers map[string][]string, projectAffinity map[string]bool) {
+	s.affMu.Lock()
+	if activeReceivers != nil {
+		cp := make(map[string][]string, len(activeReceivers))
+		for k, v := range activeReceivers {
+			cp[k] = append([]string(nil), v...)
+		}
+		s.activeReceivers = cp
+	}
+	if projectAffinity != nil {
+		cp := make(map[string]bool, len(projectAffinity))
+		for k, v := range projectAffinity {
+			cp[k] = v
+		}
+		s.projectAffinity = cp
+	}
+	s.affMu.Unlock()
+}
+
+func (s *Store) isGroupAffinityEnabled(projectID string) bool {
+	s.affMu.RLock()
+	enabled, ok := s.projectAffinity[projectID]
+	s.affMu.RUnlock()
+	if !ok {
+		return true
+	}
+	return enabled
+}
+
+func (s *Store) recordGroupAffinityLocked(projectID, groupKey, bNodeID string, now time.Time) {
+	if s.groupAffinity == nil {
+		s.groupAffinity = make(map[string]affinityEntry)
+	}
+	s.groupAffinity[projectID+"\x00"+groupKey] = affinityEntry{
+		bNodeID:   bNodeID,
+		expiresAt: now.Add(affinityTTL),
+	}
+	s.affClaimCounter++
+	if len(s.groupAffinity) > maxAffinityEntries || s.affClaimCounter%4096 == 0 {
+		for k, ent := range s.groupAffinity {
+			if !ent.expiresAt.After(now) {
+				delete(s.groupAffinity, k)
+			}
+		}
+		// Hard cap safety if bursts exceed maxAffinityEntries within TTL.
+		if len(s.groupAffinity) > maxAffinityEntries {
+			drop := len(s.groupAffinity) - maxAffinityEntries*3/4
+			for k := range s.groupAffinity {
+				delete(s.groupAffinity, k)
+				drop--
+				if drop <= 0 {
+					break
+				}
+			}
+		}
+	}
 }
 
 func (s *Store) Close() error {
@@ -228,6 +313,9 @@ func (s *Store) ClaimNext(projectID, bNodeID string, availDiskBytes uint64, leas
 
 // ClaimBatch selects up to maxCount oldest eligible files from the in-memory index in microseconds
 // and persists ONLY the claimed records in a single BoltDB write transaction.
+// When asset-group affinity is enabled (default), paired files sharing the same MediaAffinityKey
+// (e.g. <video_id>.m4a + <video_id>.info.json) are claimed atomically together and routed to the
+// same receiver node via sticky affinity + cross-node HRW rendezvous hashing with automatic failover.
 func (s *Store) ClaimBatch(projectID, bNodeID string, availDiskBytes uint64, leaseTTL time.Duration, maxCount int) ([]FileRecord, error) {
 	if maxCount <= 0 {
 		maxCount = 1
@@ -240,9 +328,24 @@ func (s *Store) ClaimBatch(projectID, bNodeID string, availDiskBytes uint64, lea
 	defer s.claimMu.Unlock()
 
 	now := time.Now().UTC()
-	// Snapshot eligible candidates from RAM without touching BoltDB.
+	affinityOn := s.isGroupAffinityEnabled(projectID)
+
+	s.affMu.Lock()
+	if s.receiverSeen == nil {
+		s.receiverSeen = make(map[string]time.Time)
+	}
+	s.receiverSeen[bNodeID] = now
+	receivers := append([]string(nil), s.activeReceivers[projectID]...)
+	receiverSet := make(map[string]struct{}, len(receivers))
+	for _, rID := range receivers {
+		receiverSet[rID] = struct{}{}
+	}
+	s.affMu.Unlock()
+
+	// Snapshot eligible candidates (and active unexpired claimed group owners) from RAM without BoltDB reads.
 	s.idxMu.RLock()
 	var candidates []FileRecord
+	activeGroupOwner := make(map[string]string)
 	for _, rec := range s.records {
 		if rec.ProjectID != projectID {
 			continue
@@ -252,6 +355,12 @@ func (s *Store) ClaimBatch(projectID, bNodeID string, availDiskBytes uint64, lea
 			isReady = true
 		}
 		if !isReady {
+			if affinityOn && rec.Status == protocol.FileStatusClaimed && rec.ClaimedBy != "" && rec.LeaseExpiresAt != nil && rec.LeaseExpiresAt.After(now) {
+				gk := transfer.MediaAffinityKey(rec.Filename)
+				if _, exists := activeGroupOwner[gk]; !exists {
+					activeGroupOwner[gk] = rec.ClaimedBy
+				}
+			}
 			continue
 		}
 		if availDiskBytes > 0 && uint64(rec.Size) > availDiskBytes {
@@ -264,6 +373,7 @@ func (s *Store) ClaimBatch(projectID, bNodeID string, availDiskBytes uint64, lea
 	if len(candidates) == 0 {
 		return nil, ErrNoReadyFile
 	}
+
 	sort.Slice(candidates, func(i, j int) bool {
 		if candidates[i].UploadedAt.Equal(candidates[j].UploadedAt) {
 			return candidates[i].FileID < candidates[j].FileID
@@ -271,58 +381,209 @@ func (s *Store) ClaimBatch(projectID, bNodeID string, availDiskBytes uint64, lea
 		return candidates[i].UploadedAt.Before(candidates[j].UploadedAt)
 	})
 
+	type assetGroup struct {
+		key        string
+		oldest     time.Time
+		files      []FileRecord
+		totalBytes uint64
+		hasRetry   bool
+	}
+
+	var orderedGroups []*assetGroup
+	if !affinityOn {
+		orderedGroups = make([]*assetGroup, len(candidates))
+		for i, c := range candidates {
+			sz := uint64(0)
+			if c.Size > 0 {
+				sz = uint64(c.Size)
+			}
+			orderedGroups[i] = &assetGroup{
+				key:        c.FileID,
+				oldest:     c.UploadedAt,
+				files:      []FileRecord{c},
+				totalBytes: sz,
+			}
+		}
+	} else {
+		byKey := make(map[string]*assetGroup, len(candidates))
+		for _, c := range candidates {
+			gk := transfer.MediaAffinityKey(c.Filename)
+			g, ok := byKey[gk]
+			if !ok {
+				g = &assetGroup{key: gk, oldest: c.UploadedAt}
+				byKey[gk] = g
+				orderedGroups = append(orderedGroups, g)
+			}
+			g.files = append(g.files, c)
+			if c.UploadedAt.Before(g.oldest) {
+				g.oldest = c.UploadedAt
+			}
+			if c.Size > 0 {
+				g.totalBytes += uint64(c.Size)
+			}
+			if c.RetryCount > 0 || (c.Status == protocol.FileStatusClaimed && c.LeaseExpiresAt != nil && !c.LeaseExpiresAt.After(now)) {
+				g.hasRetry = true
+			}
+		}
+		sort.Slice(orderedGroups, func(i, j int) bool {
+			if orderedGroups[i].oldest.Equal(orderedGroups[j].oldest) {
+				return orderedGroups[i].key < orderedGroups[j].key
+			}
+			return orderedGroups[i].oldest.Before(orderedGroups[j].oldest)
+		})
+
+		// Filter out groups currently reserved for another live receiver (active sibling lease,
+		// sticky affinity within grace window, or HRW rendezvous owner within grace window).
+		// Retried / lease-expired groups bypass reservations so healthy receivers take over immediately.
+		// Groups already sticky to bNodeID are prioritized first so paired assets finish together cleanly.
+		s.affMu.RLock()
+		isReceiverAlive := func(nodeID string) bool {
+			if _, ok := receiverSet[nodeID]; ok {
+				return true
+			}
+			if seen, ok := s.receiverSeen[nodeID]; ok && now.Sub(seen) <= receiverAliveWindow {
+				return true
+			}
+			return false
+		}
+		var ownedFirst []*assetGroup
+		var normalGroups []*assetGroup
+		for _, g := range orderedGroups {
+			if g.hasRetry {
+				normalGroups = append(normalGroups, g)
+				continue
+			}
+			if owner, ok := activeGroupOwner[g.key]; ok {
+				if owner != bNodeID {
+					continue
+				}
+				ownedFirst = append(ownedFirst, g)
+				continue
+			}
+			if ent, ok := s.groupAffinity[projectID+"\x00"+g.key]; ok && ent.bNodeID != "" && now.Before(ent.expiresAt) {
+				if ent.bNodeID == bNodeID {
+					ownedFirst = append(ownedFirst, g)
+					continue
+				}
+				if isReceiverAlive(ent.bNodeID) && now.Sub(g.oldest) < stickyGraceWindow {
+					continue
+				}
+			} else if len(receivers) > 1 {
+				if _, selfKnown := receiverSet[bNodeID]; selfKnown {
+					hrw := transfer.RendezvousOwner(projectID, g.key, receivers)
+					if hrw != "" && hrw != bNodeID && now.Sub(g.oldest) < hrwGraceWindow {
+						continue
+					}
+				}
+			}
+			normalGroups = append(normalGroups, g)
+		}
+		s.affMu.RUnlock()
+		orderedGroups = append(ownedFirst, normalGroups...)
+	}
+
+	if len(orderedGroups) == 0 {
+		return nil, ErrNoReadyFile
+	}
+
 	var chosen []FileRecord
+	var claimedGroupKeys []string
 	exp := now.Add(leaseTTL)
 	ttlSec := int(leaseTTL / time.Second)
 	remainingBudget := availDiskBytes
 
 	err := s.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketFiles)
-		for _, cand := range candidates {
+		for _, grp := range orderedGroups {
 			if len(chosen) >= maxCount {
 				break
 			}
-			// Re-verify latest durable state inside tx in case Ack/Delete raced before claimMu.
-			raw := b.Get([]byte(cand.FileID))
-			if raw == nil {
-				continue
-			}
-			var rec FileRecord
-			if err := json.Unmarshal(raw, &rec); err != nil {
-				continue
-			}
-			isReady := rec.Status == protocol.FileStatusReady && (rec.NextRetryAt == nil || !rec.NextRetryAt.After(now))
-			if !isReady && rec.Status == protocol.FileStatusClaimed && rec.LeaseExpiresAt != nil && !rec.LeaseExpiresAt.After(now) {
-				isReady = true
-				rec.RetryCount++
-			}
-			if !isReady {
-				continue
-			}
-			if availDiskBytes > 0 {
-				if uint64(rec.Size) > remainingBudget {
+			// Re-verify durable state of every file in this group inside the tx.
+			var readyFiles []FileRecord
+			var grpBytes uint64
+			for _, cand := range grp.files {
+				raw := b.Get([]byte(cand.FileID))
+				if raw == nil {
 					continue
 				}
-				remainingBudget -= uint64(rec.Size)
+				var rec FileRecord
+				if err := json.Unmarshal(raw, &rec); err != nil {
+					continue
+				}
+				isReady := rec.Status == protocol.FileStatusReady && (rec.NextRetryAt == nil || !rec.NextRetryAt.After(now))
+				if !isReady && rec.Status == protocol.FileStatusClaimed && rec.LeaseExpiresAt != nil && !rec.LeaseExpiresAt.After(now) {
+					isReady = true
+					rec.RetryCount++
+				}
+				if !isReady {
+					continue
+				}
+				readyFiles = append(readyFiles, rec)
+				if rec.Size > 0 {
+					grpBytes += uint64(rec.Size)
+				}
+			}
+			if len(readyFiles) == 0 {
+				continue
 			}
 
-			rec.Status = protocol.FileStatusClaimed
-			rec.ClaimedBy = bNodeID
-			rec.LeaseID = uuid.NewString()
-			rec.LeaseToken = auth.GenerateRandomToken(24)
-			rec.LeaseTTLSec = ttlSec
-			e := exp
-			rec.LeaseExpiresAt = &e
-			rec.NextRetryAt = nil
+			// Preserve atomic whole-group claiming: never split a ready group across batches.
+			if affinityOn && len(chosen) > 0 && len(chosen)+len(readyFiles) > maxCount {
+				continue
+			}
+			if availDiskBytes > 0 && grpBytes > remainingBudget {
+				if len(chosen) > 0 || len(readyFiles) == 1 {
+					continue
+				}
+				// Single group larger than available disk budget when nothing claimed yet: fall back to files that fit.
+				var subset []FileRecord
+				var subBytes uint64
+				for _, rec := range readyFiles {
+					sz := uint64(0)
+					if rec.Size > 0 {
+						sz = uint64(rec.Size)
+					}
+					if subBytes+sz <= remainingBudget {
+						subset = append(subset, rec)
+						subBytes += sz
+					}
+				}
+				if len(subset) == 0 {
+					continue
+				}
+				readyFiles = subset
+				grpBytes = subBytes
+			}
 
-			out, err := json.Marshal(&rec)
-			if err != nil {
-				return err
+			for _, rec := range readyFiles {
+				rec.Status = protocol.FileStatusClaimed
+				rec.ClaimedBy = bNodeID
+				rec.LeaseID = uuid.NewString()
+				rec.LeaseToken = auth.GenerateRandomToken(24)
+				rec.LeaseTTLSec = ttlSec
+				e := exp
+				rec.LeaseExpiresAt = &e
+				rec.NextRetryAt = nil
+
+				out, err := json.Marshal(&rec)
+				if err != nil {
+					return err
+				}
+				if err := b.Put([]byte(rec.FileID), out); err != nil {
+					return err
+				}
+				chosen = append(chosen, rec)
 			}
-			if err := b.Put([]byte(rec.FileID), out); err != nil {
-				return err
+			if availDiskBytes > 0 {
+				if grpBytes >= remainingBudget {
+					remainingBudget = 0
+				} else {
+					remainingBudget -= grpBytes
+				}
 			}
-			chosen = append(chosen, rec)
+			if affinityOn {
+				claimedGroupKeys = append(claimedGroupKeys, grp.key)
+			}
 		}
 		if len(chosen) == 0 {
 			return ErrNoReadyFile
@@ -338,6 +599,14 @@ func (s *Store) ClaimBatch(projectID, bNodeID string, availDiskBytes uint64, lea
 		s.records[rec.FileID] = cloneFileRecord(rec)
 	}
 	s.idxMu.Unlock()
+
+	if affinityOn && len(claimedGroupKeys) > 0 {
+		s.affMu.Lock()
+		for _, gk := range claimedGroupKeys {
+			s.recordGroupAffinityLocked(projectID, gk, bNodeID, now)
+		}
+		s.affMu.Unlock()
+	}
 	return chosen, nil
 }
 
@@ -674,6 +943,9 @@ func (s *Store) Nack(fileID, leaseID, leaseToken, bNodeID string, buildEvent fun
 	s.idxMu.Lock()
 	s.records[fileID] = cloneFileRecord(rec)
 	s.idxMu.Unlock()
+	s.affMu.Lock()
+	delete(s.groupAffinity, rec.ProjectID+"\x00"+transfer.MediaAffinityKey(rec.Filename))
+	s.affMu.Unlock()
 	return &rec, nil
 }
 
@@ -748,6 +1020,11 @@ func (s *Store) ReapExpiredLeases(now time.Time) (int, error) {
 			}
 		}
 		s.idxMu.Unlock()
+		s.affMu.Lock()
+		for _, rec := range updated {
+			delete(s.groupAffinity, rec.ProjectID+"\x00"+transfer.MediaAffinityKey(rec.Filename))
+		}
+		s.affMu.Unlock()
 	}
 	return reaped, nil
 }

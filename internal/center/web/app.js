@@ -699,14 +699,22 @@ function renderProjects(projects, winHours) {
     `).join('') || '<span class="muted">当前无待传输积压</span>';
 
     const autoBadge = p.description === '上传自动发现创建' ? '<span class="badge">自动发现</span>' : '';
+    const affBadge = p.group_affinity === false
+      ? '<span class="badge">自由抢占</span>'
+      : '<span class="badge accent">同源亲和</span>';
+    const quotaParts = [];
+    if (p.max_total_concurrent > 0) quotaParts.push(`总并发 ≤ ${p.max_total_concurrent}`);
+    if (p.max_total_rate_mbps > 0) quotaParts.push(`总限速 ${p.max_total_rate_mbps} MB/s`);
+    const quotaBadge = quotaParts.length ? `<span class="badge alarm">${esc(quotaParts.join(' · '))}</span>` : '';
     return `
       <div class="card">
         <div class="card-head">
           <div>
-            <h3>${esc(p.name)} <span class="mono muted">(${esc(p.id)})</span> ${autoBadge}</h3>
+            <h3>${esc(p.name)} <span class="mono muted">(${esc(p.id)})</span> ${autoBadge} ${affBadge} ${quotaBadge}</h3>
             <div class="muted">${esc(p.description || '无描述')} · 策略: ${esc(p.conflict_policy)} · 租约: ${p.lease_ttl_sec}s</div>
           </div>
           <div style="display:flex;gap:6px">
+            <button class="btn sm" data-action="edit-project" data-id="${esc(p.id)}">编辑策略</button>
             <button class="btn sm danger" data-action="delete-project" data-id="${esc(p.id)}">删除</button>
           </div>
         </div>
@@ -774,7 +782,31 @@ function diskPolicyLabel(pol) {
   }
 }
 
-function renderProjectScope(projects, schedule) {
+function renderAdaptiveBadge(n) {
+  const mode = n.concurrency_mode || 'auto';
+  const stateMap = {
+    probing: { cls: 'accent', lbl: '探优中' },
+    cruising: { cls: 'online', lbl: '稳态巡航' },
+    backoff: { cls: 'alarm', lbl: '拥塞退避' },
+    manual: { cls: '', lbl: '手动固定' },
+  };
+  const info = stateMap[n.adaptive_state] || (mode === 'manual' ? stateMap.manual : stateMap.cruising);
+  const concTxt = n.effective_concurrent > 0
+    ? `${n.effective_concurrent}/${n.max_concurrent_cap || n.effective_concurrent}`
+    : (n.max_concurrent_override > 0 ? `≤${n.max_concurrent_override}` : '自动');
+  const title = n.adaptive_reason ? ` title="${esc(n.adaptive_reason)}"` : '';
+  const rateVal = n.effective_rate_mbps > 0 ? n.effective_rate_mbps : (n.rate_limit_mbps || 0);
+  const rateBadge = rateVal > 0 ? `<span class="badge alarm">限速 ${Number(rateVal).toFixed(0)} MB/s</span>` : '';
+  return `
+    <div style="margin-top:5px;display:flex;gap:4px;flex-wrap:wrap;align-items:center">
+      <span class="badge ${info.cls}"${title}>${mode === 'manual' ? '手动并发' : '智能并发'} ${esc(concTxt)} · ${esc(info.lbl)}</span>
+      ${rateBadge}
+    </div>
+  `;
+}
+
+function renderProjectScope(projects, schedule, node) {
+  const adaptHtml = node ? renderAdaptiveBadge(node) : '';
   if (!projects || !projects.length) {
     return `
       <div style="display:flex;gap:4px;flex-wrap:wrap">
@@ -782,12 +814,14 @@ function renderProjectScope(projects, schedule) {
         <span class="badge">${esc(scheduleLabel(schedule))}</span>
       </div>
       <div class="muted" style="margin-top:3px">自动同步新建项目</div>
+      ${adaptHtml}
     `;
   }
   if (projects.length === 1) {
     return `
       <div><span class="badge online">单项目专享</span></div>
       <div class="mono muted" style="margin-top:3px">${esc(projects[0])}</div>
+      ${adaptHtml}
     `;
   }
   return `
@@ -796,6 +830,7 @@ function renderProjectScope(projects, schedule) {
       <span class="badge">${esc(scheduleLabel(schedule))}</span>
     </div>
     <div class="mono muted" style="margin-top:3px">${esc(projects.join(', '))}</div>
+    ${adaptHtml}
   `;
 }
 
@@ -907,7 +942,7 @@ function renderNodes(nodes, winHours) {
           </div>
           <div class="mono muted" style="margin-top:3px">${esc(verStr)}</div>
         </td>
-        <td>${renderProjectScope(n.projects, n.project_schedule)}</td>
+        <td>${renderProjectScope(n.projects, n.project_schedule, n)}</td>
         <td>${renderReceiverDisks(n)}</td>
         <td>
           <div>${fmtNum(n.window_completed)} 文件</div>
@@ -1280,6 +1315,18 @@ function openEditNodeProjectsModal(nodeId) {
   form.elements.name.value = node.name || node.id;
   form.elements.project_schedule.value = node.project_schedule || 'fifo';
   form.elements.disk_policy.value = node.disk_policy || 'affinity_hash';
+  form.elements.concurrency_mode.value = node.concurrency_mode || 'auto';
+  form.elements.max_concurrent_override.value = node.max_concurrent_override || 0;
+  form.elements.rate_limit_mbps.value = node.rate_limit_mbps || 0;
+  const liveBanner = document.getElementById('edit-adaptive-live-banner');
+  if (liveBanner) {
+    if (node.online && node.effective_concurrent > 0) {
+      liveBanner.textContent = `当前实时调度：并发 ${node.effective_concurrent} / ${node.max_concurrent_cap || node.effective_concurrent} · 并发流上限 ${node.effective_streams || '-'} · 状态：${node.adaptive_reason || node.adaptive_state || '运行中'}`;
+      liveBanner.classList.remove('hidden');
+    } else {
+      liveBanner.classList.add('hidden');
+    }
+  }
   document.getElementById('edit-node-title').textContent = `配置接收节点: ${node.name || node.id}`;
 
   const projs = node.projects || [];
@@ -1359,6 +1406,7 @@ function setupEvents() {
     if (!btn) return;
     const id = btn.dataset.id || '';
     switch (btn.dataset.action) {
+      case 'edit-project': openProjectModal(id); break;
       case 'delete-project': deleteProject(id); break;
       case 'delete-node': deleteNode(id); break;
       case 'delete-release': deleteRelease(id); break;
@@ -1438,10 +1486,31 @@ function setupEvents() {
     if (activeDeployTaskId) fetchDeployStatus(activeDeployTaskId);
   });
 
-  document.getElementById('open-create-project').addEventListener('click', () => {
-    document.getElementById('create-project-form').reset();
+  const openProjectModal = (projectId = '') => {
+    const form = document.getElementById('create-project-form');
+    form.reset();
+    const existing = projectId ? cachedProjects.find(ps => ps.project.id === projectId)?.project : null;
+    document.getElementById('project-modal-title').textContent = existing ? `编辑项目策略: ${existing.id}` : '新建项目';
+    form.elements.id.readOnly = !!existing;
+    if (existing) {
+      form.elements.id.value = existing.id;
+      form.elements.name.value = existing.name || existing.id;
+      form.elements.description.value = existing.description || '';
+      form.elements.conflict_policy.value = existing.conflict_policy || 'overwrite';
+      form.elements.lease_ttl_sec.value = existing.lease_ttl_sec || 300;
+      form.elements.group_affinity.checked = existing.group_affinity !== false;
+      form.elements.max_total_concurrent.value = existing.max_total_concurrent || 0;
+      form.elements.max_total_rate_mbps.value = existing.max_total_rate_mbps || 0;
+    } else {
+      form.elements.group_affinity.checked = true;
+      form.elements.max_total_concurrent.value = 0;
+      form.elements.max_total_rate_mbps.value = 0;
+    }
     openModal('project-modal');
-  });
+  };
+  window.openProjectModal = openProjectModal;
+
+  document.getElementById('open-create-project').addEventListener('click', () => openProjectModal(''));
 
   // Backdrop click & Escape key to close any open modal (except login overlay).
   document.querySelectorAll('.overlay').forEach(ov => {
@@ -1479,10 +1548,13 @@ function setupEvents() {
           description: fd.get('description'),
           conflict_policy: fd.get('conflict_policy'),
           lease_ttl_sec: Number(fd.get('lease_ttl_sec') || 300),
+          group_affinity: fd.get('group_affinity') === 'on',
+          max_total_concurrent: Number(fd.get('max_total_concurrent') || 0),
+          max_total_rate_mbps: Number(fd.get('max_total_rate_mbps') || 0),
         }),
       });
       closeModal('project-modal');
-      showToast(`项目 ${fd.get('id')} 已保存`, 'success');
+      showToast(`项目 ${fd.get('id')} 策略已保存`, 'success');
       refreshAll();
     } catch (err) {
       if (err.message !== 'unauthorized') showToast(`保存项目失败: ${err.message}`, 'error');
@@ -1628,6 +1700,9 @@ function setupEvents() {
       projects: projs,
       project_schedule: projectSchedule,
       disk_policy: diskPolicy,
+      concurrency_mode: String(fd.get('concurrency_mode') || 'auto'),
+      max_concurrent_override: Number(fd.get('max_concurrent_override') || 0),
+      rate_limit_mbps: Number(fd.get('rate_limit_mbps') || 0),
     };
     if (diskChks.length > 0) {
       const disabledDisks = diskChks.filter(el => !el.checked).map(el => el.value);

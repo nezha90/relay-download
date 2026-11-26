@@ -280,11 +280,11 @@
     </div>
   </div>
 
-  <!-- Create Project Modal -->
+  <!-- Create / Edit Project Modal -->
   <div id="project-modal" class="overlay hidden">
     <div class="modal-card">
       <div class="modal-head">
-        <h3>新建项目</h3>
+        <h3 id="project-modal-title">新建项目</h3>
         <button class="btn ghost" onclick="closeModal('project-modal')">关闭</button>
       </div>
       <form id="create-project-form" class="form-stack">
@@ -297,16 +297,34 @@
         <label>描述
           <input name="description" placeholder="可选描述" autocomplete="off" />
         </label>
-        <label>同名冲突策略
-          <select name="conflict_policy">
-            <option value="overwrite" selected>项目内部覆盖 (overwrite)</option>
-            <option value="auto_rename">自动重命名 (auto_rename)</option>
-            <option value="skip">跳过 (skip)</option>
-          </select>
-        </label>
-        <label>抢占租约超时 (秒)
-          <input name="lease_ttl_sec" type="number" value="300" min="10" max="3600" />
-        </label>
+        <div class="form-grid-2">
+          <label>同名冲突策略
+            <select name="conflict_policy">
+              <option value="overwrite" selected>项目内部覆盖 (overwrite)</option>
+              <option value="auto_rename">自动重命名 (auto_rename)</option>
+              <option value="skip">跳过 (skip)</option>
+            </select>
+          </label>
+          <label>抢占租约超时 (秒)
+            <input name="lease_ttl_sec" type="number" value="300" min="10" max="3600" />
+          </label>
+        </div>
+        <div class="config-section">
+          <div class="config-section-title">多机协同与全局配额</div>
+          <label class="toggle">
+            <input type="checkbox" name="group_affinity" checked />
+            <span>同源资产亲和 (多台接收机下载时，同一视频的音视频与 .info.json 强制落到同一台机器)</span>
+          </label>
+          <div class="form-grid-2">
+            <label>项目全局总并发上限 (0 = 不限)
+              <input name="max_total_concurrent" type="number" value="0" min="0" max="10000" />
+            </label>
+            <label>项目全局总限速 MB/s (0 = 不限)
+              <input name="max_total_rate_mbps" type="number" value="0" min="0" step="1" />
+            </label>
+          </div>
+          <div class="muted">设置全局上限后，中心会按在线接收节点数自动智能均分，节点增减 2 秒内自动重平衡</div>
+        </div>
         <button type="submit" class="btn primary full">保存项目</button>
       </form>
     </div>
@@ -449,6 +467,29 @@
           </div>
           <div id="edit-storage-pool-tip" class="banner warn hidden" style="margin-top:6px;margin-bottom:0">
             提示：该接收节点当前未配置通用磁盘池 (<code>storage_dirs</code>)，切换到未在本地 YAML 映射过的新项目可能无法自动建目录；建议升级至 v1.8.0 并配置 <code>storage_dirs</code> 实现彻底免 SSH 切换。
+          </div>
+        </div>
+
+        <div class="config-section">
+          <div class="config-section-title">3. 智能并发与动态带宽控制</div>
+          <div id="edit-adaptive-live-banner" class="banner pass hidden" style="margin-bottom:0"></div>
+          <div class="radio-row">
+            <label class="radio-opt">
+              <input type="radio" name="concurrency_mode" value="auto" checked />
+              <span>智能自适应 (推荐：BBR 梯度探优 + 拥塞/磁盘积压自动退避)</span>
+            </label>
+            <label class="radio-opt">
+              <input type="radio" name="concurrency_mode" value="manual" />
+              <span>手动固定并发</span>
+            </label>
+          </div>
+          <div class="form-grid-2">
+            <label>单机并发上限 (0 = 使用节点默认上限)
+              <input name="max_concurrent_override" type="number" value="0" min="0" max="1024" />
+            </label>
+            <label>单机动态限速 MB/s (0 = 不限速，热生效)
+              <input name="rate_limit_mbps" type="number" value="0" min="0" step="1" />
+            </label>
           </div>
         </div>
 

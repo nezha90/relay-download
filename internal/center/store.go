@@ -174,11 +174,17 @@ CREATE TABLE IF NOT EXISTS node_upgrades (
 	if _, err := db.Exec(schema); err != nil {
 		return err
 	}
-	// Idempotent schema migrations for pre-v1.8.0 databases.
+	// Idempotent schema migrations for pre-v1.9.0 databases.
 	migrations := []string{
 		`ALTER TABLE nodes ADD COLUMN project_schedule TEXT NOT NULL DEFAULT 'fifo'`,
 		`ALTER TABLE nodes ADD COLUMN disk_policy TEXT NOT NULL DEFAULT 'affinity_hash'`,
 		`ALTER TABLE nodes ADD COLUMN disabled_disks_json TEXT NOT NULL DEFAULT '[]'`,
+		`ALTER TABLE nodes ADD COLUMN concurrency_mode TEXT NOT NULL DEFAULT 'auto'`,
+		`ALTER TABLE nodes ADD COLUMN max_concurrent_override INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE nodes ADD COLUMN rate_limit_mbps REAL NOT NULL DEFAULT 0`,
+		`ALTER TABLE projects ADD COLUMN group_affinity INTEGER NOT NULL DEFAULT 1`,
+		`ALTER TABLE projects ADD COLUMN max_total_concurrent INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE projects ADD COLUMN max_total_rate_mbps REAL NOT NULL DEFAULT 0`,
 	}
 	for _, stmt := range migrations {
 		if _, err := db.Exec(stmt); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
@@ -251,36 +257,52 @@ func (s *Store) UpsertProject(ctx context.Context, p protocol.Project) error {
 	if p.CreatedAt.IsZero() {
 		p.CreatedAt = time.Now().UTC()
 	}
+	affInt := 1
+	if !p.GroupAffinityEnabled() {
+		affInt = 0
+	}
+	if p.MaxTotalConcurrent < 0 {
+		p.MaxTotalConcurrent = 0
+	}
+	if p.MaxTotalRateMBps < 0 {
+		p.MaxTotalRateMBps = 0
+	}
 	_, err := s.db.ExecContext(ctx, `
-INSERT INTO projects (id, name, description, conflict_policy, lease_ttl_sec, created_at)
-VALUES (?, ?, ?, ?, ?, ?)
+INSERT INTO projects (id, name, description, conflict_policy, lease_ttl_sec, group_affinity, max_total_concurrent, max_total_rate_mbps, created_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
 	name=excluded.name,
 	description=excluded.description,
 	conflict_policy=excluded.conflict_policy,
-	lease_ttl_sec=excluded.lease_ttl_sec
-`, p.ID, p.Name, p.Description, p.ConflictPolicy, p.LeaseTTLSec, p.CreatedAt)
+	lease_ttl_sec=excluded.lease_ttl_sec,
+	group_affinity=excluded.group_affinity,
+	max_total_concurrent=excluded.max_total_concurrent,
+	max_total_rate_mbps=excluded.max_total_rate_mbps
+`, p.ID, p.Name, p.Description, p.ConflictPolicy, p.LeaseTTLSec, affInt, p.MaxTotalConcurrent, p.MaxTotalRateMBps, p.CreatedAt)
 	return err
 }
 
 func (s *Store) GetProject(ctx context.Context, id string) (*protocol.Project, error) {
 	var p protocol.Project
+	var affInt int
 	err := s.db.QueryRowContext(ctx, `
-SELECT id, name, description, conflict_policy, lease_ttl_sec, created_at
+SELECT id, name, description, conflict_policy, lease_ttl_sec, group_affinity, max_total_concurrent, max_total_rate_mbps, created_at
 FROM projects WHERE id = ?
-`, id).Scan(&p.ID, &p.Name, &p.Description, &p.ConflictPolicy, &p.LeaseTTLSec, &p.CreatedAt)
+`, id).Scan(&p.ID, &p.Name, &p.Description, &p.ConflictPolicy, &p.LeaseTTLSec, &affInt, &p.MaxTotalConcurrent, &p.MaxTotalRateMBps, &p.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
 		return nil, err
 	}
+	aff := affInt != 0
+	p.GroupAffinity = &aff
 	return &p, nil
 }
 
 func (s *Store) ListProjects(ctx context.Context) ([]protocol.Project, error) {
 	rows, err := s.db.QueryContext(ctx, `
-SELECT id, name, description, conflict_policy, lease_ttl_sec, created_at
+SELECT id, name, description, conflict_policy, lease_ttl_sec, group_affinity, max_total_concurrent, max_total_rate_mbps, created_at
 FROM projects ORDER BY created_at ASC
 `)
 	if err != nil {
@@ -290,9 +312,12 @@ FROM projects ORDER BY created_at ASC
 	list := make([]protocol.Project, 0)
 	for rows.Next() {
 		var p protocol.Project
-		if err := rows.Scan(&p.ID, &p.Name, &p.Description, &p.ConflictPolicy, &p.LeaseTTLSec, &p.CreatedAt); err != nil {
+		var affInt int
+		if err := rows.Scan(&p.ID, &p.Name, &p.Description, &p.ConflictPolicy, &p.LeaseTTLSec, &affInt, &p.MaxTotalConcurrent, &p.MaxTotalRateMBps, &p.CreatedAt); err != nil {
 			return nil, err
 		}
+		aff := affInt != 0
+		p.GroupAffinity = &aff
 		list = append(list, p)
 	}
 	return list, rows.Err()
@@ -338,6 +363,17 @@ func normalizeDiskPolicy(v string) string {
 	}
 }
 
+func normalizeConcurrencyMode(v string) string {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case protocol.ConcurrencyManual:
+		return protocol.ConcurrencyManual
+	case protocol.ConcurrencyAuto, "":
+		return protocol.ConcurrencyAuto
+	default:
+		return ""
+	}
+}
+
 func (s *Store) UpsertNode(ctx context.Context, n protocol.NodeRecord, rawToken string) error {
 	if n.CreatedAt.IsZero() {
 		n.CreatedAt = time.Now().UTC()
@@ -352,6 +388,17 @@ func (s *Store) UpsertNode(ctx context.Context, n protocol.NodeRecord, rawToken 
 	} else {
 		n.DiskPolicy = protocol.DiskPolicyAffinityHash
 	}
+	if cm := normalizeConcurrencyMode(n.ConcurrencyMode); cm != "" {
+		n.ConcurrencyMode = cm
+	} else {
+		n.ConcurrencyMode = protocol.ConcurrencyAuto
+	}
+	if n.MaxConcurrentOverride < 0 {
+		n.MaxConcurrentOverride = 0
+	}
+	if n.RateLimitMBps < 0 {
+		n.RateLimitMBps = 0
+	}
 	projJSON, _ := json.Marshal(n.Projects)
 	if n.Projects == nil {
 		projJSON = []byte("[]")
@@ -362,8 +409,8 @@ func (s *Store) UpsertNode(ctx context.Context, n protocol.NodeRecord, rawToken 
 	}
 	tokHash := auth.HashToken(rawToken)
 	_, err := s.db.ExecContext(ctx, `
-INSERT INTO nodes (id, name, role, projects_json, project_schedule, disk_policy, disabled_disks_json, public_addr, token_hash, created_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO nodes (id, name, role, projects_json, project_schedule, disk_policy, disabled_disks_json, concurrency_mode, max_concurrent_override, rate_limit_mbps, public_addr, token_hash, created_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
 	name=excluded.name,
 	role=excluded.role,
@@ -371,9 +418,12 @@ ON CONFLICT(id) DO UPDATE SET
 	project_schedule=excluded.project_schedule,
 	disk_policy=excluded.disk_policy,
 	disabled_disks_json=excluded.disabled_disks_json,
+	concurrency_mode=excluded.concurrency_mode,
+	max_concurrent_override=excluded.max_concurrent_override,
+	rate_limit_mbps=excluded.rate_limit_mbps,
 	public_addr=excluded.public_addr,
 	token_hash=CASE WHEN ? != '' THEN excluded.token_hash ELSE nodes.token_hash END
-`, n.ID, n.Name, n.Role, string(projJSON), n.ProjectSchedule, n.DiskPolicy, string(disDisksJSON), n.PublicAddr, tokHash, n.CreatedAt, rawToken)
+`, n.ID, n.Name, n.Role, string(projJSON), n.ProjectSchedule, n.DiskPolicy, string(disDisksJSON), n.ConcurrencyMode, n.MaxConcurrentOverride, n.RateLimitMBps, n.PublicAddr, tokHash, n.CreatedAt, rawToken)
 	return err
 }
 
@@ -381,9 +431,9 @@ func (s *Store) AuthenticateNode(ctx context.Context, id, rawToken, expectedRole
 	var sn StoredNode
 	var projJSON, disDisksJSON string
 	err := s.db.QueryRowContext(ctx, `
-SELECT id, name, role, projects_json, project_schedule, disk_policy, disabled_disks_json, public_addr, token_hash, created_at
+SELECT id, name, role, projects_json, project_schedule, disk_policy, disabled_disks_json, concurrency_mode, max_concurrent_override, rate_limit_mbps, public_addr, token_hash, created_at
 FROM nodes WHERE id = ?
-`, id).Scan(&sn.ID, &sn.Name, &sn.Role, &projJSON, &sn.ProjectSchedule, &sn.DiskPolicy, &disDisksJSON, &sn.PublicAddr, &sn.TokenHash, &sn.CreatedAt)
+`, id).Scan(&sn.ID, &sn.Name, &sn.Role, &projJSON, &sn.ProjectSchedule, &sn.DiskPolicy, &disDisksJSON, &sn.ConcurrencyMode, &sn.MaxConcurrentOverride, &sn.RateLimitMBps, &sn.PublicAddr, &sn.TokenHash, &sn.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -404,12 +454,15 @@ FROM nodes WHERE id = ?
 	if sn.DiskPolicy == "" {
 		sn.DiskPolicy = protocol.DiskPolicyAffinityHash
 	}
+	if sn.ConcurrencyMode == "" {
+		sn.ConcurrencyMode = protocol.ConcurrencyAuto
+	}
 	return &sn, nil
 }
 
 func (s *Store) ListNodes(ctx context.Context) ([]protocol.NodeRecord, error) {
 	rows, err := s.db.QueryContext(ctx, `
-SELECT id, name, role, projects_json, project_schedule, disk_policy, disabled_disks_json, public_addr, created_at
+SELECT id, name, role, projects_json, project_schedule, disk_policy, disabled_disks_json, concurrency_mode, max_concurrent_override, rate_limit_mbps, public_addr, created_at
 FROM nodes ORDER BY role ASC, created_at ASC
 `)
 	if err != nil {
@@ -420,7 +473,7 @@ FROM nodes ORDER BY role ASC, created_at ASC
 	for rows.Next() {
 		var n protocol.NodeRecord
 		var projJSON, disDisksJSON string
-		if err := rows.Scan(&n.ID, &n.Name, &n.Role, &projJSON, &n.ProjectSchedule, &n.DiskPolicy, &disDisksJSON, &n.PublicAddr, &n.CreatedAt); err != nil {
+		if err := rows.Scan(&n.ID, &n.Name, &n.Role, &projJSON, &n.ProjectSchedule, &n.DiskPolicy, &disDisksJSON, &n.ConcurrencyMode, &n.MaxConcurrentOverride, &n.RateLimitMBps, &n.PublicAddr, &n.CreatedAt); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(projJSON), &n.Projects)
@@ -431,6 +484,9 @@ FROM nodes ORDER BY role ASC, created_at ASC
 		if n.DiskPolicy == "" {
 			n.DiskPolicy = protocol.DiskPolicyAffinityHash
 		}
+		if n.ConcurrencyMode == "" {
+			n.ConcurrencyMode = protocol.ConcurrencyAuto
+		}
 		list = append(list, n)
 	}
 	return list, rows.Err()
@@ -440,9 +496,9 @@ func (s *Store) GetNode(ctx context.Context, id string) (*protocol.NodeRecord, e
 	var n protocol.NodeRecord
 	var projJSON, disDisksJSON string
 	err := s.db.QueryRowContext(ctx, `
-SELECT id, name, role, projects_json, project_schedule, disk_policy, disabled_disks_json, public_addr, created_at
+SELECT id, name, role, projects_json, project_schedule, disk_policy, disabled_disks_json, concurrency_mode, max_concurrent_override, rate_limit_mbps, public_addr, created_at
 FROM nodes WHERE id = ?
-`, id).Scan(&n.ID, &n.Name, &n.Role, &projJSON, &n.ProjectSchedule, &n.DiskPolicy, &disDisksJSON, &n.PublicAddr, &n.CreatedAt)
+`, id).Scan(&n.ID, &n.Name, &n.Role, &projJSON, &n.ProjectSchedule, &n.DiskPolicy, &disDisksJSON, &n.ConcurrencyMode, &n.MaxConcurrentOverride, &n.RateLimitMBps, &n.PublicAddr, &n.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -456,6 +512,9 @@ FROM nodes WHERE id = ?
 	}
 	if n.DiskPolicy == "" {
 		n.DiskPolicy = protocol.DiskPolicyAffinityHash
+	}
+	if n.ConcurrencyMode == "" {
+		n.ConcurrencyMode = protocol.ConcurrencyAuto
 	}
 	return &n, nil
 }

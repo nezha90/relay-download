@@ -449,3 +449,107 @@ func TestAutoCreateProjectsAndReceiverDirectives(t *testing.T) {
 		t.Fatalf("unexpected LiveNodeView for nas-01: %+v", foundB)
 	}
 }
+
+func TestClusterQuotaFairShareAndActiveReceiversSync(t *testing.T) {
+	dir := t.TempDir()
+	caCert := filepath.Join(dir, "ca.crt")
+	caKey := filepath.Join(dir, "ca.key")
+	if err := pki.InitCA(caCert, caKey, "Test CA", 365); err != nil {
+		t.Fatalf("InitCA: %v", err)
+	}
+	srvCert := filepath.Join(dir, "center.crt")
+	srvKey := filepath.Join(dir, "center.key")
+	if err := pki.IssueCert(caCert, caKey, srvCert, srvKey, "center", []string{"127.0.0.1"}, nil, 365); err != nil {
+		t.Fatalf("IssueCert: %v", err)
+	}
+	srv, err := New(&Config{
+		Listen:       "127.0.0.1:0",
+		TLSCert:      srvCert,
+		TLSKey:       srvKey,
+		CACert:       caCert,
+		DBPath:       filepath.Join(dir, "center.db"),
+		ReleasesDir:  filepath.Join(dir, "releases"),
+		JWTSecret:    "jwt-secret",
+		CenterSecret: "center-secret",
+		AdminToken:   "adm-tok",
+	}, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer srv.Shutdown(context.Background())
+	h := srv.routes()
+
+	postAdmin := func(path, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+		req.Header.Set(protocol.HeaderAdminToken, "adm-tok")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("POST %s failed: %d %s", path, rec.Code, rec.Body.String())
+		}
+		return rec
+	}
+
+	// Create project with group_affinity=true, global max_total_concurrent=200, max_total_rate_mbps=100.
+	postAdmin("/api/v1/admin/projects", `{"id":"proj-big","name":"Big","group_affinity":true,"max_total_concurrent":200,"max_total_rate_mbps":100}`)
+
+	createTok := func(body string) string {
+		rec := postAdmin("/api/v1/admin/nodes", body)
+		var out struct {
+			Token string `json:"token"`
+		}
+		_ = json.Unmarshal(rec.Body.Bytes(), &out)
+		return out.Token
+	}
+
+	tokA := createTok(`{"id":"edge-01","role":"agent_a","public_addr":"https://10.0.0.1:8443","projects":[]}`)
+	tokB1 := createTok(`{"id":"nas-01","role":"agent_b","projects":["proj-big"]}`)
+	tokB2 := createTok(`{"id":"nas-02","role":"agent_b","projects":["proj-big"]}`)
+
+	// 1. Both receivers heartbeat -> each should receive fair-share 50 MB/s and max_concurrent=100!
+	hbB := func(id, tok string) protocol.HeartbeatResp {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/b/heartbeat", strings.NewReader(`{"node_id":"`+id+`","projects":["proj-big"],"effective_concurrent":60,"max_concurrent_cap":100,"adaptive_state":"cruising"}`))
+		req.Header.Set(protocol.HeaderNodeID, id)
+		req.Header.Set(protocol.HeaderNodeToken, tok)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("b heartbeat %s: %d %s", id, rec.Code, rec.Body.String())
+		}
+		var out protocol.HeartbeatResp
+		_ = json.Unmarshal(rec.Body.Bytes(), &out)
+		return out
+	}
+
+	// Dispatch heartbeat reports 1000 max_concurrent_streams.
+	aReq := httptest.NewRequest(http.MethodPost, "/api/v1/a/heartbeat", strings.NewReader(`{"node_id":"edge-01","public_addr":"https://10.0.0.1:8443","max_concurrent_streams":1000}`))
+	aReq.Header.Set(protocol.HeaderNodeID, "edge-01")
+	aReq.Header.Set(protocol.HeaderNodeToken, tokA)
+	aRec := httptest.NewRecorder()
+	h.ServeHTTP(aRec, aReq)
+
+	// First receiver online alone -> gets full 200 concurrent / 100 MB/s!
+	r1Solo := hbB("nas-01", tokB1)
+	if r1Solo.Directive.MaxConcurrent != 200 || r1Solo.Directive.RateLimitMBps != 100 {
+		t.Fatalf("solo receiver expected 200/100MBps, got %+v", r1Solo.Directive)
+	}
+
+	// Second receiver joins -> both split evenly to 100 concurrent / 50 MB/s + suggested stream cap = 625!
+	r2 := hbB("nas-02", tokB2)
+	if r2.Directive.MaxConcurrent != 100 || r2.Directive.RateLimitMBps != 50 || r2.Directive.SuggestedStreamCap != 625 {
+		t.Fatalf("2-node fair share expected 100 / 50MBps / 625 streams, got %+v", r2.Directive)
+	}
+
+	// Dispatch node heartbeat now receives sorted active_receivers={"proj-big":["nas-01","nas-02"]} and project_affinity={"proj-big":true}!
+	aReq2 := httptest.NewRequest(http.MethodPost, "/api/v1/a/heartbeat", strings.NewReader(`{"node_id":"edge-01","public_addr":"https://10.0.0.1:8443","max_concurrent_streams":1000}`))
+	aReq2.Header.Set(protocol.HeaderNodeID, "edge-01")
+	aReq2.Header.Set(protocol.HeaderNodeToken, tokA)
+	aRec2 := httptest.NewRecorder()
+	h.ServeHTTP(aRec2, aReq2)
+	var aResp protocol.HeartbeatResp
+	_ = json.Unmarshal(aRec2.Body.Bytes(), &aResp)
+	revs := aResp.ActiveReceivers["proj-big"]
+	if len(revs) != 2 || revs[0] != "nas-01" || revs[1] != "nas-02" || !aResp.ProjectAffinity["proj-big"] {
+		t.Fatalf("unexpected Agent A HRW routing response: active=%+v affinity=%+v", aResp.ActiveReceivers, aResp.ProjectAffinity)
+	}
+}

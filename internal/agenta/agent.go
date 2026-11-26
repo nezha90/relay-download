@@ -1702,9 +1702,10 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 		DiskTotalBytes:   total,
 		DiskFreeBytes:    free,
 		DiskUsedPct:      pct,
-		DiskAlarm:        alarm,
-		ActiveStreams:    int(a.activeStreams.Load()),
-		Availability:     avail,
+		DiskAlarm:            alarm,
+		ActiveStreams:        int(a.activeStreams.Load()),
+		MaxConcurrentStreams: a.cfg.MaxConcurrentStreams,
+		Availability:         avail,
 	}
 	body, _ := json.Marshal(payload)
 	url := strings.TrimRight(a.cfg.CenterURL, "/") + "/api/v1/a/heartbeat"
@@ -1727,8 +1728,13 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 		return
 	}
 	var hbResp protocol.HeartbeatResp
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 64*1024)).Decode(&hbResp); err == nil && hbResp.Upgrade != nil && a.updater != nil {
-		a.updater.HandleDirective(ctx, hbResp.Upgrade)
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 256*1024)).Decode(&hbResp); err == nil {
+		if hbResp.ActiveReceivers != nil || hbResp.ProjectAffinity != nil {
+			a.store.SetRoutingState(hbResp.ActiveReceivers, hbResp.ProjectAffinity)
+		}
+		if hbResp.Upgrade != nil && a.updater != nil {
+			a.updater.HandleDirective(ctx, hbResp.Upgrade)
+		}
 	}
 }
 

@@ -52,6 +52,11 @@ const (
 	DiskPolicyFirst        = "first"         // fill first enabled disk in order before spilling to next
 )
 
+const (
+	ConcurrencyAuto   = "auto"   // intelligent adaptive concurrency (gradient throughput probing + AIMD backpressure)
+	ConcurrencyManual = "manual" // fixed concurrency ceiling
+)
+
 type DiskStatus struct {
 	Path       string  `json:"path"`
 	TotalBytes uint64  `json:"total_bytes"`
@@ -63,33 +68,50 @@ type DiskStatus struct {
 }
 
 type ReceiverDirective struct {
-	ProjectMode     string   `json:"project_mode,omitempty"`     // "all" | "selected"
-	AllowedProjects []string `json:"allowed_projects,omitempty"` // explicit ordered allowlist when project_mode=="selected"
-	KnownProjects   []string `json:"known_projects,omitempty"`   // all projects ordered by created_at ASC
-	ProjectSchedule string   `json:"project_schedule,omitempty"` // "fifo" | "fair" | "random"
-	DiskPolicy      string   `json:"disk_policy,omitempty"`      // "affinity_hash" | "most_free" | "round_robin" | "first"
-	DisabledDisks   []string `json:"disabled_disks,omitempty"`   // storage root dirs disabled via console
+	ProjectMode        string   `json:"project_mode,omitempty"`         // "all" | "selected"
+	AllowedProjects    []string `json:"allowed_projects,omitempty"`     // explicit ordered allowlist when project_mode=="selected"
+	KnownProjects      []string `json:"known_projects,omitempty"`       // all projects ordered by created_at ASC
+	ProjectSchedule    string   `json:"project_schedule,omitempty"`     // "fifo" | "fair" | "random"
+	DiskPolicy         string   `json:"disk_policy,omitempty"`          // "affinity_hash" | "most_free" | "round_robin" | "first"
+	DisabledDisks      []string `json:"disabled_disks,omitempty"`       // storage root dirs disabled via console
+	ConcurrencyMode    string   `json:"concurrency_mode,omitempty"`     // "auto" | "manual"
+	MaxConcurrent      int      `json:"max_concurrent,omitempty"`       // >0 overrides effective upper concurrency cap
+	SuggestedStreamCap int      `json:"suggested_stream_cap,omitempty"` // >0 cluster-wide fair-share stream ceiling from dispatch capacity
+	RateLimitMBps      float64  `json:"rate_limit_mbps,omitempty"`      // >0 hot rate cap in MB/s (0 = unlimited)
 }
 
 type Project struct {
-	ID             string    `json:"id"`
-	Name           string    `json:"name"`
-	Description    string    `json:"description"`
-	ConflictPolicy string    `json:"conflict_policy"`
-	LeaseTTLSec    int       `json:"lease_ttl_sec"`
-	CreatedAt      time.Time `json:"created_at"`
+	ID                 string    `json:"id"`
+	Name               string    `json:"name"`
+	Description        string    `json:"description"`
+	ConflictPolicy     string    `json:"conflict_policy"`
+	LeaseTTLSec        int       `json:"lease_ttl_sec"`
+	GroupAffinity      *bool     `json:"group_affinity,omitempty"`       // default true: route paired files (<video_id>.*) to same receiver
+	MaxTotalConcurrent int       `json:"max_total_concurrent,omitempty"` // optional cluster-wide concurrency cap across all receivers (0 = unlimited)
+	MaxTotalRateMBps   float64   `json:"max_total_rate_mbps,omitempty"`  // optional cluster-wide bandwidth cap in MB/s across all receivers (0 = unlimited)
+	CreatedAt          time.Time `json:"created_at"`
+}
+
+func (p Project) GroupAffinityEnabled() bool {
+	if p.GroupAffinity == nil {
+		return true
+	}
+	return *p.GroupAffinity
 }
 
 type NodeRecord struct {
-	ID              string    `json:"id"`
-	Name            string    `json:"name"`
-	Role            string    `json:"role"`
-	Projects        []string  `json:"projects"`
-	ProjectSchedule string    `json:"project_schedule,omitempty"`
-	DiskPolicy      string    `json:"disk_policy,omitempty"`
-	DisabledDisks   []string  `json:"disabled_disks,omitempty"`
-	PublicAddr      string    `json:"public_addr,omitempty"`
-	CreatedAt       time.Time `json:"created_at"`
+	ID                    string    `json:"id"`
+	Name                  string    `json:"name"`
+	Role                  string    `json:"role"`
+	Projects              []string  `json:"projects"`
+	ProjectSchedule       string    `json:"project_schedule,omitempty"`
+	DiskPolicy            string    `json:"disk_policy,omitempty"`
+	DisabledDisks         []string  `json:"disabled_disks,omitempty"`
+	ConcurrencyMode       string    `json:"concurrency_mode,omitempty"`
+	MaxConcurrentOverride int       `json:"max_concurrent_override,omitempty"`
+	RateLimitMBps         float64   `json:"rate_limit_mbps,omitempty"`
+	PublicAddr            string    `json:"public_addr,omitempty"`
+	CreatedAt             time.Time `json:"created_at"`
 }
 
 type ProjectAvailability struct {
@@ -113,9 +135,10 @@ type AgentAHeartbeatReq struct {
 	DiskTotalBytes   uint64                `json:"disk_total_bytes"`
 	DiskFreeBytes    uint64                `json:"disk_free_bytes"`
 	DiskUsedPct      float64               `json:"disk_used_pct"`
-	DiskAlarm        bool                  `json:"disk_alarm"`
-	ActiveStreams    int                   `json:"active_streams,omitempty"`
-	Availability     []ProjectAvailability `json:"availability"`
+	DiskAlarm            bool                  `json:"disk_alarm"`
+	ActiveStreams        int                   `json:"active_streams,omitempty"`
+	MaxConcurrentStreams int                   `json:"max_concurrent_streams,omitempty"`
+	Availability         []ProjectAvailability `json:"availability"`
 }
 
 type SummaryEvent struct {
@@ -141,6 +164,13 @@ type AgentBHeartbeatReq struct {
 	Disks                 []DiskStatus      `json:"disks,omitempty"`
 	ProjectSchedule       string            `json:"project_schedule,omitempty"`
 	DiskPolicy            string            `json:"disk_policy,omitempty"`
+	ConcurrencyMode       string            `json:"concurrency_mode,omitempty"`
+	EffectiveConcurrent   int               `json:"effective_concurrent,omitempty"`
+	MaxConcurrentCap      int               `json:"max_concurrent_cap,omitempty"`
+	EffectiveStreams      int               `json:"effective_streams,omitempty"`
+	EffectiveRateMBps     float64           `json:"effective_rate_mbps,omitempty"`
+	AdaptiveState         string            `json:"adaptive_state,omitempty"`
+	AdaptiveReason        string            `json:"adaptive_reason,omitempty"`
 	Version               string            `json:"version,omitempty"`
 	OS                    string            `json:"os,omitempty"`
 	Arch                  string            `json:"arch,omitempty"`
@@ -163,9 +193,11 @@ type UpgradeDirective struct {
 }
 
 type HeartbeatResp struct {
-	Upgrade         *UpgradeDirective  `json:"upgrade,omitempty"`
-	AllowedProjects []string           `json:"allowed_projects,omitempty"`
-	Directive       *ReceiverDirective `json:"directive,omitempty"`
+	Upgrade         *UpgradeDirective   `json:"upgrade,omitempty"`
+	AllowedProjects []string            `json:"allowed_projects,omitempty"`
+	Directive       *ReceiverDirective  `json:"directive,omitempty"`
+	ActiveReceivers map[string][]string `json:"active_receivers,omitempty"` // for agent_a: project_id -> sorted online receiver IDs
+	ProjectAffinity map[string]bool     `json:"project_affinity,omitempty"` // for agent_a: project_id -> enable asset-group affinity (default true)
 }
 
 type DiscoverCandidate struct {
@@ -398,17 +430,26 @@ type ANodeAvailSummary struct {
 }
 
 type LiveNodeView struct {
-	ID                string                `json:"id"`
-	Name              string                `json:"name"`
-	Role              string                `json:"role"`
-	Projects          []string              `json:"projects"`
-	ProjectSchedule   string                `json:"project_schedule,omitempty"`
-	DiskPolicy        string                `json:"disk_policy,omitempty"`
-	DisabledDisks     []string              `json:"disabled_disks,omitempty"`
-	StorageDirs       []string              `json:"storage_dirs,omitempty"`
-	Disks             []DiskStatus          `json:"disks,omitempty"`
-	PublicAddr        string                `json:"public_addr,omitempty"`
-	Online            bool                  `json:"online"`
+	ID                    string                `json:"id"`
+	Name                  string                `json:"name"`
+	Role                  string                `json:"role"`
+	Projects              []string              `json:"projects"`
+	ProjectSchedule       string                `json:"project_schedule,omitempty"`
+	DiskPolicy            string                `json:"disk_policy,omitempty"`
+	DisabledDisks         []string              `json:"disabled_disks,omitempty"`
+	ConcurrencyMode       string                `json:"concurrency_mode,omitempty"`
+	MaxConcurrentOverride int                   `json:"max_concurrent_override,omitempty"`
+	RateLimitMBps         float64               `json:"rate_limit_mbps,omitempty"`
+	EffectiveConcurrent   int                   `json:"effective_concurrent,omitempty"`
+	MaxConcurrentCap      int                   `json:"max_concurrent_cap,omitempty"`
+	EffectiveStreams      int                   `json:"effective_streams,omitempty"`
+	EffectiveRateMBps     float64               `json:"effective_rate_mbps,omitempty"`
+	AdaptiveState         string                `json:"adaptive_state,omitempty"`
+	AdaptiveReason        string                `json:"adaptive_reason,omitempty"`
+	StorageDirs           []string              `json:"storage_dirs,omitempty"`
+	Disks                 []DiskStatus          `json:"disks,omitempty"`
+	PublicAddr            string                `json:"public_addr,omitempty"`
+	Online                bool                  `json:"online"`
 	Version           string                `json:"version,omitempty"`
 	OS                string                `json:"os,omitempty"`
 	Arch              string                `json:"arch,omitempty"`

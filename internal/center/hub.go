@@ -11,37 +11,46 @@ import (
 )
 
 type LiveAState struct {
-	NodeID         string
-	Name           string
-	PublicAddr     string
-	Projects       []string
-	Version        string
-	OS             string
-	Arch           string
-	DiskTotalBytes uint64
-	DiskFreeBytes  uint64
-	DiskUsedPct    float64
-	DiskAlarm      bool
-	Availability   map[string]protocol.ProjectAvailability // project_id -> availability
-	LastSeen       time.Time
+	NodeID               string
+	Name                 string
+	PublicAddr           string
+	Projects             []string
+	Version              string
+	OS                   string
+	Arch                 string
+	DiskTotalBytes       uint64
+	DiskFreeBytes        uint64
+	DiskUsedPct          float64
+	DiskAlarm            bool
+	ActiveStreams        int
+	MaxConcurrentStreams int
+	Availability         map[string]protocol.ProjectAvailability // project_id -> availability
+	LastSeen             time.Time
 }
 
 type LiveBState struct {
-	NodeID          string
-	Name            string
-	Projects        []string
-	StorageDirs     []string
-	Disks           []protocol.DiskStatus
-	ProjectSchedule string
-	DiskPolicy      string
-	Version         string
-	OS              string
-	Arch            string
-	DiskTotalBytes  uint64
-	DiskFreeBytes   uint64
-	DiskUsedPct     float64
-	ActiveCount     int
-	LastSeen        time.Time
+	NodeID              string
+	Name                string
+	Projects            []string
+	StorageDirs         []string
+	Disks               []protocol.DiskStatus
+	ProjectSchedule     string
+	DiskPolicy          string
+	ConcurrencyMode     string
+	EffectiveConcurrent int
+	MaxConcurrentCap    int
+	EffectiveStreams    int
+	EffectiveRateMBps   float64
+	AdaptiveState       string
+	AdaptiveReason      string
+	Version             string
+	OS                  string
+	Arch                string
+	DiskTotalBytes      uint64
+	DiskFreeBytes       uint64
+	DiskUsedPct         float64
+	ActiveCount         int
+	LastSeen            time.Time
 }
 
 type bSub struct {
@@ -82,19 +91,21 @@ func (h *Hub) UpdateA(hb protocol.AgentAHeartbeatReq) {
 		}
 	}
 	h.aNodes[hb.NodeID] = &LiveAState{
-		NodeID:         hb.NodeID,
-		Name:           hb.Name,
-		PublicAddr:     hb.PublicAddr,
-		Projects:       append([]string(nil), hb.Projects...),
-		Version:        hb.Version,
-		OS:             hb.OS,
-		Arch:           hb.Arch,
-		DiskTotalBytes: hb.DiskTotalBytes,
-		DiskFreeBytes:  hb.DiskFreeBytes,
-		DiskUsedPct:    hb.DiskUsedPct,
-		DiskAlarm:      hb.DiskAlarm,
-		Availability:   availMap,
-		LastSeen:       now,
+		NodeID:               hb.NodeID,
+		Name:                 hb.Name,
+		PublicAddr:           hb.PublicAddr,
+		Projects:             append([]string(nil), hb.Projects...),
+		Version:              hb.Version,
+		OS:                   hb.OS,
+		Arch:                 hb.Arch,
+		DiskTotalBytes:       hb.DiskTotalBytes,
+		DiskFreeBytes:        hb.DiskFreeBytes,
+		DiskUsedPct:          hb.DiskUsedPct,
+		DiskAlarm:            hb.DiskAlarm,
+		ActiveStreams:        hb.ActiveStreams,
+		MaxConcurrentStreams: hb.MaxConcurrentStreams,
+		Availability:         availMap,
+		LastSeen:             now,
 	}
 	h.mu.Unlock()
 
@@ -111,21 +122,28 @@ func (h *Hub) UpdateB(hb protocol.AgentBHeartbeatReq) {
 	}
 	h.mu.Lock()
 	h.bNodes[hb.NodeID] = &LiveBState{
-		NodeID:          hb.NodeID,
-		Name:            hb.Name,
-		Projects:        append([]string(nil), hb.Projects...),
-		StorageDirs:     append([]string(nil), hb.StorageDirs...),
-		Disks:           append([]protocol.DiskStatus(nil), hb.Disks...),
-		ProjectSchedule: hb.ProjectSchedule,
-		DiskPolicy:      hb.DiskPolicy,
-		Version:         hb.Version,
-		OS:              hb.OS,
-		Arch:            hb.Arch,
-		DiskTotalBytes:  hb.DiskTotalBytes,
-		DiskFreeBytes:   hb.DiskFreeBytes,
-		DiskUsedPct:     hb.DiskUsedPct,
-		ActiveCount:     activeCnt,
-		LastSeen:        now,
+		NodeID:              hb.NodeID,
+		Name:                hb.Name,
+		Projects:            append([]string(nil), hb.Projects...),
+		StorageDirs:         append([]string(nil), hb.StorageDirs...),
+		Disks:               append([]protocol.DiskStatus(nil), hb.Disks...),
+		ProjectSchedule:     hb.ProjectSchedule,
+		DiskPolicy:          hb.DiskPolicy,
+		ConcurrencyMode:     hb.ConcurrencyMode,
+		EffectiveConcurrent: hb.EffectiveConcurrent,
+		MaxConcurrentCap:    hb.MaxConcurrentCap,
+		EffectiveStreams:    hb.EffectiveStreams,
+		EffectiveRateMBps:   hb.EffectiveRateMBps,
+		AdaptiveState:       hb.AdaptiveState,
+		AdaptiveReason:      hb.AdaptiveReason,
+		Version:             hb.Version,
+		OS:                  hb.OS,
+		Arch:                hb.Arch,
+		DiskTotalBytes:      hb.DiskTotalBytes,
+		DiskFreeBytes:       hb.DiskFreeBytes,
+		DiskUsedPct:         hb.DiskUsedPct,
+		ActiveCount:         activeCnt,
+		LastSeen:            now,
 	}
 	h.mu.Unlock()
 }
@@ -329,4 +347,133 @@ func (h *Hub) Snapshot() (map[string]*LiveAState, map[string]*LiveBState) {
 		bOut[k] = &cp
 	}
 	return aOut, bOut
+}
+
+// ActiveReceiversByProject builds the deterministic sorted list of online receiver node IDs
+// eligible for each project so all dispatch nodes compute the exact same HRW asset-group owner.
+func (h *Hub) ActiveReceiversByProject(projectIDs []string, dbNodes []protocol.NodeRecord) map[string][]string {
+	nodePolicy := make(map[string][]string, len(dbNodes))
+	for _, n := range dbNodes {
+		if n.Role == protocol.RoleAgentB {
+			nodePolicy[n.ID] = n.Projects
+		}
+	}
+
+	h.mu.RLock()
+	onlineB := make([]*LiveBState, 0, len(h.bNodes))
+	for _, st := range h.bNodes {
+		if h.IsOnline(st.LastSeen) {
+			onlineB = append(onlineB, st)
+		}
+	}
+	h.mu.RUnlock()
+
+	res := make(map[string][]string, len(projectIDs))
+	for _, pid := range projectIDs {
+		var ids []string
+		for _, bSt := range onlineB {
+			dbProjs, known := nodePolicy[bSt.NodeID]
+			if known && !nodeAllowsProject(dbProjs, pid) {
+				continue
+			}
+			if !nodeAllowsProject(bSt.Projects, pid) {
+				continue
+			}
+			ids = append(ids, bSt.NodeID)
+		}
+		if len(ids) > 0 {
+			sort.Strings(ids)
+			res[pid] = ids
+		}
+	}
+	return res
+}
+
+// ComputeClusterQuotas calculates smart per-receiver concurrency, stream, and rate ceilings
+// based on node overrides, project-wide cluster limits, and online dispatch-node stream capacity.
+func (h *Hub) ComputeClusterQuotas(node *StoredNode, projects []protocol.Project, dbNodes []protocol.NodeRecord) (maxConc int, suggestedStreamCap int, rateLimitMBps float64) {
+	maxConc = node.MaxConcurrentOverride
+	rateLimitMBps = node.RateLimitMBps
+
+	nodePolicy := make(map[string][]string, len(dbNodes))
+	for _, n := range dbNodes {
+		if n.Role == protocol.RoleAgentB {
+			nodePolicy[n.ID] = n.Projects
+		}
+	}
+
+	h.mu.RLock()
+	var totalDispatchStreams int
+	for _, aSt := range h.aNodes {
+		if h.IsOnline(aSt.LastSeen) && aSt.MaxConcurrentStreams > 0 {
+			totalDispatchStreams += aSt.MaxConcurrentStreams
+		}
+	}
+	onlineB := make([]*LiveBState, 0, len(h.bNodes))
+	for _, bSt := range h.bNodes {
+		if h.IsOnline(bSt.LastSeen) {
+			onlineB = append(onlineB, bSt)
+		}
+	}
+	h.mu.RUnlock()
+
+	// Cluster-wide dispatch stream protection when multiple receivers share the same source pool.
+	if totalDispatchStreams > 0 {
+		if len(onlineB) <= 1 {
+			suggestedStreamCap = totalDispatchStreams
+		} else {
+			// Fair share + 25% work-conserving headroom so active nodes absorb idle peer slack.
+			share := int(float64(totalDispatchStreams)*1.25/float64(len(onlineB)) + 0.5)
+			if share < 16 {
+				share = 16
+			}
+			suggestedStreamCap = share
+		}
+	}
+
+	// Project-level global concurrency & bandwidth quotas evenly divided across online peers.
+	for _, proj := range projects {
+		if !nodeAllowsProject(node.Projects, proj.ID) {
+			continue
+		}
+		if proj.MaxTotalConcurrent <= 0 && proj.MaxTotalRateMBps <= 0 {
+			continue
+		}
+		peers := 0
+		selfCounted := false
+		for _, bSt := range onlineB {
+			if dbP, ok := nodePolicy[bSt.NodeID]; ok && !nodeAllowsProject(dbP, proj.ID) {
+				continue
+			}
+			if !nodeAllowsProject(bSt.Projects, proj.ID) {
+				continue
+			}
+			peers++
+			if bSt.NodeID == node.ID {
+				selfCounted = true
+			}
+		}
+		if !selfCounted {
+			peers++
+		}
+		if peers < 1 {
+			peers = 1
+		}
+		if proj.MaxTotalConcurrent > 0 {
+			share := (proj.MaxTotalConcurrent + peers - 1) / peers
+			if share < 1 {
+				share = 1
+			}
+			if maxConc == 0 || share < maxConc {
+				maxConc = share
+			}
+		}
+		if proj.MaxTotalRateMBps > 0 {
+			share := proj.MaxTotalRateMBps / float64(peers)
+			if rateLimitMBps == 0 || share < rateLimitMBps {
+				rateLimitMBps = share
+			}
+		}
+	}
+	return maxConc, suggestedStreamCap, rateLimitMBps
 }

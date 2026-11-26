@@ -345,6 +345,18 @@ func (s *Server) handleAHeartbeat(w http.ResponseWriter, r *http.Request, node *
 	}
 	s.hub.UpdateA(req)
 	hbResp := s.processNodeHeartbeatUpgrade(r.Context(), node.ID, req.Version, req.UpgradeAttemptID, req.UpgradeStatus, req.UpgradeError)
+	if projs, err := s.store.ListProjects(r.Context()); err == nil && len(projs) > 0 {
+		projIDs := make([]string, 0, len(projs))
+		affMap := make(map[string]bool, len(projs))
+		for _, p := range projs {
+			projIDs = append(projIDs, p.ID)
+			affMap[p.ID] = p.GroupAffinityEnabled()
+		}
+		if dbNodes, nErr := s.store.ListNodes(r.Context()); nErr == nil {
+			hbResp.ActiveReceivers = s.hub.ActiveReceiversByProject(projIDs, dbNodes)
+		}
+		hbResp.ProjectAffinity = affMap
+	}
 	protocol.WriteJSON(w, http.StatusOK, hbResp)
 }
 
@@ -397,13 +409,24 @@ func (s *Server) handleBHeartbeat(w http.ResponseWriter, r *http.Request, node *
 	s.hub.UpdateB(req)
 	hbResp := s.processNodeHeartbeatUpgrade(r.Context(), node.ID, req.Version, req.UpgradeAttemptID, req.UpgradeStatus, req.UpgradeError)
 
-	knownIDs, _ := s.store.ListProjectIDs(r.Context())
+	projs, _ := s.store.ListProjects(r.Context())
+	knownIDs := make([]string, 0, len(projs))
+	for _, p := range projs {
+		knownIDs = append(knownIDs, p.ID)
+	}
+	dbNodes, _ := s.store.ListNodes(r.Context())
+	maxConc, suggestedStreamCap, rateLimitMBps := s.hub.ComputeClusterQuotas(node, projs, dbNodes)
+
 	dir := &protocol.ReceiverDirective{
-		ProjectMode:     "all",
-		KnownProjects:   knownIDs,
-		ProjectSchedule: node.ProjectSchedule,
-		DiskPolicy:      node.DiskPolicy,
-		DisabledDisks:   append([]string(nil), node.DisabledDisks...),
+		ProjectMode:        "all",
+		KnownProjects:      knownIDs,
+		ProjectSchedule:    node.ProjectSchedule,
+		DiskPolicy:         node.DiskPolicy,
+		DisabledDisks:      append([]string(nil), node.DisabledDisks...),
+		ConcurrencyMode:    node.ConcurrencyMode,
+		MaxConcurrent:      maxConc,
+		SuggestedStreamCap: suggestedStreamCap,
+		RateLimitMBps:      rateLimitMBps,
 	}
 	if len(node.Projects) > 0 {
 		dir.ProjectMode = "selected"
@@ -765,6 +788,14 @@ func (s *Server) handleAdminUpsertProject(w http.ResponseWriter, r *http.Request
 		protocol.WriteError(w, http.StatusBadRequest, "lease_ttl_sec must be <= 3600")
 		return
 	}
+	if p.MaxTotalConcurrent < 0 || p.MaxTotalConcurrent > 10000 {
+		protocol.WriteError(w, http.StatusBadRequest, "max_total_concurrent must be between 0 and 10000")
+		return
+	}
+	if p.MaxTotalRateMBps < 0 {
+		protocol.WriteError(w, http.StatusBadRequest, "max_total_rate_mbps must be >= 0")
+		return
+	}
 	p.CreatedAt = time.Now().UTC()
 	if err := s.store.UpsertProject(r.Context(), p); err != nil {
 		protocol.WriteError(w, http.StatusInternalServerError, err.Error())
@@ -814,15 +845,18 @@ func (s *Server) handleAdminListNodes(w http.ResponseWriter, r *http.Request) {
 	views := make([]protocol.LiveNodeView, 0, len(nodes))
 	for _, n := range nodes {
 		v := protocol.LiveNodeView{
-			ID:              n.ID,
-			Name:            n.Name,
-			Role:            n.Role,
-			Projects:        n.Projects,
-			ProjectSchedule: n.ProjectSchedule,
-			DiskPolicy:      n.DiskPolicy,
-			DisabledDisks:   n.DisabledDisks,
-			PublicAddr:      n.PublicAddr,
-			WindowHours:     hours,
+			ID:                    n.ID,
+			Name:                  n.Name,
+			Role:                  n.Role,
+			Projects:              n.Projects,
+			ProjectSchedule:       n.ProjectSchedule,
+			DiskPolicy:            n.DiskPolicy,
+			DisabledDisks:         n.DisabledDisks,
+			ConcurrencyMode:       n.ConcurrencyMode,
+			MaxConcurrentOverride: n.MaxConcurrentOverride,
+			RateLimitMBps:         n.RateLimitMBps,
+			PublicAddr:            n.PublicAddr,
+			WindowHours:           hours,
 		}
 		if upg, ok := upgrades[n.ID]; ok {
 			v.TargetVersion = upg.TargetVersion
@@ -875,6 +909,12 @@ func (s *Server) handleAdminListNodes(w http.ResponseWriter, r *http.Request) {
 				v.Arch = st.Arch
 				v.StorageDirs = st.StorageDirs
 				v.Disks = st.Disks
+				v.EffectiveConcurrent = st.EffectiveConcurrent
+				v.MaxConcurrentCap = st.MaxConcurrentCap
+				v.EffectiveStreams = st.EffectiveStreams
+				v.EffectiveRateMBps = st.EffectiveRateMBps
+				v.AdaptiveState = st.AdaptiveState
+				v.AdaptiveReason = st.AdaptiveReason
 				v.DiskTotalBytes = st.DiskTotalBytes
 				v.DiskFreeBytes = st.DiskFreeBytes
 				v.DiskUsedPct = st.DiskUsedPct
@@ -886,15 +926,18 @@ func (s *Server) handleAdminListNodes(w http.ResponseWriter, r *http.Request) {
 }
 
 type createNodeReq struct {
-	ID              string   `json:"id"`
-	Name            string   `json:"name"`
-	Role            string   `json:"role"`
-	Projects        []string `json:"projects"`
-	ProjectSchedule string   `json:"project_schedule,omitempty"`
-	DiskPolicy      string   `json:"disk_policy,omitempty"`
-	DisabledDisks   []string `json:"disabled_disks,omitempty"`
-	PublicAddr      string   `json:"public_addr"`
-	Token           string   `json:"token,omitempty"`
+	ID                    string   `json:"id"`
+	Name                  string   `json:"name"`
+	Role                  string   `json:"role"`
+	Projects              []string `json:"projects"`
+	ProjectSchedule       string   `json:"project_schedule,omitempty"`
+	DiskPolicy            string   `json:"disk_policy,omitempty"`
+	DisabledDisks         []string `json:"disabled_disks,omitempty"`
+	ConcurrencyMode       string   `json:"concurrency_mode,omitempty"`
+	MaxConcurrentOverride int      `json:"max_concurrent_override,omitempty"`
+	RateLimitMBps         float64  `json:"rate_limit_mbps,omitempty"`
+	PublicAddr            string   `json:"public_addr"`
+	Token                 string   `json:"token,omitempty"`
 }
 
 func cleanDiskPathList(raw []string) []string {
@@ -950,6 +993,19 @@ func (s *Server) handleAdminCreateNode(w http.ResponseWriter, r *http.Request) {
 		protocol.WriteError(w, http.StatusBadRequest, "disk_policy must be affinity_hash, most_free, round_robin, or first")
 		return
 	}
+	cm := normalizeConcurrencyMode(req.ConcurrencyMode)
+	if cm == "" {
+		protocol.WriteError(w, http.StatusBadRequest, "concurrency_mode must be auto or manual")
+		return
+	}
+	if req.MaxConcurrentOverride < 0 || req.MaxConcurrentOverride > 1024 {
+		protocol.WriteError(w, http.StatusBadRequest, "max_concurrent_override must be between 0 and 1024")
+		return
+	}
+	if req.RateLimitMBps < 0 {
+		protocol.WriteError(w, http.StatusBadRequest, "rate_limit_mbps must be >= 0")
+		return
+	}
 	if req.Name == "" {
 		req.Name = req.ID
 	}
@@ -958,15 +1014,18 @@ func (s *Server) handleAdminCreateNode(w http.ResponseWriter, r *http.Request) {
 		rawToken = auth.GenerateRandomToken(24)
 	}
 	rec := protocol.NodeRecord{
-		ID:              req.ID,
-		Name:            req.Name,
-		Role:            req.Role,
-		Projects:        req.Projects,
-		ProjectSchedule: sched,
-		DiskPolicy:      dp,
-		DisabledDisks:   cleanDiskPathList(req.DisabledDisks),
-		PublicAddr:      req.PublicAddr,
-		CreatedAt:       time.Now().UTC(),
+		ID:                    req.ID,
+		Name:                  req.Name,
+		Role:                  req.Role,
+		Projects:              req.Projects,
+		ProjectSchedule:       sched,
+		DiskPolicy:            dp,
+		DisabledDisks:         cleanDiskPathList(req.DisabledDisks),
+		ConcurrencyMode:       cm,
+		MaxConcurrentOverride: req.MaxConcurrentOverride,
+		RateLimitMBps:         req.RateLimitMBps,
+		PublicAddr:            req.PublicAddr,
+		CreatedAt:             time.Now().UTC(),
 	}
 	if err := s.store.UpsertNode(r.Context(), rec, rawToken); err != nil {
 		protocol.WriteError(w, http.StatusInternalServerError, err.Error())
@@ -981,12 +1040,15 @@ func (s *Server) handleAdminCreateNode(w http.ResponseWriter, r *http.Request) {
 }
 
 type updateNodeReq struct {
-	Name            string    `json:"name,omitempty"`
-	Projects        *[]string `json:"projects,omitempty"`
-	ProjectSchedule string    `json:"project_schedule,omitempty"`
-	DiskPolicy      string    `json:"disk_policy,omitempty"`
-	DisabledDisks   *[]string `json:"disabled_disks,omitempty"`
-	PublicAddr      string    `json:"public_addr,omitempty"`
+	Name                  string    `json:"name,omitempty"`
+	Projects              *[]string `json:"projects,omitempty"`
+	ProjectSchedule       string    `json:"project_schedule,omitempty"`
+	DiskPolicy            string    `json:"disk_policy,omitempty"`
+	DisabledDisks         *[]string `json:"disabled_disks,omitempty"`
+	ConcurrencyMode       string    `json:"concurrency_mode,omitempty"`
+	MaxConcurrentOverride *int      `json:"max_concurrent_override,omitempty"`
+	RateLimitMBps         *float64  `json:"rate_limit_mbps,omitempty"`
+	PublicAddr            string    `json:"public_addr,omitempty"`
 }
 
 func (s *Server) handleAdminUpdateNode(w http.ResponseWriter, r *http.Request) {
@@ -1037,6 +1099,30 @@ func (s *Server) handleAdminUpdateNode(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.DisabledDisks != nil {
 		rec.DisabledDisks = cleanDiskPathList(*req.DisabledDisks)
+	}
+	if req.ConcurrencyMode != "" {
+		cm := normalizeConcurrencyMode(req.ConcurrencyMode)
+		if cm == "" {
+			protocol.WriteError(w, http.StatusBadRequest, "concurrency_mode must be auto or manual")
+			return
+		}
+		rec.ConcurrencyMode = cm
+	}
+	if req.MaxConcurrentOverride != nil {
+		v := *req.MaxConcurrentOverride
+		if v < 0 || v > 1024 {
+			protocol.WriteError(w, http.StatusBadRequest, "max_concurrent_override must be between 0 and 1024")
+			return
+		}
+		rec.MaxConcurrentOverride = v
+	}
+	if req.RateLimitMBps != nil {
+		v := *req.RateLimitMBps
+		if v < 0 {
+			protocol.WriteError(w, http.StatusBadRequest, "rate_limit_mbps must be >= 0")
+			return
+		}
+		rec.RateLimitMBps = v
 	}
 	if req.Projects != nil {
 		cleanProjects := make([]string, 0, len(*req.Projects))

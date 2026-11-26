@@ -23,6 +23,7 @@ type Config struct {
 	StorageDirs          []string            `yaml:"storage_dirs,omitempty"`     // managed disk pool roots: any project lands in <storage_dir>/<project_id>/
 	ProjectSchedule      string              `yaml:"project_schedule,omitempty"` // default multi-project schedule: "fifo" | "fair" | "random" (overridable by Center)
 	DiskPolicy           string              `yaml:"disk_policy,omitempty"`      // default disk placement: "affinity_hash" | "most_free" | "round_robin" | "first" (overridable by Center)
+	ConcurrencyMode      string              `yaml:"concurrency_mode,omitempty"` // default concurrency control: "auto" (adaptive BBR/AIMD) | "manual" (overridable by Center)
 	OnlyProject          string              `yaml:"only_project,omitempty"`     // optional: strictly restrict this receiver node locally to download ONLY this single project
 	DestDir              string              `yaml:"dest_dir,omitempty"`         // optional shorthand single destination directory when only_project is set
 	DestDirs             []string            `yaml:"dest_dirs,omitempty"`        // optional shorthand multiple destination directories when only_project is set
@@ -88,6 +89,10 @@ func (c *Config) ApplyDefaults() {
 	c.DiskPolicy = strings.ToLower(strings.TrimSpace(c.DiskPolicy))
 	if c.DiskPolicy == "" {
 		c.DiskPolicy = protocol.DiskPolicyAffinityHash
+	}
+	c.ConcurrencyMode = strings.ToLower(strings.TrimSpace(c.ConcurrencyMode))
+	if c.ConcurrencyMode == "" {
+		c.ConcurrencyMode = protocol.ConcurrencyAuto
 	}
 	if c.NodeName == "" {
 		c.NodeName = c.NodeID
@@ -177,6 +182,11 @@ func (c *Config) Validate() error {
 	case protocol.DiskPolicyAffinityHash, protocol.DiskPolicyMostFree, protocol.DiskPolicyRoundRobin, protocol.DiskPolicyFirst:
 	default:
 		return fmt.Errorf("disk_policy must be 'affinity_hash', 'most_free', 'round_robin', or 'first' (got %q)", c.DiskPolicy)
+	}
+	switch c.ConcurrencyMode {
+	case protocol.ConcurrencyAuto, protocol.ConcurrencyManual:
+	default:
+		return fmt.Errorf("concurrency_mode must be 'auto' or 'manual' (got %q)", c.ConcurrencyMode)
 	}
 	if len(c.ProjectIDs()) == 0 && len(c.StorageDirs) == 0 {
 		if c.OnlyProject != "" {

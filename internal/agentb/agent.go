@@ -53,9 +53,10 @@ type Agent struct {
 	streamIdx     atomic.Uint64
 	limiter       *transfer.RateLimiter
 
-	workSem   chan struct{}
-	streamSem chan struct{}
-	wakeupCh  chan string
+	workGate   *DynamicGate
+	streamGate *DynamicGate
+	adaptive   *AdaptiveController
+	wakeupCh   chan string
 	ackWakeCh chan struct{}
 	hbWakeCh  chan struct{}
 	updater   *updater.Updater
@@ -244,10 +245,10 @@ func New(cfg *Config, logger *slog.Logger) (*Agent, error) {
 		}
 	}
 
-	var limiter *transfer.RateLimiter
-	if cfg.RateLimitMBps > 0 {
-		limiter = transfer.NewRateLimiter(int64(cfg.RateLimitMBps * 1024 * 1024))
-	}
+	limiter := transfer.NewDynamicRateLimiter(int64(cfg.RateLimitMBps * 1024 * 1024))
+	workGate := NewDynamicGate(cfg.MaxConcurrent)
+	streamGate := NewDynamicGate(cfg.MaxTotalStreams)
+	adaptive := NewAdaptiveController(cfg.ConcurrencyMode, cfg.MaxConcurrent, cfg.MaxTotalStreams, workGate, streamGate)
 
 	ag := &Agent{
 		cfg:             cfg,
@@ -259,8 +260,9 @@ func New(cfg *Config, logger *slog.Logger) (*Agent, error) {
 		sseClient:       makeSSEClient(),
 		streamClients:   streamClients,
 		makeStreamCli:   makeStreamCli,
-		workSem:         make(chan struct{}, cfg.MaxConcurrent),
-		streamSem:       make(chan struct{}, cfg.MaxTotalStreams),
+		workGate:        workGate,
+		streamGate:      streamGate,
+		adaptive:        adaptive,
 		wakeupCh:        make(chan string, 256),
 		ackWakeCh:       make(chan struct{}, 1),
 		hbWakeCh:        make(chan struct{}, 1),
@@ -462,6 +464,7 @@ func (a *Agent) Start(ctx context.Context) error {
 	launchBG(a.ackFlushLoop)
 	launchBG(a.sseLoop)
 	launchBG(a.dispatchLoop)
+	launchBG(a.adaptiveLoop)
 	if a.cfg.StreamConnMaxAgeSec > 0 {
 		launchBG(a.streamRotateLoop)
 	}
@@ -785,6 +788,19 @@ func (a *Agent) applyDirective(dir *protocol.ReceiverDirective, legacyAllowed []
 	a.disabledDisks = nextDisabled
 	a.dirMu.Unlock()
 
+	if dir != nil {
+		if a.adaptive != nil {
+			a.adaptive.Configure(dir.ConcurrencyMode, dir.MaxConcurrent, dir.SuggestedStreamCap)
+		}
+		if a.limiter != nil {
+			effRateMBps := dir.RateLimitMBps
+			if effRateMBps <= 0 {
+				effRateMBps = a.cfg.RateLimitMBps
+			}
+			a.limiter.SetRate(int64(effRateMBps * 1024 * 1024))
+		}
+	}
+
 	if scopeChanged || policyChanged {
 		nextActive := a.activeProjectIDs()
 		a.discMu.Lock()
@@ -806,6 +822,43 @@ func (a *Agent) applyDirective(dir *protocol.ReceiverDirective, legacyAllowed []
 	}
 }
 
+func (a *Agent) adaptiveLoop(ctx context.Context) {
+	if a.adaptive == nil {
+		return
+	}
+	const interval = 5 * time.Second
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	prevLimit := a.adaptive.Snapshot().EffectiveConcurrent
+	prevState := a.adaptive.Snapshot().State
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			snap := a.adaptive.Evaluate(interval, a.workGate.InFlight(), a.pendingAckCount.Load())
+			if snap.EffectiveConcurrent != prevLimit || snap.State != prevState {
+				if a.logger != nil {
+					a.logger.Info("adaptive concurrency adjusted",
+						"mode", snap.Mode,
+						"state", snap.State,
+						"concurrent", snap.EffectiveConcurrent,
+						"cap", snap.MaxConcurrentCap,
+						"streams", snap.EffectiveStreams,
+						"reason", snap.Reason,
+					)
+				}
+				if snap.EffectiveConcurrent > prevLimit {
+					a.triggerWakeup("")
+				}
+				prevLimit = snap.EffectiveConcurrent
+				prevState = snap.State
+			}
+		}
+	}
+}
+
 func (a *Agent) resumePersistedDownloads(ctx context.Context) {
 	active, err := a.store.ListActive()
 	if err != nil {
@@ -823,19 +876,17 @@ func (a *Agent) resumePersistedDownloads(ctx context.Context) {
 			continue
 		}
 		dlCopy := dl
-		select {
-		case a.workSem <- struct{}{}:
-			a.wg.Add(1)
-			go func() {
-				defer func() {
-					<-a.workSem
-					a.wg.Done()
-				}()
-				a.runDownload(ctx, dlCopy)
-			}()
-		case <-ctx.Done():
+		if err := a.workGate.Acquire(ctx); err != nil {
 			return
 		}
+		a.wg.Add(1)
+		go func() {
+			defer func() {
+				a.workGate.Release()
+				a.wg.Done()
+			}()
+			a.runDownload(ctx, dlCopy)
+		}()
 	}
 }
 
@@ -1000,9 +1051,9 @@ func (a *Agent) scanAllProjects(ctx context.Context) {
 	switch sched {
 	case protocol.ScheduleFIFO:
 		// Strict creation / configured order: drain earlier projects first, spilling remaining
-		// concurrency slots into subsequent projects only if earlier projects cannot fill workSem.
+		// concurrency slots into subsequent projects only if earlier projects cannot fill workGate.
 		for _, proj := range ids {
-			if ctx.Err() != nil || len(a.workSem) >= cap(a.workSem) {
+			if ctx.Err() != nil || a.workGate.Free() <= 0 {
 				return
 			}
 			a.scanProject(ctx, proj)
@@ -1014,8 +1065,8 @@ func (a *Agent) scanAllProjects(ctx context.Context) {
 		for i := range ids {
 			ordered[i] = ids[(start+i)%len(ids)]
 		}
-		for len(a.workSem) < cap(a.workSem) && ctx.Err() == nil {
-			free := cap(a.workSem) - len(a.workSem)
+		for a.workGate.Free() > 0 && ctx.Err() == nil {
+			free := a.workGate.Free()
 			quantum := free / len(ordered)
 			if quantum < 1 {
 				quantum = 1
@@ -1025,7 +1076,7 @@ func (a *Agent) scanAllProjects(ctx context.Context) {
 			}
 			roundClaimed := 0
 			for _, proj := range ordered {
-				if ctx.Err() != nil || len(a.workSem) >= cap(a.workSem) {
+				if ctx.Err() != nil || a.workGate.Free() <= 0 {
 					return
 				}
 				roundClaimed += a.scanProjectWithLimit(ctx, proj, quantum)
@@ -1039,7 +1090,7 @@ func (a *Agent) scanAllProjects(ctx context.Context) {
 		shuffled := append([]string(nil), ids...)
 		rand.Shuffle(len(shuffled), func(i, j int) { shuffled[i], shuffled[j] = shuffled[j], shuffled[i] })
 		for _, proj := range shuffled {
-			if ctx.Err() != nil || len(a.workSem) >= cap(a.workSem) {
+			if ctx.Err() != nil || a.workGate.Free() <= 0 {
 				return
 			}
 			a.scanProject(ctx, proj)
@@ -1077,22 +1128,10 @@ func (a *Agent) discoverCached(ctx context.Context, projectID string) (*protocol
 	return disc, nil
 }
 
-// mediaAffinityKey strips compound metadata suffixes (like .info.json) or the last extension
-// so paired files for the same asset (e.g. <video_id>.opus and <video_id>.info.json) hash
-// to the same destination disk when multi-disk placement is enabled.
+// mediaAffinityKey delegates to transfer.MediaAffinityKey so dispatch nodes and receiver nodes
+// always agree on the canonical asset-group stem (e.g. "<video_id>.opus" == "<video_id>.info.json").
 func mediaAffinityKey(filename string) string {
-	base := filepath.Base(filename)
-	lower := strings.ToLower(base)
-	for _, suffix := range []string{".info.json", ".meta.json", ".tar.gz", ".tar.zst"} {
-		if strings.HasSuffix(lower, suffix) && len(base) > len(suffix) {
-			return base[:len(base)-len(suffix)]
-		}
-	}
-	ext := filepath.Ext(base)
-	if ext != "" && len(base) > len(ext) {
-		return base[:len(base)-len(ext)]
-	}
-	return base
+	return transfer.MediaAffinityKey(filename)
 }
 
 func (a *Agent) chooseDestDir(projectID, filename string, fileSize int64) string {
@@ -1178,7 +1217,7 @@ func (a *Agent) scanProjectWithLimit(ctx context.Context, projectID string, maxS
 	if len(dirs) == 0 {
 		return 0
 	}
-	if len(a.workSem) >= cap(a.workSem) {
+	if a.workGate.Free() <= 0 {
 		return 0
 	}
 
@@ -1209,21 +1248,15 @@ func (a *Agent) scanProjectWithLimit(ctx context.Context, projectID string, maxS
 			}
 			// Reserve up to limit worker slots upfront without blocking.
 			reserved := 0
-			for reserved < limit {
-				select {
-				case a.workSem <- struct{}{}:
-					reserved++
-				default:
-					goto reservedDone
-				}
+			for reserved < limit && a.workGate.TryAcquire() {
+				reserved++
 			}
-		reservedDone:
 			if reserved == 0 {
 				return totalClaimed
 			}
 			releaseSlots := func(n int) {
 				for i := 0; i < n; i++ {
-					<-a.workSem
+					a.workGate.Release()
 				}
 			}
 
@@ -1237,6 +1270,7 @@ func (a *Agent) scanProjectWithLimit(ctx context.Context, projectID string, maxS
 			claimed, status, err := a.claimBatchFromA(ctx, cand, projectID, availDisk, disc.LeaseTTLSec, reserved)
 			if err != nil {
 				releaseSlots(reserved)
+				a.adaptive.RecordError()
 				a.invalidateDiscover(projectID)
 				a.logger.Warn("claim from agent-a failed", "a_node", cand.ANodeID, "err", err)
 				// Brief backoff after a transport/timeout failure prevents hammering claim-batch
@@ -1314,7 +1348,7 @@ func (a *Agent) scanProjectWithLimit(ctx context.Context, projectID string, maxS
 				a.wg.Add(1)
 				go func(item ActiveDownload) {
 					defer func() {
-						<-a.workSem
+						a.workGate.Release()
 						a.wg.Done()
 						// Immediately check for more queued files on completion.
 						if a.effectiveProjectSchedule() == protocol.ScheduleRandom {
@@ -1695,6 +1729,7 @@ func (a *Agent) runDownload(ctx context.Context, dl ActiveDownload) {
 		}
 	}
 
+	a.adaptive.RecordCompleted()
 	a.logger.Info("download verified and committed", "file_id", dl.FileID, "project", dl.ProjectID, "target", targetPath, "size", dl.Size)
 }
 
@@ -2043,14 +2078,12 @@ func (a *Agent) fetchRangeWithRetry(ctx context.Context, dl ActiveDownload, f *o
 		if ctx.Err() != nil {
 			return 0, ctx.Err()
 		}
-		select {
-		case a.streamSem <- struct{}{}:
-		case <-ctx.Done():
-			return 0, ctx.Err()
+		if err := a.streamGate.Acquire(ctx); err != nil {
+			return 0, err
 		}
 
 		// Per-attempt stall & slow-flow watchdog: if a single WAN TCP flow stalls for >12s
-		// OR degrades below 150 KB/s after 10s (ISP per-flow policer), abort this range attempt
+		// OR degrades below 32 KB/s after 10s (ISP per-flow policer), abort this range attempt
 		// and immediately retry on a fresh TCP socket from the rotated pool.
 		reqCtx, reqCancel := context.WithCancel(ctx)
 		attemptStart := time.Now()
@@ -2072,7 +2105,7 @@ func (a *Agent) fetchRangeWithRetry(ctx context.Context, dl ActiveDownload, f *o
 						reqCancel()
 						return
 					}
-					if a.limiter == nil {
+					if a.limiter == nil || a.limiter.Rate() <= 0 {
 						if elapsed := time.Since(attemptStart); elapsed > 10*time.Second {
 							if float64(attemptBytes.Load())/elapsed.Seconds() < 32*1024 {
 								reqCancel()
@@ -2091,11 +2124,16 @@ func (a *Agent) fetchRangeWithRetry(ctx context.Context, dl ActiveDownload, f *o
 		written, status, streamErr := a.streamRangeOnce(reqCtx, u, dl.LeaseToken, f, cur, end, subMem, &lastActivity, &attemptBytes)
 		close(watchDone)
 		reqCancel()
-		<-a.streamSem
+		a.streamGate.Release()
 
 		cur += written
 		if streamErr == nil && cur > end {
 			return http.StatusPartialContent, nil
+		}
+		if status == http.StatusServiceUnavailable {
+			a.adaptive.RecordBackpressure()
+		} else if streamErr != nil && ctx.Err() == nil && status != http.StatusConflict && status != http.StatusNotFound && status != http.StatusGone {
+			a.adaptive.RecordError()
 		}
 		if status == http.StatusConflict || status == http.StatusNotFound || status == http.StatusGone {
 			return status, streamErr
@@ -2168,6 +2206,7 @@ func (a *Agent) streamRangeOnce(ctx context.Context, streamURL, leaseToken strin
 				}
 				written += int64(nw)
 				attemptBytes.Add(int64(nw))
+				a.adaptive.RecordBytes(int64(nw))
 			}
 			if wErr != nil {
 				return written, resp.StatusCode, wErr
@@ -2190,12 +2229,10 @@ func (a *Agent) streamRangeOnce(ctx context.Context, streamURL, leaseToken strin
 }
 
 func (a *Agent) streamOnce(ctx context.Context, dl ActiveDownload, offset int64) (written int64, shaFromZero string, statusCode int, err error) {
-	select {
-	case a.streamSem <- struct{}{}:
-		defer func() { <-a.streamSem }()
-	case <-ctx.Done():
-		return 0, "", 0, ctx.Err()
+	if acqErr := a.streamGate.Acquire(ctx); acqErr != nil {
+		return 0, "", 0, acqErr
 	}
+	defer a.streamGate.Release()
 
 	reqCtx, reqCancel := context.WithCancel(ctx)
 	defer reqCancel()
@@ -2219,7 +2256,7 @@ func (a *Agent) streamOnce(ctx context.Context, dl ActiveDownload, offset int64)
 					reqCancel()
 					return
 				}
-				if a.limiter == nil {
+				if a.limiter == nil || a.limiter.Rate() <= 0 {
 					if elapsed := time.Since(attemptStart); elapsed > 10*time.Second {
 						if float64(attemptBytes.Load())/elapsed.Seconds() < 32*1024 {
 							reqCancel()
@@ -2243,11 +2280,19 @@ func (a *Agent) streamOnce(ctx context.Context, dl ActiveDownload, offset int64)
 
 	resp, err := a.nextStreamClient().Do(req)
 	if err != nil {
+		if ctx.Err() == nil {
+			a.adaptive.RecordError()
+		}
 		return 0, "", 0, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+		if resp.StatusCode == http.StatusServiceUnavailable {
+			a.adaptive.RecordBackpressure()
+		} else if resp.StatusCode >= 500 {
+			a.adaptive.RecordError()
+		}
 		return 0, "", resp.StatusCode, fmt.Errorf("stream returned HTTP %d", resp.StatusCode)
 	}
 
@@ -2305,6 +2350,7 @@ func (a *Agent) streamOnce(ctx context.Context, dl ActiveDownload, offset int64)
 				}
 				written += int64(nw)
 				attemptBytes.Add(int64(nw))
+				a.adaptive.RecordBytes(int64(nw))
 			}
 			if wErr != nil {
 				syncPartOnErr()
@@ -2658,15 +2704,31 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 		upgAttempt, upgStatus, upgErr = a.updater.Status()
 	}
 
+	var snap AdaptiveSnapshot
+	if a.adaptive != nil {
+		snap = a.adaptive.Snapshot()
+	}
+	var effRateMBps float64
+	if a.limiter != nil && a.limiter.Rate() > 0 {
+		effRateMBps = float64(a.limiter.Rate()) / (1024 * 1024)
+	}
+
 	payload := protocol.AgentBHeartbeatReq{
-		NodeID:           a.cfg.NodeID,
-		Name:             a.cfg.NodeName,
-		Projects:         a.activeProjectIDs(),
-		StorageDirs:      append([]string(nil), a.cfg.StorageDirs...),
-		Disks:            disks,
-		ProjectSchedule:  a.effectiveProjectSchedule(),
-		DiskPolicy:       a.effectiveDiskPolicy(),
-		Version:          version.Version,
+		NodeID:              a.cfg.NodeID,
+		Name:                a.cfg.NodeName,
+		Projects:            a.activeProjectIDs(),
+		StorageDirs:         append([]string(nil), a.cfg.StorageDirs...),
+		Disks:               disks,
+		ProjectSchedule:     a.effectiveProjectSchedule(),
+		DiskPolicy:          a.effectiveDiskPolicy(),
+		ConcurrencyMode:     snap.Mode,
+		EffectiveConcurrent: snap.EffectiveConcurrent,
+		MaxConcurrentCap:    snap.MaxConcurrentCap,
+		EffectiveStreams:    snap.EffectiveStreams,
+		EffectiveRateMBps:   effRateMBps,
+		AdaptiveState:       snap.State,
+		AdaptiveReason:      snap.Reason,
+		Version:             version.Version,
 		OS:               runtime.GOOS,
 		Arch:             runtime.GOARCH,
 		UpgradeAttemptID: upgAttempt,
