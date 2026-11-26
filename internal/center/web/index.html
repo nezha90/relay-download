@@ -29,8 +29,8 @@
     <nav class="tabs">
       <button class="tab active" data-tab="dashboard">总览看板</button>
       <button class="tab" data-tab="projects">项目视图</button>
-      <button class="tab" data-tab="nodes-a">A 节点 (公网)</button>
-      <button class="tab" data-tab="nodes-b">B 节点 (内网)</button>
+      <button class="tab" data-tab="nodes-a">分发节点 (公网)</button>
+      <button class="tab" data-tab="nodes-b">接收节点 (内网)</button>
       <button class="tab" data-tab="deploy">部署与版本</button>
     </nav>
     <div class="actions">
@@ -93,19 +93,19 @@
       <div id="projects-grid" class="card-grid"></div>
     </section>
 
-    <!-- Agent A Tab -->
+    <!-- Dispatch (Source/Edge) Nodes Tab -->
     <section id="tab-nodes-a" class="tab-panel">
       <div class="section-bar">
-        <h2>公网 A 节点列表 (A1 / A2 / A3...)</h2>
+        <h2>公网分发节点列表 (源端服务)</h2>
         <div class="btn-row">
-          <button id="open-deploy-a-from-tab" class="btn primary">一键部署 A 节点 (SSH)</button>
-          <button id="open-create-node-a" class="btn">+ 手动注册 A 节点</button>
+          <button id="open-deploy-a-from-tab" class="btn primary">一键部署分发节点 (SSH)</button>
+          <button id="open-create-node-a" class="btn">+ 手动注册分发节点</button>
         </div>
       </div>
       <div class="batch-bar">
-        <span class="muted">批量更新 (Agent 主动 HTTPS 自更新)：</span>
+        <span class="muted">批量更新 (节点主动 HTTPS 自更新)：</span>
         <select id="batch-rel-a"></select>
-        <button id="btn-batch-upgrade-a" class="btn sm primary">批量更新所选 A 节点</button>
+        <button id="btn-batch-upgrade-a" class="btn sm primary">批量更新所选分发节点</button>
         <span id="batch-msg-a" class="muted"></span>
       </div>
       <div class="card table-wrap">
@@ -117,7 +117,7 @@
               <th>状态 / 版本</th>
               <th>公网地址</th>
               <th>磁盘水位</th>
-              <th>待分发积压汇总</th>
+              <th>待传输积压汇总</th>
               <th id="th-a-window">阶段出站统计</th>
               <th>操作</th>
             </tr>
@@ -127,16 +127,16 @@
       </div>
     </section>
 
-    <!-- Agent B Tab -->
+    <!-- Receiver (Destination/Intranet) Nodes Tab -->
     <section id="tab-nodes-b" class="tab-panel">
       <div class="section-bar">
-        <h2>内网 B 节点列表 (多机抢占消费 · 零入站端口)</h2>
-        <button id="open-create-node-b" class="btn primary">+ 注册 B 节点</button>
+        <h2>内网接收节点列表 (目标落盘 · 支持单项目专享)</h2>
+        <button id="open-create-node-b" class="btn primary">+ 注册接收节点</button>
       </div>
       <div class="batch-bar">
-        <span class="muted">批量更新 (内网 B 主动 HTTPS 拉取自更新)：</span>
+        <span class="muted">批量更新 (内网接收节点主动 HTTPS 拉取自更新)：</span>
         <select id="batch-rel-b"></select>
-        <button id="btn-batch-upgrade-b" class="btn sm primary">批量更新所选 B 节点</button>
+        <button id="btn-batch-upgrade-b" class="btn sm primary">批量更新所选接收节点</button>
         <span id="batch-msg-b" class="muted"></span>
       </div>
       <div class="card table-wrap">
@@ -146,7 +146,7 @@
               <th style="width:32px"><input id="chk-all-b" type="checkbox" /></th>
               <th>节点 ID / 名称</th>
               <th>状态 / 版本</th>
-              <th>订阅项目</th>
+              <th>下载项目范围</th>
               <th>本地磁盘可用</th>
               <th id="th-b-completed">阶段完成汇总</th>
               <th id="th-b-speed">阶段平均速率</th>
@@ -162,7 +162,7 @@
     <section id="tab-deploy" class="tab-panel">
       <div class="section-bar">
         <h2>一键部署与版本发布管理</h2>
-        <button id="open-deploy-a-modal" class="btn primary">+ 一键部署公网 A 节点 (SSH)</button>
+        <button id="open-deploy-a-modal" class="btn primary">+ 一键部署公网分发节点 (SSH)</button>
       </div>
 
       <div class="two-col" style="margin-bottom:20px">
@@ -175,12 +175,12 @@
             <div class="form-grid-2">
               <label>节点角色
                 <select name="role">
-                  <option value="agent_a">公网 A 节点 (relay-agent-a)</option>
-                  <option value="agent_b">内网 B 节点 (relay-agent-b)</option>
+                  <option value="agent_a">分发节点 (公网源端服务)</option>
+                  <option value="agent_b">接收节点 (内网目标落盘)</option>
                 </select>
               </label>
               <label>版本号
-                <input name="version" required placeholder="e.g. v1.6.0" autocomplete="off" />
+                <input name="version" required placeholder="e.g. v1.7.0" autocomplete="off" />
               </label>
             </div>
             <div class="form-grid-2">
@@ -198,7 +198,7 @@
               </label>
             </div>
             <label>更新说明 (可选)
-              <input name="notes" placeholder="例如：优化断点续传与租约续期" autocomplete="off" />
+              <input name="notes" placeholder="例如：优化断点续传与单项目隔离" autocomplete="off" />
             </label>
             <label>选择编译好的静态二进制文件
               <input name="file" type="file" required />
@@ -210,7 +210,7 @@
 
         <div class="card">
           <div class="card-head">
-            <h3>最近一键部署任务 (公网 A)</h3>
+            <h3>最近一键部署任务 (公网分发节点)</h3>
             <span class="muted">保留最近 50 条</span>
           </div>
           <div id="deploy-tasks-list"></div>
@@ -299,15 +299,33 @@
       <form id="create-node-form" class="form-stack">
         <input type="hidden" name="role" />
         <label>节点 ID
-          <input name="id" required placeholder="e.g. a1 / b1" autocomplete="off" />
+          <input name="id" required placeholder="e.g. edge-01 / nas-01" autocomplete="off" />
         </label>
         <label>显示名称
-          <input name="name" placeholder="公网节点 A1" autocomplete="off" />
+          <input name="name" placeholder="例如：目标机房接收节点 01" autocomplete="off" />
         </label>
-        <label id="node-public-addr-wrap">公网地址 (仅 A 节点)
+        <label id="node-public-addr-wrap">公网地址 (仅分发节点)
           <input name="public_addr" placeholder="https://1.2.3.4:8443" autocomplete="off" />
         </label>
-        <label>绑定项目 (逗号分隔，留空表示所有项目)
+        <div id="node-project-mode-wrap" class="form-stack">
+          <div class="radio-row">
+            <label class="radio-opt">
+              <input type="radio" name="project_mode" value="single" checked />
+              <span>仅下载单个项目 (推荐)</span>
+            </label>
+            <label class="radio-opt">
+              <input type="radio" name="project_mode" value="multi" />
+              <span>多个 / 全部项目</span>
+            </label>
+          </div>
+          <label id="node-single-project-wrap">选择专享项目 (该节点只下载这一个项目)
+            <select id="node-single-project-select" name="single_project"></select>
+          </label>
+          <label id="node-single-project-custom-wrap" class="hidden">自定义项目 ID
+            <input name="single_project_custom" placeholder="输入项目 ID" autocomplete="off" />
+          </label>
+        </div>
+        <label id="node-multi-projects-wrap">绑定项目 (逗号分隔，留空表示允许全部项目)
           <input name="projects" placeholder="proj-alpha,proj-beta" autocomplete="off" />
         </label>
         <button type="submit" class="btn primary full">创建并生成密钥</button>
@@ -316,12 +334,51 @@
     </div>
   </div>
 
-  <!-- One-Click SSH Deploy Agent A Wizard Modal -->
+  <!-- Edit Node Project Scope Modal (No Token Rotation) -->
+  <div id="edit-node-modal" class="overlay hidden">
+    <div class="modal-card">
+      <div class="modal-head">
+        <div>
+          <h3 id="edit-node-title">配置节点下载项目</h3>
+          <p class="muted">修改后立即生效（中心下发限制并刷新订阅，无需更换节点密钥）</p>
+        </div>
+        <button class="btn ghost" onclick="closeModal('edit-node-modal')">关闭</button>
+      </div>
+      <form id="edit-node-form" class="form-stack">
+        <input type="hidden" name="node_id" />
+        <label>显示名称
+          <input name="name" autocomplete="off" />
+        </label>
+        <div class="radio-row">
+          <label class="radio-opt">
+            <input type="radio" name="edit_project_mode" value="single" checked />
+            <span>仅下载单个项目 (专享模式)</span>
+          </label>
+          <label class="radio-opt">
+            <input type="radio" name="edit_project_mode" value="multi" />
+            <span>多个 / 全部项目</span>
+          </label>
+        </div>
+        <label id="edit-single-project-wrap">目标项目 (该接收服务器将仅下载此项目)
+          <select id="edit-single-project-select" name="single_project"></select>
+        </label>
+        <label id="edit-single-project-custom-wrap" class="hidden">自定义项目 ID
+          <input name="single_project_custom" placeholder="输入项目 ID" autocomplete="off" />
+        </label>
+        <label id="edit-multi-projects-wrap" class="hidden">绑定项目列表 (逗号分隔，留空表示全部项目)
+          <input name="projects" placeholder="proj-alpha,proj-beta" autocomplete="off" />
+        </label>
+        <button type="submit" class="btn primary full">保存并立即生效</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- One-Click SSH Deploy Dispatch Node Wizard Modal -->
   <div id="deploy-a-modal" class="overlay hidden">
     <div class="modal-card wide">
       <div class="modal-head">
         <div>
-          <h3>一键部署公网 A 节点 (SSH 环境预检 → 确认安装)</h3>
+          <h3>一键部署公网分发节点 (SSH 环境预检 → 确认安装)</h3>
           <p class="muted">默认使用中心服务器本机 SSH 私钥免密以 root 连接目标机，自动签发 IP-SAN 证书并配置 systemd</p>
         </div>
         <button class="btn ghost" onclick="closeModal('deploy-a-modal')">关闭</button>
@@ -341,10 +398,10 @@
         </div>
         <div class="form-grid-3">
           <label>节点 ID *
-            <input name="node_id" required placeholder="e.g. a1" autocomplete="off" />
+            <input name="node_id" required placeholder="e.g. edge-01" autocomplete="off" />
           </label>
           <label>节点显示名称
-            <input name="node_name" placeholder="公网下载节点 A1" autocomplete="off" />
+            <input name="node_name" placeholder="公网分发节点 01" autocomplete="off" />
           </label>
           <label>临时 SSH 密码 (可选)
             <input name="ssh_password" type="password" placeholder="已配公钥免密则留空" autocomplete="new-password" />
@@ -370,7 +427,7 @@
           </label>
           <label>目标版本包 (留空自动匹配架构最新版)
             <select id="deploy-a-release-select" name="release_id">
-              <option value="">自动匹配最新 agent_a 发布包</option>
+              <option value="">自动匹配最新分发节点发布包</option>
             </select>
           </label>
         </div>
@@ -391,12 +448,12 @@
     </div>
   </div>
 
-  <!-- Agent B Install Script Modal -->
+  <!-- Receiver Node Install Script Modal -->
   <div id="b-script-modal" class="overlay hidden">
     <div class="modal-card wide">
       <div class="modal-head">
         <div>
-          <h3 id="b-script-title">内网 B 节点一键安装脚本</h3>
+          <h3 id="b-script-title">内网接收节点一键安装脚本</h3>
           <p class="muted">脚本内嵌 Root CA 证书，采用严格 TLS 1.3 从中心拉取二进制并自动配置 systemd</p>
         </div>
         <button class="btn ghost" onclick="closeModal('b-script-modal')">关闭</button>
@@ -411,19 +468,37 @@
           <label>状态数据库目录
             <input name="state_dir" value="/data/relay-b/state" autocomplete="off" />
           </label>
-          <label>选择 agent_b 版本包
+          <label>选择接收节点版本包
             <select id="b-script-release-select" name="release_id">
-              <option value="">自动匹配最新 agent_b 发布包</option>
+              <option value="">自动匹配最新接收节点发布包</option>
             </select>
           </label>
         </div>
-        <label>项目落盘目录映射 (每行一条 `项目ID=/本地目录`，留空按节点绑定项目自动生成)
+        <div class="radio-row">
+          <label class="radio-opt">
+            <input type="radio" name="script_mode" value="single" checked />
+            <span>仅下载单个项目 (生成 only_project 专享配置)</span>
+          </label>
+          <label class="radio-opt">
+            <input type="radio" name="script_mode" value="multi" />
+            <span>多项目映射配置</span>
+          </label>
+        </div>
+        <div id="b-script-single-wrap" class="form-stack">
+          <label>绑定单个项目
+            <select id="b-script-single-project" name="only_project"></select>
+          </label>
+          <label>本地落盘目录 (每行一个目录，填多个目录自动多盘均衡落盘)
+            <textarea name="single_dest_dirs" rows="2" placeholder="/mnt/sda/relay-delivery&#10;/mnt/sdb/relay-delivery"></textarea>
+          </label>
+        </div>
+        <label id="b-script-multi-wrap" class="hidden">多项目落盘目录映射 (每行一条 `项目ID=/本地目录`，留空按节点绑定项目自动生成)
           <textarea name="projects_map" rows="3" placeholder="proj-alpha=/data/relay/proj-alpha"></textarea>
         </label>
         <div class="btn-row">
           <label class="toggle">
             <input name="rotate_token" type="checkbox" />
-            <span>重新生成并直接内嵌新接入 Token (会断开该 B 节点旧连接)</span>
+            <span>重新生成并直接内嵌新接入 Token (会断开该接收节点旧连接)</span>
           </label>
           <button type="submit" class="btn primary">生成安装脚本</button>
           <button type="button" id="btn-copy-b-script" class="btn hidden">复制脚本</button>

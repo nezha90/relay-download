@@ -190,6 +190,7 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("DELETE /api/v1/admin/projects/{id}", s.requireAdmin(s.handleAdminDeleteProject))
 	mux.HandleFunc("GET /api/v1/admin/nodes", s.requireAdmin(s.handleAdminListNodes))
 	mux.HandleFunc("POST /api/v1/admin/nodes", s.requireAdmin(s.handleAdminCreateNode))
+	mux.HandleFunc("PUT /api/v1/admin/nodes/{id}", s.requireAdmin(s.handleAdminUpdateNode))
 	mux.HandleFunc("DELETE /api/v1/admin/nodes/{id}", s.requireAdmin(s.handleAdminDeleteNode))
 	mux.HandleFunc("GET /api/v1/admin/stats/intervals", s.requireAdmin(s.handleAdminIntervalStats))
 	mux.HandleFunc("GET /api/v1/admin/stats/daily", s.requireAdmin(s.handleAdminDailyStats))
@@ -349,6 +350,9 @@ func (s *Server) handleBHeartbeat(w http.ResponseWriter, r *http.Request, node *
 	}
 	s.hub.UpdateB(req)
 	hbResp := s.processNodeHeartbeatUpgrade(r.Context(), node.ID, req.Version, req.UpgradeAttemptID, req.UpgradeStatus, req.UpgradeError)
+	if len(node.Projects) > 0 {
+		hbResp.AllowedProjects = append([]string(nil), node.Projects...)
+	}
 	protocol.WriteJSON(w, http.StatusOK, hbResp)
 }
 
@@ -845,6 +849,70 @@ func (s *Server) handleAdminCreateNode(w http.ResponseWriter, r *http.Request) {
 		"node":  rec,
 		"token": rawToken,
 	})
+}
+
+type updateNodeReq struct {
+	Name       string   `json:"name,omitempty"`
+	Projects   []string `json:"projects"`
+	PublicAddr string   `json:"public_addr,omitempty"`
+}
+
+func (s *Server) handleAdminUpdateNode(w http.ResponseWriter, r *http.Request) {
+	nodeID := strings.TrimSpace(r.PathValue("id"))
+	existing, err := s.store.GetNode(r.Context(), nodeID)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			protocol.WriteError(w, http.StatusNotFound, "node not found")
+			return
+		}
+		protocol.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	var req updateNodeReq
+	if err := protocol.DecodeJSON(r.Body, &req); err != nil {
+		protocol.WriteError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+
+	rec := *existing
+	if name := strings.TrimSpace(req.Name); name != "" {
+		rec.Name = name
+	}
+	if req.PublicAddr != "" && rec.Role == protocol.RoleAgentA {
+		addr := strings.TrimSpace(req.PublicAddr)
+		if err := validateHTTPSAddr(addr); err != nil {
+			protocol.WriteError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		rec.PublicAddr = addr
+	}
+
+	cleanProjects := make([]string, 0, len(req.Projects))
+	seen := make(map[string]struct{}, len(req.Projects))
+	for _, p := range req.Projects {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if !validIDRe.MatchString(p) {
+			protocol.WriteError(w, http.StatusBadRequest, "invalid project id: "+p)
+			return
+		}
+		if _, dup := seen[p]; !dup {
+			seen[p] = struct{}{}
+			cleanProjects = append(cleanProjects, p)
+		}
+	}
+	rec.Projects = cleanProjects
+
+	// Empty rawToken tells Store.UpsertNode to keep the existing token_hash untouched.
+	if err := s.store.UpsertNode(r.Context(), rec, ""); err != nil {
+		protocol.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	s.hub.UpdateNodeProjects(rec.ID, rec.Projects)
+	protocol.WriteJSON(w, http.StatusOK, rec)
 }
 
 func (s *Server) handleAdminDeleteNode(w http.ResponseWriter, r *http.Request) {

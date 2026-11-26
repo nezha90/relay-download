@@ -186,6 +186,20 @@ func (h *Hub) RemoveNode(nodeID string) {
 	h.DisconnectSSE(nodeID)
 }
 
+// UpdateNodeProjects updates in-memory project restrictions for a node and disconnects its SSE
+// streams so updated single-project / multi-project subscriptions take effect immediately.
+func (h *Hub) UpdateNodeProjects(nodeID string, projects []string) {
+	h.mu.Lock()
+	if st, ok := h.aNodes[nodeID]; ok {
+		st.Projects = append([]string(nil), projects...)
+	}
+	if st, ok := h.bNodes[nodeID]; ok {
+		st.Projects = append([]string(nil), projects...)
+	}
+	h.mu.Unlock()
+	h.DisconnectSSE(nodeID)
+}
+
 // WakeupB wakes up at most readyCount+1 subscribed B nodes for projectID,
 // preferring currently idle B nodes to prevent thundering herd.
 func (h *Hub) WakeupB(projectID string, readyCount int) {

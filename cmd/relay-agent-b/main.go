@@ -15,6 +15,7 @@ import (
 
 func main() {
 	cfgPath := flag.String("config", "agent-b.yaml", "path to agent-b yaml config")
+	onlyProj := flag.String("project", "", "optional: restrict this receiver node to download only the specified project ID")
 	showVer := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 
@@ -28,6 +29,15 @@ func main() {
 	if err != nil {
 		logger.Error("load agent-b config failed", "err", err)
 		os.Exit(1)
+	}
+	if *onlyProj != "" {
+		cfg.OnlyProject = *onlyProj
+		cfg.ApplyDefaults()
+		if err := cfg.Validate(); err != nil {
+			logger.Error("apply -project override failed", "project", *onlyProj, "err", err)
+			os.Exit(1)
+		}
+		logger.Info("single-project mode enabled via CLI flag", "only_project", cfg.OnlyProject)
 	}
 
 	ag, err := agentb.New(cfg, logger)

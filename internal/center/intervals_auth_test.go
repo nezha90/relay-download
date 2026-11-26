@@ -234,3 +234,91 @@ func TestTrustedAdminCIDRAndNoRealtimePayload(t *testing.T) {
 		t.Fatalf("expected auth_trusted_ip=false for token-authenticated untrusted IP")
 	}
 }
+
+func TestUpdateReceiverSingleProjectWithoutTokenRotation(t *testing.T) {
+	dir := t.TempDir()
+	caCert := filepath.Join(dir, "ca.crt")
+	caKey := filepath.Join(dir, "ca.key")
+	if err := pki.InitCA(caCert, caKey, "Test CA", 365); err != nil {
+		t.Fatalf("InitCA: %v", err)
+	}
+	srvCert := filepath.Join(dir, "center.crt")
+	srvKey := filepath.Join(dir, "center.key")
+	if err := pki.IssueCert(caCert, caKey, srvCert, srvKey, "center", []string{"127.0.0.1"}, nil, 365); err != nil {
+		t.Fatalf("IssueCert: %v", err)
+	}
+	srv, err := New(&Config{
+		Listen:       "127.0.0.1:0",
+		TLSCert:      srvCert,
+		TLSKey:       srvKey,
+		CACert:       caCert,
+		DBPath:       filepath.Join(dir, "center.db"),
+		ReleasesDir:  filepath.Join(dir, "releases"),
+		JWTSecret:    "jwt-secret",
+		CenterSecret: "center-secret",
+		AdminToken:   "adm-tok",
+	}, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer srv.Shutdown(context.Background())
+
+	h := srv.routes()
+
+	// 1. Register receiver node with unrestricted projects.
+	createBody := `{"id":"rx-01","name":"NAS 1","role":"agent_b","projects":[]}`
+	cReq := httptest.NewRequest(http.MethodPost, "/api/v1/admin/nodes", strings.NewReader(createBody))
+	cReq.Header.Set(protocol.HeaderAdminToken, "adm-tok")
+	cRec := httptest.NewRecorder()
+	h.ServeHTTP(cRec, cReq)
+	if cRec.Code != http.StatusOK {
+		t.Fatalf("create node: %d %s", cRec.Code, cRec.Body.String())
+	}
+	var created struct {
+		Token string `json:"token"`
+	}
+	_ = json.Unmarshal(cRec.Body.Bytes(), &created)
+
+	// 2. Lock rx-01 to ONLY "proj-alpha" via PUT /api/v1/admin/nodes/rx-01.
+	uReq := httptest.NewRequest(http.MethodPut, "/api/v1/admin/nodes/rx-01", strings.NewReader(`{"name":"NAS 1 (Alpha Only)","projects":["proj-alpha"]}`))
+	uReq.Header.Set(protocol.HeaderAdminToken, "adm-tok")
+	uRec := httptest.NewRecorder()
+	h.ServeHTTP(uRec, uReq)
+	if uRec.Code != http.StatusOK {
+		t.Fatalf("update node: %d %s", uRec.Code, uRec.Body.String())
+	}
+
+	// 3. Original token must STILL authenticate on heartbeat and receive allowed_projects=["proj-alpha"].
+	hbReq := httptest.NewRequest(http.MethodPost, "/api/v1/b/heartbeat", strings.NewReader(`{"node_id":"rx-01","projects":["proj-alpha","proj-beta"]}`))
+	hbReq.Header.Set(protocol.HeaderNodeID, "rx-01")
+	hbReq.Header.Set(protocol.HeaderNodeToken, created.Token)
+	hbRec := httptest.NewRecorder()
+	h.ServeHTTP(hbRec, hbReq)
+	if hbRec.Code != http.StatusOK {
+		t.Fatalf("heartbeat with original token failed after PUT update: %d %s", hbRec.Code, hbRec.Body.String())
+	}
+	var hbResp protocol.HeartbeatResp
+	_ = json.Unmarshal(hbRec.Body.Bytes(), &hbResp)
+	if len(hbResp.AllowedProjects) != 1 || hbResp.AllowedProjects[0] != "proj-alpha" {
+		t.Fatalf("expected allowed_projects=[proj-alpha], got %+v", hbResp.AllowedProjects)
+	}
+
+	// 4. Discover must ALLOW proj-alpha (200) and FORBID proj-beta (403).
+	dOK := httptest.NewRequest(http.MethodGet, "/api/v1/b/discover?project=proj-alpha", nil)
+	dOK.Header.Set(protocol.HeaderNodeID, "rx-01")
+	dOK.Header.Set(protocol.HeaderNodeToken, created.Token)
+	dOKRec := httptest.NewRecorder()
+	h.ServeHTTP(dOKRec, dOK)
+	if dOKRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for allowed proj-alpha, got %d", dOKRec.Code)
+	}
+
+	dDeny := httptest.NewRequest(http.MethodGet, "/api/v1/b/discover?project=proj-beta", nil)
+	dDeny.Header.Set(protocol.HeaderNodeID, "rx-01")
+	dDeny.Header.Set(protocol.HeaderNodeToken, created.Token)
+	dDenyRec := httptest.NewRecorder()
+	h.ServeHTTP(dDenyRec, dDeny)
+	if dDenyRec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for disallowed proj-beta, got %d", dDenyRec.Code)
+	}
+}

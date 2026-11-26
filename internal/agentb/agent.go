@@ -63,6 +63,9 @@ type Agent struct {
 	discMu    sync.Mutex
 	discCache map[string]cachedDiscover
 
+	allowedMu       sync.RWMutex
+	allowedProjects map[string]struct{} // nil = unrestricted by Center; non-nil = Center-enforced subset
+
 	activeCount     atomic.Int32
 	pendingAckCount atomic.Int64
 	hashRAMBytes    atomic.Int64
@@ -455,6 +458,72 @@ func (a *Agent) triggerHeartbeat() {
 	}
 }
 
+func (a *Agent) activeProjectIDs() []string {
+	localIDs := a.cfg.ProjectIDs()
+	a.allowedMu.RLock()
+	allowed := a.allowedProjects
+	a.allowedMu.RUnlock()
+	if allowed == nil {
+		return localIDs
+	}
+	out := make([]string, 0, len(localIDs))
+	for _, id := range localIDs {
+		if _, ok := allowed[id]; ok {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+func (a *Agent) isProjectAllowed(projectID string) bool {
+	if len(a.cfg.DestDirsFor(projectID)) == 0 {
+		return false
+	}
+	a.allowedMu.RLock()
+	allowed := a.allowedProjects
+	a.allowedMu.RUnlock()
+	if allowed == nil {
+		return true
+	}
+	_, ok := allowed[projectID]
+	return ok
+}
+
+func (a *Agent) updateAllowedProjects(list []string) {
+	var next map[string]struct{}
+	if len(list) > 0 {
+		next = make(map[string]struct{}, len(list))
+		for _, p := range list {
+			p = strings.TrimSpace(p)
+			if p != "" {
+				next[p] = struct{}{}
+			}
+		}
+	}
+	a.allowedMu.Lock()
+	changed := (a.allowedProjects == nil) != (next == nil) || len(a.allowedProjects) != len(next)
+	if !changed && next != nil {
+		for k := range next {
+			if _, ok := a.allowedProjects[k]; !ok {
+				changed = true
+				break
+			}
+		}
+	}
+	a.allowedProjects = next
+	a.allowedMu.Unlock()
+
+	if changed {
+		a.discMu.Lock()
+		a.discCache = make(map[string]cachedDiscover)
+		a.discMu.Unlock()
+		a.logger.Info("updated Center-enforced project scope", "allowed_projects", list, "effective_projects", a.activeProjectIDs())
+		for _, p := range a.activeProjectIDs() {
+			a.triggerWakeup(p)
+		}
+	}
+}
+
 func (a *Agent) resumePersistedDownloads(ctx context.Context) {
 	active, err := a.store.ListActive()
 	if err != nil {
@@ -462,6 +531,15 @@ func (a *Agent) resumePersistedDownloads(ctx context.Context) {
 		return
 	}
 	for _, dl := range active {
+		if len(a.cfg.DestDirsFor(dl.ProjectID)) == 0 {
+			// Skip and release downloads belonging to projects excluded by only_project / updated config.
+			a.logger.Info("skipping persisted download excluded by project filter", "file_id", dl.FileID, "project", dl.ProjectID)
+			_ = os.Remove(dl.PartPath)
+			_ = os.Remove(dl.PartPath + ".bitmap")
+			_ = a.store.DeleteActive(dl.FileID)
+			_ = a.sendNack(ctx, dl, "project no longer subscribed on receiver")
+			continue
+		}
 		dlCopy := dl
 		select {
 		case a.workSem <- struct{}{}:
@@ -494,14 +572,14 @@ func (a *Agent) triggerAckFlush() {
 }
 
 func (a *Agent) sseLoop(ctx context.Context) {
-	projects := strings.Join(a.cfg.ProjectIDs(), ",")
-	u := strings.TrimRight(a.cfg.CenterURL, "/") + "/api/v1/b/events?projects=" + url.QueryEscape(projects)
 	backoff := 500 * time.Millisecond
 
 	for {
 		if ctx.Err() != nil {
 			return
 		}
+		projects := strings.Join(a.activeProjectIDs(), ",")
+		u := strings.TrimRight(a.cfg.CenterURL, "/") + "/api/v1/b/events?projects=" + url.QueryEscape(projects)
 		connected, err := a.consumeSSE(ctx, u)
 		if ctx.Err() != nil {
 			return
@@ -584,9 +662,9 @@ func (a *Agent) dispatchLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case proj := <-a.wakeupCh:
-			if len(a.cfg.DestDirsFor(proj)) > 0 {
+			if a.isProjectAllowed(proj) {
 				a.scanProject(ctx, proj)
-			} else {
+			} else if proj == "" {
 				a.scanAllProjects(ctx)
 			}
 		case <-ticker.C:
@@ -596,7 +674,7 @@ func (a *Agent) dispatchLoop(ctx context.Context) {
 }
 
 func (a *Agent) scanAllProjects(ctx context.Context) {
-	ids := a.cfg.ProjectIDs()
+	ids := a.activeProjectIDs()
 	rand.Shuffle(len(ids), func(i, j int) { ids[i], ids[j] = ids[j], ids[i] })
 	for _, proj := range ids {
 		if ctx.Err() != nil {
@@ -700,6 +778,9 @@ func (a *Agent) availableDiskForProject(projectID string) uint64 {
 }
 
 func (a *Agent) scanProject(ctx context.Context, projectID string) {
+	if !a.isProjectAllowed(projectID) {
+		return
+	}
 	dirs := a.cfg.DestDirsFor(projectID)
 	if len(dirs) == 0 {
 		return
@@ -2109,7 +2190,7 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 	payload := protocol.AgentBHeartbeatReq{
 		NodeID:           a.cfg.NodeID,
 		Name:             a.cfg.NodeName,
-		Projects:         a.cfg.ProjectIDs(),
+		Projects:         a.activeProjectIDs(),
 		Version:          version.Version,
 		OS:               runtime.GOOS,
 		Arch:             runtime.GOARCH,
@@ -2140,8 +2221,11 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 		return
 	}
 	var hbResp protocol.HeartbeatResp
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 64*1024)).Decode(&hbResp); err == nil && hbResp.Upgrade != nil && a.updater != nil {
-		a.updater.HandleDirective(ctx, hbResp.Upgrade)
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 64*1024)).Decode(&hbResp); err == nil {
+		a.updateAllowedProjects(hbResp.AllowedProjects)
+		if hbResp.Upgrade != nil && a.updater != nil {
+			a.updater.HandleDirective(ctx, hbResp.Upgrade)
+		}
 	}
 }
 

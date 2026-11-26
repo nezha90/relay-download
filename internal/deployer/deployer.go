@@ -434,7 +434,7 @@ func (d *Deployer) Precheck(ctx context.Context, req protocol.DeployPrecheckReq,
 	if findRelease != nil && resp.HostInfo.OS != "" && resp.HostInfo.Arch != "" {
 		rel, err := findRelease(resp.HostInfo.OS, resp.HostInfo.Arch)
 		if err != nil || rel == nil {
-			addCheck("release_bin", "中心发布包就绪", "fail", fmt.Sprintf("中心未上传匹配的 agent_a (%s/%s) 二进制包，请先在「版本发布」中上传", resp.HostInfo.OS, resp.HostInfo.Arch))
+			addCheck("release_bin", "中心发布包就绪", "fail", fmt.Sprintf("中心未上传匹配的分发节点 (%s/%s) 二进制包，请先在「部署与版本」中上传", resp.HostInfo.OS, resp.HostInfo.Arch))
 		} else {
 			resp.MatchedRelease = rel
 			addCheck("release_bin", "中心发布包就绪", "pass", fmt.Sprintf("已匹配 %s (%s/%s, SHA256 %s…)", rel.Version, rel.OS, rel.Arch, rel.SHA256[:12]))
@@ -768,15 +768,43 @@ func RenderAgentBInstallScript(centerPublicURL string, caCertPEM []byte, node pr
 	if err := ValidateAbsDir(stateDir); err != nil {
 		return "", err
 	}
+	onlyProject := strings.TrimSpace(req.OnlyProject)
+	destDirs := make([]string, 0, len(req.DestDirs))
+	for _, d := range req.DestDirs {
+		d = strings.TrimSpace(d)
+		if d != "" {
+			if err := ValidateAbsDir(d); err != nil {
+				return "", fmt.Errorf("dest_dir: %w", err)
+			}
+			destDirs = append(destDirs, d)
+		}
+	}
+
 	projects := req.Projects
 	projectDirs := req.ProjectDirs
-	if len(projects) == 0 && len(projectDirs) == 0 {
-		projects = make(map[string]string)
-		for _, pid := range node.Projects {
-			projects[pid] = filepath.Join("/data/relay-b/files", pid)
+	var destDir string
+	if onlyProject != "" {
+		// Single-project receiver mode: strictly pin only_project with dest_dir / dest_dirs.
+		projects = nil
+		projectDirs = nil
+		if len(destDirs) == 0 {
+			destDir = filepath.Join("/data/relay-b/files", onlyProject)
+		} else if len(destDirs) == 1 {
+			destDir = destDirs[0]
+			destDirs = nil
 		}
-		if len(projects) == 0 {
-			projects["proj-alpha"] = "/data/relay-b/files/proj-alpha"
+	} else if len(projects) == 0 && len(projectDirs) == 0 {
+		if len(node.Projects) == 1 {
+			onlyProject = node.Projects[0]
+			destDir = filepath.Join("/data/relay-b/files", onlyProject)
+		} else {
+			projects = make(map[string]string)
+			for _, pid := range node.Projects {
+				projects[pid] = filepath.Join("/data/relay-b/files", pid)
+			}
+			if len(projects) == 0 {
+				projects["proj-alpha"] = "/data/relay-b/files/proj-alpha"
+			}
 		}
 	}
 	maxConc := req.MaxConcurrent
@@ -785,7 +813,7 @@ func RenderAgentBInstallScript(centerPublicURL string, caCertPEM []byte, node pr
 	}
 	tokVal := rawToken
 	if tokVal == "" {
-		tokVal = "<REPLACE_WITH_NODE_B_TOKEN>"
+		tokVal = "<REPLACE_WITH_RECEIVER_NODE_TOKEN>"
 	}
 
 	bCfg := agentb.Config{
@@ -794,6 +822,9 @@ func RenderAgentBInstallScript(centerPublicURL string, caCertPEM []byte, node pr
 		CenterURL:            centerPublicURL,
 		CenterToken:          tokVal,
 		CACert:               filepath.Join(installDir, "certs", "ca.crt"),
+		OnlyProject:          onlyProject,
+		DestDir:              destDir,
+		DestDirs:             destDirs,
 		Projects:             projects,
 		ProjectDirs:          projectDirs,
 		StateDir:             stateDir,

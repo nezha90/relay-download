@@ -17,6 +17,9 @@ type Config struct {
 	CenterURL            string              `yaml:"center_url"`
 	CenterToken          string              `yaml:"center_token"`
 	CACert               string              `yaml:"ca_cert"`
+	OnlyProject          string              `yaml:"only_project,omitempty"` // optional: strictly restrict this receiver node to download ONLY this single project
+	DestDir              string              `yaml:"dest_dir,omitempty"`     // optional shorthand single destination directory when only_project is set
+	DestDirs             []string            `yaml:"dest_dirs,omitempty"`    // optional shorthand multiple destination directories when only_project is set
 	Projects             map[string]string   `yaml:"projects,omitempty"`     // project_id -> single local dest directory
 	ProjectDirs          map[string][]string `yaml:"project_dirs,omitempty"` // project_id -> multiple local dest directories for balanced multi-disk placement
 	StateDir             string              `yaml:"state_dir"`
@@ -54,6 +57,8 @@ func LoadConfig(path string) (*Config, error) {
 }
 
 func (c *Config) ApplyDefaults() {
+	c.OnlyProject = strings.TrimSpace(c.OnlyProject)
+	c.DestDir = strings.TrimSpace(c.DestDir)
 	if c.NodeName == "" {
 		c.NodeName = c.NodeID
 	}
@@ -134,13 +139,21 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("stream_protocol must be 'h2' or 'h1' (got %q)", c.StreamProtocol)
 	}
 	if len(c.ProjectIDs()) == 0 {
+		if c.OnlyProject != "" {
+			return fmt.Errorf("only_project %q requires a destination directory (dest_dir, dest_dirs, projects, or project_dirs)", c.OnlyProject)
+		}
 		return errors.New("at least one project destination mapping is required")
 	}
 	return nil
 }
 
 // DestDirsFor returns all configured destination directories for a project (deduplicated, preserving order).
+// When only_project is set, all other projects return nil so this receiver downloads strictly one project.
 func (c *Config) DestDirsFor(projectID string) []string {
+	only := strings.TrimSpace(c.OnlyProject)
+	if only != "" && projectID != only {
+		return nil
+	}
 	seen := make(map[string]struct{})
 	var out []string
 	add := func(d string) {
@@ -159,10 +172,22 @@ func (c *Config) DestDirsFor(projectID string) []string {
 	if d, ok := c.Projects[projectID]; ok {
 		add(d)
 	}
+	if only != "" && projectID == only {
+		for _, d := range c.DestDirs {
+			add(d)
+		}
+		add(c.DestDir)
+	}
 	return out
 }
 
 func (c *Config) ProjectIDs() []string {
+	if only := strings.TrimSpace(c.OnlyProject); only != "" {
+		if len(c.DestDirsFor(only)) > 0 {
+			return []string{only}
+		}
+		return nil
+	}
 	seen := make(map[string]struct{})
 	for k, v := range c.Projects {
 		if strings.TrimSpace(v) != "" {

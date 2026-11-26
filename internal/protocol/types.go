@@ -65,10 +65,10 @@ type ProjectAvailability struct {
 }
 
 type AgentAHeartbeatReq struct {
-	NodeID         string                `json:"node_id"`
-	Name           string                `json:"name"`
-	PublicAddr     string                `json:"public_addr"`
-	Projects       []string              `json:"projects"`
+	NodeID           string                `json:"node_id"`
+	Name             string                `json:"name"`
+	PublicAddr       string                `json:"public_addr"`
+	Projects         []string              `json:"projects"`
 	Version          string                `json:"version,omitempty"`
 	OS               string                `json:"os,omitempty"`
 	Arch             string                `json:"arch,omitempty"`
@@ -124,7 +124,8 @@ type UpgradeDirective struct {
 }
 
 type HeartbeatResp struct {
-	Upgrade *UpgradeDirective `json:"upgrade,omitempty"`
+	Upgrade         *UpgradeDirective `json:"upgrade,omitempty"`
+	AllowedProjects []string          `json:"allowed_projects,omitempty"`
 }
 
 type DiscoverCandidate struct {
@@ -499,22 +500,22 @@ type DeployPrecheckResp struct {
 }
 
 type DeployAgentAReq struct {
-	Host                 string   `json:"host"`
-	SSHPort              int      `json:"ssh_port,omitempty"`
-	SSHUser              string   `json:"ssh_user,omitempty"`
-	SSHPassword          string   `json:"ssh_password,omitempty"`
-	SSHPrivateKey        string   `json:"ssh_private_key,omitempty"`
-	NodeID               string   `json:"node_id"`
-	NodeName             string   `json:"node_name,omitempty"`
-	Projects             []string `json:"projects,omitempty"`
-	PublicPort           int      `json:"public_port,omitempty"`
-	LocalPort            int      `json:"local_port,omitempty"`
-	InstallDir           string   `json:"install_dir,omitempty"`
-	DataDir              string   `json:"data_dir,omitempty"`
-	ReleaseID            string   `json:"release_id,omitempty"`
-	MaxDiskUsagePct      float64  `json:"max_disk_usage_pct,omitempty"`
-	MinFreeDiskBytes     uint64   `json:"min_free_disk_bytes,omitempty"`
-	LeaseTTLSec          int      `json:"lease_ttl_sec,omitempty"`
+	Host                   string   `json:"host"`
+	SSHPort                int      `json:"ssh_port,omitempty"`
+	SSHUser                string   `json:"ssh_user,omitempty"`
+	SSHPassword            string   `json:"ssh_password,omitempty"`
+	SSHPrivateKey          string   `json:"ssh_private_key,omitempty"`
+	NodeID                 string   `json:"node_id"`
+	NodeName               string   `json:"node_name,omitempty"`
+	Projects               []string `json:"projects,omitempty"`
+	PublicPort             int      `json:"public_port,omitempty"`
+	LocalPort              int      `json:"local_port,omitempty"`
+	InstallDir             string   `json:"install_dir,omitempty"`
+	DataDir                string   `json:"data_dir,omitempty"`
+	ReleaseID              string   `json:"release_id,omitempty"`
+	MaxDiskUsagePct        float64  `json:"max_disk_usage_pct,omitempty"`
+	MinFreeDiskBytes       uint64   `json:"min_free_disk_bytes,omitempty"`
+	LeaseTTLSec            int      `json:"lease_ttl_sec,omitempty"`
 	MaxConcurrentStreams   int      `json:"max_concurrent_streams,omitempty"`
 	RateLimitMBps          float64  `json:"rate_limit_mbps,omitempty"`
 	DeleteBatchIntervalSec int      `json:"delete_batch_interval_sec,omitempty"`
@@ -542,6 +543,8 @@ type AgentBScriptReq struct {
 	RotateToken        bool                `json:"rotate_token,omitempty"`
 	InstallDir         string              `json:"install_dir,omitempty"`
 	StateDir           string              `json:"state_dir,omitempty"`
+	OnlyProject        string              `json:"only_project,omitempty"`
+	DestDirs           []string            `json:"dest_dirs,omitempty"`
 	Projects           map[string]string   `json:"projects,omitempty"`
 	ProjectDirs        map[string][]string `json:"project_dirs,omitempty"`
 	MaxConcurrent      int                 `json:"max_concurrent,omitempty"`

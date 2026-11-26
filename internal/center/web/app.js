@@ -42,6 +42,8 @@ function saveStoredToken(tok) {
 let adminToken = loadStoredToken();
 let authTrustedIP = false;
 let cachedReleases = [];
+let cachedProjects = [];
+let cachedNodes = [];
 let lastPrecheck = null;
 let activeDeployTaskId = '';
 let activeLogModalTaskId = '';
@@ -151,6 +153,28 @@ function openModal(id) { document.getElementById(id).classList.remove('hidden');
 function closeModal(id) { document.getElementById(id).classList.add('hidden'); }
 window.closeModal = closeModal;
 
+function populateProjectSelect(selectEl, currentValue = '', includeCustomOption = true) {
+  if (!selectEl) return;
+  const opts = [];
+  for (const ps of cachedProjects) {
+    const p = ps.project;
+    opts.push(`<option value="${esc(p.id)}">${esc(p.name)} (${esc(p.id)})</option>`);
+  }
+  if (currentValue && !cachedProjects.some(ps => ps.project.id === currentValue)) {
+    opts.unshift(`<option value="${esc(currentValue)}">${esc(currentValue)}</option>`);
+  }
+  if (includeCustomOption) {
+    opts.push('<option value="__custom__">手动输入项目 ID...</option>');
+  }
+  if (!opts.length) {
+    opts.push('<option value="__custom__">暂无项目，请手动输入项目 ID</option>');
+  }
+  selectEl.innerHTML = opts.join('');
+  if (currentValue) {
+    selectEl.value = currentValue;
+  }
+}
+
 async function refreshAll() {
   const btn = document.getElementById('refresh-now');
   if (btn) btn.disabled = true;
@@ -178,11 +202,13 @@ async function refreshAll() {
       snapEl.textContent = `统计截至 ${fmtTimeShort(overview.generated_at, false)}`;
     }
 
+    cachedProjects = overview.projects || [];
+    cachedNodes = nodes || [];
     cachedReleases = releases || [];
-    syncProjectFilterOptions(overview.projects || []);
+    syncProjectFilterOptions(cachedProjects);
     renderDashboard(overview);
-    renderProjects(overview.projects || [], overview.window_hours || hours);
-    renderNodes(nodes || [], overview.window_hours || hours);
+    renderProjects(cachedProjects, overview.window_hours || hours);
+    renderNodes(cachedNodes, overview.window_hours || hours);
     renderReleases(cachedReleases);
     renderDeployTasks(tasks || []);
   } catch (e) {
@@ -261,9 +287,9 @@ function renderDashboard(ov) {
       sub: `累计 ${fmtBytes(ov.all_time_bytes)} · 失败 ${fmtNum(ov.all_time_failed)}`,
     },
     {
-      label: '在线节点 (A / B)',
+      label: '在线节点 (分发 / 接收)',
       value: `${ov.online_a_nodes}/${ov.total_a_nodes} · ${ov.online_b_nodes}/${ov.total_b_nodes}`,
-      sub: `项目 ${ov.total_projects} · 待分发积压 ${fmtNum(ov.queued_files)} (${fmtBytes(ov.queued_bytes)})`,
+      sub: `项目 ${ov.total_projects} · 待传输积压 ${fmtNum(ov.queued_files)} (${fmtBytes(ov.queued_bytes)})`,
     },
   ];
   document.getElementById('kpi-grid').innerHTML = kpis.map(k => `
@@ -344,7 +370,7 @@ function buildMonotonePath(pts) {
 }
 
 function niceSpeedCeiling(maxBps) {
-  if (!maxBps || maxBps <= 0) return 1024 * 1024; // default 1 MB/s scale when idle
+  if (!maxBps || maxBps <= 0) return 1024 * 1024;
   const raw = maxBps * 1.15;
   const pow = Math.pow(10, Math.floor(Math.log10(raw)));
   const norm = raw / pow;
@@ -433,7 +459,6 @@ function renderSpeedCurve(data) {
   const baseY = padT + plotH;
   const areaD = `${lineD} L ${pts[pts.length - 1].x.toFixed(1)} ${baseY.toFixed(1)} L ${pts[0].x.toFixed(1)} ${baseY.toFixed(1)} Z`;
 
-  // Y-axis grid lines (4 intervals)
   const yTicks = [0, 0.25, 0.5, 0.75, 1].map(frac => {
     const val = yMax * frac;
     const y = padT + plotH - frac * plotH;
@@ -443,7 +468,6 @@ function renderSpeedCurve(data) {
     `;
   }).join('');
 
-  // X-axis labels (~7 evenly spaced labels)
   const tickCount = Math.min(buckets.length, showDate ? 6 : 8);
   const xTickIdxs = new Set();
   if (tickCount <= 1) {
@@ -462,7 +486,6 @@ function renderSpeedCurve(data) {
     `;
   }).join('');
 
-  // Reference lines for full-window avg and active avg
   let refLines = '';
   if (windowAvg > 0) {
     const avgY = padT + plotH - Math.min(1, windowAvg / yMax) * plotH;
@@ -479,12 +502,10 @@ function renderSpeedCurve(data) {
     `;
   }
 
-  // Visible subtle dots on non-zero points
   const dots = pts.filter(p => (p.b.avg_speed_bps || 0) > 0).map(p => `
     <circle cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="2.8" fill="#38bdf8" stroke="#0d1117" stroke-width="1.2" />
   `).join('');
 
-  // Invisible hover hit bands for crisp interactive tooltips
   const hitBands = pts.map((p, i) => {
     const prevX = i === 0 ? padL : (pts[i - 1].x + p.x) / 2;
     const nextX = i === pts.length - 1 ? w - padR : (p.x + pts[i + 1].x) / 2;
@@ -646,7 +667,7 @@ function renderProjects(projects, winHours) {
         <span class="badge online">积压 ${fmtNum(a.ready_count + a.claimed_count)}</span>
         <span class="muted">${fmtBytes(a.ready_bytes)}</span>
       </span>
-    `).join('') || '<span class="muted">当前无待分发积压</span>';
+    `).join('') || '<span class="muted">当前无待传输积压</span>';
 
     return `
       <div class="card">
@@ -677,12 +698,12 @@ function renderProjects(projects, winHours) {
           </div>
           <div class="proj-stat-box">
             <div class="k">在线节点</div>
-            <div class="v">A 节点 ${ps.online_a_nodes} · B 节点 ${ps.online_b_nodes}</div>
-            <div class="muted">待分发 ${esc(fmtNum(ps.queued_files))} (${esc(fmtBytes(ps.queued_bytes))})</div>
+            <div class="v">分发节点 ${ps.online_a_nodes} · 接收节点 ${ps.online_b_nodes}</div>
+            <div class="muted">待传输 ${esc(fmtNum(ps.queued_files))} (${esc(fmtBytes(ps.queued_bytes))})</div>
           </div>
         </div>
         <div>
-          <div class="muted" style="margin-bottom:4px">各 A 节点待分发积压汇总：</div>
+          <div class="muted" style="margin-bottom:4px">各分发节点待传输积压汇总：</div>
           ${avail}
         </div>
       </div>
@@ -702,6 +723,22 @@ function renderUpgradeBadge(n) {
   const info = map[n.upgrade_status] || { cls: '', txt: n.upgrade_status };
   const title = n.upgrade_message ? ` title="${esc(n.upgrade_message)}"` : '';
   return `<span class="badge ${info.cls}"${title}>${esc(info.txt)}</span>`;
+}
+
+function renderProjectScope(projects) {
+  if (!projects || !projects.length) {
+    return '<span class="badge">全部项目</span>';
+  }
+  if (projects.length === 1) {
+    return `
+      <div><span class="badge online">单项目专享</span></div>
+      <div class="mono muted" style="margin-top:3px">${esc(projects[0])}</div>
+    `;
+  }
+  return `
+    <div><span class="badge">多项目 (${projects.length})</span></div>
+    <div class="mono muted" style="margin-top:3px">${esc(projects.join(', '))}</div>
+  `;
 }
 
 function renderNodes(nodes, winHours) {
@@ -759,7 +796,7 @@ function renderNodes(nodes, winHours) {
         </td>
       </tr>
     `;
-  }).join('') : '<tr><td colspan="8" class="empty">暂无注册的 A 节点</td></tr>';
+  }).join('') : '<tr><td colspan="8" class="empty">暂无注册的分发节点</td></tr>';
 
   document.getElementById('nodes-b-tbody').innerHTML = bs.length ? bs.map(n => {
     const verStr = n.version ? `${n.version}${n.arch ? ' · ' + n.arch : ''}` : '-';
@@ -775,7 +812,7 @@ function renderNodes(nodes, winHours) {
           </div>
           <div class="mono muted" style="margin-top:3px">${esc(verStr)}</div>
         </td>
-        <td class="mono">${(n.projects && n.projects.length) ? esc(n.projects.join(', ')) : '全部'}</td>
+        <td>${renderProjectScope(n.projects)}</td>
         <td>${fmtBytes(n.disk_free_bytes)} <span class="muted">(${(n.disk_used_pct || 0).toFixed(1)}% 已用)</span></td>
         <td>
           <div>${fmtNum(n.window_completed)} 文件</div>
@@ -787,13 +824,14 @@ function renderNodes(nodes, winHours) {
         </td>
         <td>
           <div class="btn-row">
+            <button class="btn sm" data-action="edit-node-projects" data-id="${esc(n.id)}">配置项目</button>
             <button class="btn sm" data-action="open-b-script" data-id="${esc(n.id)}">安装脚本</button>
             <button class="btn sm danger" data-action="delete-node" data-id="${esc(n.id)}">删除</button>
           </div>
         </td>
       </tr>
     `;
-  }).join('') : '<tr><td colspan="8" class="empty">暂无注册的 B 节点</td></tr>';
+  }).join('') : '<tr><td colspan="8" class="empty">暂无注册的接收节点</td></tr>';
 
   document.getElementById('chk-all-a').checked = as.length > 0 && as.every(n => selectedNodes.agent_a.has(n.id));
   document.getElementById('chk-all-b').checked = bs.length > 0 && bs.every(n => selectedNodes.agent_b.has(n.id));
@@ -820,13 +858,13 @@ function populateReleaseSelect(selectEl, role, emptyLabel) {
 function renderReleases(list) {
   populateReleaseSelect(document.getElementById('batch-rel-a'), 'agent_a', '');
   populateReleaseSelect(document.getElementById('batch-rel-b'), 'agent_b', '');
-  populateReleaseSelect(document.getElementById('deploy-a-release-select'), 'agent_a', '自动匹配最新 agent_a 发布包');
-  populateReleaseSelect(document.getElementById('b-script-release-select'), 'agent_b', '自动匹配最新 agent_b 发布包');
+  populateReleaseSelect(document.getElementById('deploy-a-release-select'), 'agent_a', '自动匹配最新分发节点发布包');
+  populateReleaseSelect(document.getElementById('b-script-release-select'), 'agent_b', '自动匹配最新接收节点发布包');
 
   const tbody = document.getElementById('releases-tbody');
   tbody.innerHTML = list.length ? list.map(r => `
     <tr>
-      <td><span class="badge">${r.role === 'agent_a' ? 'A 节点' : 'B 节点'}</span></td>
+      <td><span class="badge">${r.role === 'agent_a' ? '分发节点' : '接收节点'}</span></td>
       <td class="mono"><strong>${esc(r.version)}</strong></td>
       <td class="mono">${esc(r.os)}/${esc(r.arch)}</td>
       <td>${fmtBytes(r.size)}</td>
@@ -935,7 +973,7 @@ function openDeployAModal() {
   document.getElementById('btn-refresh-deploy-status').classList.add('hidden');
   document.getElementById('deploy-force-chk').checked = false;
   document.getElementById('btn-confirm-deploy-a').disabled = true;
-  populateReleaseSelect(document.getElementById('deploy-a-release-select'), 'agent_a', '自动匹配最新 agent_a 发布包');
+  populateReleaseSelect(document.getElementById('deploy-a-release-select'), 'agent_a', '自动匹配最新分发节点发布包');
   openModal('deploy-a-modal');
 }
 
@@ -1006,7 +1044,7 @@ function renderDeployTaskDetail(t, targetEl) {
   if (t.local_token) {
     tokHtml = `
       <div class="token-box" style="margin-bottom:10px">
-        <strong>请保存该 A 节点的本机上传密钥 X-Local-Token（仅展示一次）：</strong>
+        <strong>请保存该分发节点的本机上传密钥 X-Local-Token（仅展示一次）：</strong>
         <div class="mono" style="margin-top:6px">${esc(t.local_token)}</div>
       </div>
     `;
@@ -1050,20 +1088,81 @@ async function viewDeployTaskLog(taskId) {
   }
 }
 
+function syncCreateNodeProjectMode() {
+  const form = document.getElementById('create-node-form');
+  const isReceiver = form.elements.role.value === 'agent_b';
+  const mode = form.elements.project_mode.value || 'single';
+  document.getElementById('node-project-mode-wrap').classList.toggle('hidden', !isReceiver);
+  const useSingle = isReceiver && mode === 'single';
+  document.getElementById('node-single-project-wrap').classList.toggle('hidden', !useSingle);
+  document.getElementById('node-multi-projects-wrap').classList.toggle('hidden', useSingle);
+  const selVal = document.getElementById('node-single-project-select').value;
+  document.getElementById('node-single-project-custom-wrap').classList.toggle('hidden', !(useSingle && selVal === '__custom__'));
+}
+
+function syncEditNodeProjectMode() {
+  const form = document.getElementById('edit-node-form');
+  const mode = form.elements.edit_project_mode.value || 'single';
+  const useSingle = mode === 'single';
+  document.getElementById('edit-single-project-wrap').classList.toggle('hidden', !useSingle);
+  document.getElementById('edit-multi-projects-wrap').classList.toggle('hidden', useSingle);
+  const selVal = document.getElementById('edit-single-project-select').value;
+  document.getElementById('edit-single-project-custom-wrap').classList.toggle('hidden', !(useSingle && selVal === '__custom__'));
+}
+
+function openEditNodeProjectsModal(nodeId) {
+  const node = cachedNodes.find(n => n.id === nodeId);
+  if (!node) return;
+  const form = document.getElementById('edit-node-form');
+  form.reset();
+  form.elements.node_id.value = node.id;
+  form.elements.name.value = node.name || node.id;
+  document.getElementById('edit-node-title').textContent = `配置接收节点下载项目: ${node.name || node.id}`;
+
+  const projs = node.projects || [];
+  const defaultSingle = projs.length === 1 ? projs[0] : (cachedProjects[0]?.project?.id || '');
+  populateProjectSelect(document.getElementById('edit-single-project-select'), defaultSingle, true);
+
+  if (projs.length === 1 || (projs.length === 0 && cachedProjects.length === 1)) {
+    form.elements.edit_project_mode.value = 'single';
+  } else {
+    form.elements.edit_project_mode.value = 'multi';
+  }
+  form.elements.projects.value = projs.join(',');
+  syncEditNodeProjectMode();
+  openModal('edit-node-modal');
+}
+
+function syncBScriptMode() {
+  const form = document.getElementById('b-script-form');
+  const isSingle = (form.elements.script_mode.value || 'single') === 'single';
+  document.getElementById('b-script-single-wrap').classList.toggle('hidden', !isSingle);
+  document.getElementById('b-script-multi-wrap').classList.toggle('hidden', isSingle);
+}
+
 function openBScriptModal(nodeId, presetToken = '') {
+  const node = cachedNodes.find(n => n.id === nodeId);
   const form = document.getElementById('b-script-form');
   form.reset();
   form.elements.node_id.value = nodeId;
   form.elements.node_token.value = presetToken;
-  document.getElementById('b-script-title').textContent = `内网 B 节点一键安装脚本: ${nodeId}`;
+  document.getElementById('b-script-title').textContent = `内网接收节点一键安装脚本: ${nodeId}`;
   document.getElementById('b-script-output').classList.add('hidden');
   document.getElementById('btn-copy-b-script').classList.add('hidden');
-  populateReleaseSelect(document.getElementById('b-script-release-select'), 'agent_b', '自动匹配最新 agent_b 发布包');
+  populateReleaseSelect(document.getElementById('b-script-release-select'), 'agent_b', '自动匹配最新接收节点发布包');
+
+  const nodeProjs = (node && node.projects) || [];
+  const defaultProj = nodeProjs.length === 1 ? nodeProjs[0] : (cachedProjects[0]?.project?.id || '');
+  populateProjectSelect(document.getElementById('b-script-single-project'), defaultProj, false);
+  form.elements.script_mode.value = nodeProjs.length > 1 ? 'multi' : 'single';
+  if (defaultProj) {
+    form.elements.single_dest_dirs.value = `/data/relay-b/files/${defaultProj}`;
+  }
+  syncBScriptMode();
   openModal('b-script-modal');
 }
 
 function setupEvents() {
-  // Restore saved window selection
   const winSel = document.getElementById('window-select');
   try {
     const savedWin = localStorage.getItem(WINDOW_STORAGE_KEY);
@@ -1094,6 +1193,7 @@ function setupEvents() {
       case 'delete-release': deleteRelease(id); break;
       case 'view-deploy-task': viewDeployTaskLog(id); break;
       case 'open-b-script': openBScriptModal(id); break;
+      case 'edit-node-projects': openEditNodeProjectsModal(id); break;
     }
   });
 
@@ -1193,23 +1293,55 @@ function setupEvents() {
     }
   });
 
+  // Create node modal
   const openNodeModal = (role) => {
     const form = document.getElementById('create-node-form');
     form.reset();
     form.elements.role.value = role;
-    document.getElementById('node-modal-title').textContent = role === 'agent_a' ? '手动注册公网 A 节点' : '注册内网 B 节点';
+    document.getElementById('node-modal-title').textContent = role === 'agent_a' ? '手动注册公网分发节点' : '注册内网接收节点';
     document.getElementById('node-public-addr-wrap').classList.toggle('hidden', role !== 'agent_a');
     document.getElementById('node-token-result').classList.add('hidden');
+    populateProjectSelect(document.getElementById('node-single-project-select'), cachedProjects[0]?.project?.id || '', true);
+    form.elements.project_mode.value = 'single';
+    syncCreateNodeProjectMode();
     openModal('node-modal');
   };
   document.getElementById('open-create-node-a').addEventListener('click', () => openNodeModal('agent_a'));
   document.getElementById('open-create-node-b').addEventListener('click', () => openNodeModal('agent_b'));
 
+  document.querySelectorAll('input[name="project_mode"]').forEach(el => {
+    el.addEventListener('change', syncCreateNodeProjectMode);
+  });
+  document.getElementById('node-single-project-select').addEventListener('change', syncCreateNodeProjectMode);
+
+  document.querySelectorAll('input[name="edit_project_mode"]').forEach(el => {
+    el.addEventListener('change', syncEditNodeProjectMode);
+  });
+  document.getElementById('edit-single-project-select').addEventListener('change', syncEditNodeProjectMode);
+
+  document.querySelectorAll('input[name="script_mode"]').forEach(el => {
+    el.addEventListener('change', syncBScriptMode);
+  });
+
   document.getElementById('create-node-form').addEventListener('submit', async (e) => {
     e.preventDefault();
     const fd = new FormData(e.target);
-    const projs = String(fd.get('projects') || '').split(',').map(s => s.trim()).filter(Boolean);
     const role = fd.get('role');
+    let projs = [];
+    if (role === 'agent_b' && fd.get('project_mode') === 'single') {
+      let chosen = String(fd.get('single_project') || '').trim();
+      if (chosen === '__custom__') {
+        chosen = String(fd.get('single_project_custom') || '').trim();
+      }
+      if (!chosen) {
+        alert('请选择或输入该接收节点要专享下载的项目 ID');
+        return;
+      }
+      projs = [chosen];
+    } else {
+      projs = String(fd.get('projects') || '').split(',').map(s => s.trim()).filter(Boolean);
+    }
+
     try {
       const res = await api('/api/v1/admin/nodes', {
         method: 'POST',
@@ -1227,15 +1359,48 @@ function setupEvents() {
         : '';
       box.innerHTML = `<strong>节点已创建！请妥善保存接入 Token（仅展示一次）：</strong><div class="mono" style="margin-top:6px">${esc(res.token)}</div>${extraBtn}`;
       box.classList.remove('hidden');
+      await refreshAll();
       if (role === 'agent_b') {
         document.getElementById('btn-gen-b-after-create').addEventListener('click', () => {
           closeModal('node-modal');
           openBScriptModal(res.node.id, res.token);
         });
       }
-      refreshAll();
     } catch (err) {
       if (err.message !== 'unauthorized') alert(`创建节点失败: ${err.message}`);
+    }
+  });
+
+  // Edit node projects modal
+  document.getElementById('edit-node-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    const nodeId = String(fd.get('node_id') || '').trim();
+    const name = String(fd.get('name') || '').trim();
+    const mode = String(fd.get('edit_project_mode') || 'single');
+    let projs = [];
+    if (mode === 'single') {
+      let chosen = String(fd.get('single_project') || '').trim();
+      if (chosen === '__custom__') {
+        chosen = String(fd.get('single_project_custom') || '').trim();
+      }
+      if (!chosen) {
+        alert('请选择或输入该接收节点专享下载的项目 ID');
+        return;
+      }
+      projs = [chosen];
+    } else {
+      projs = String(fd.get('projects') || '').split(',').map(s => s.trim()).filter(Boolean);
+    }
+    try {
+      await api(`/api/v1/admin/nodes/${encodeURIComponent(nodeId)}`, {
+        method: 'PUT',
+        body: JSON.stringify({ name, projects: projs }),
+      });
+      closeModal('edit-node-modal');
+      refreshAll();
+    } catch (err) {
+      if (err.message !== 'unauthorized') alert(`更新节点项目配置失败: ${err.message}`);
     }
   });
 
@@ -1247,7 +1412,8 @@ function setupEvents() {
     const fd = new FormData(e.target);
     try {
       const rel = await api('/api/v1/admin/releases', { method: 'POST', body: fd });
-      msgEl.textContent = `上传成功: ${rel.role} ${rel.version} (${rel.os}/${rel.arch}, ${fmtBytes(rel.size)})`;
+      const roleLbl = rel.role === 'agent_a' ? '分发节点' : '接收节点';
+      msgEl.textContent = `上传成功: ${roleLbl} ${rel.version} (${rel.os}/${rel.arch}, ${fmtBytes(rel.size)})`;
       e.target.reset();
       refreshAll();
     } catch (err) {
@@ -1256,7 +1422,7 @@ function setupEvents() {
     }
   });
 
-  // One-click Deploy A wizard
+  // One-click Deploy Dispatch Node wizard
   document.getElementById('open-deploy-a-modal').addEventListener('click', openDeployAModal);
   document.getElementById('open-deploy-a-from-tab').addEventListener('click', openDeployAModal);
 
@@ -1320,32 +1486,47 @@ function setupEvents() {
     }
   });
 
-  // Agent B Install Script generator
+  // Receiver Install Script generator
   let lastBScript = '';
   document.getElementById('b-script-form').addEventListener('submit', async (e) => {
     e.preventDefault();
     const fd = new FormData(e.target);
-    const projects = {};
-    String(fd.get('projects_map') || '').split('\n').forEach(line => {
-      const trimmed = line.trim();
-      if (!trimmed || !trimmed.includes('=')) return;
-      const idx = trimmed.indexOf('=');
-      const k = trimmed.slice(0, idx).trim();
-      const v = trimmed.slice(idx + 1).trim();
-      if (k && v) projects[k] = v;
-    });
+    const scriptMode = String(fd.get('script_mode') || 'single');
+    const body = {
+      node_id: fd.get('node_id'),
+      node_token: fd.get('node_token'),
+      rotate_token: fd.get('rotate_token') === 'on',
+      install_dir: fd.get('install_dir'),
+      state_dir: fd.get('state_dir'),
+      release_id: fd.get('release_id'),
+    };
+    if (scriptMode === 'single') {
+      const onlyProj = String(fd.get('only_project') || '').trim();
+      if (!onlyProj || onlyProj === '__custom__') {
+        alert('请选择要绑定的单个项目');
+        return;
+      }
+      body.only_project = onlyProj;
+      body.dest_dirs = String(fd.get('single_dest_dirs') || '')
+        .split(/[\n,]/)
+        .map(s => s.trim())
+        .filter(Boolean);
+    } else {
+      const projects = {};
+      String(fd.get('projects_map') || '').split('\n').forEach(line => {
+        const trimmed = line.trim();
+        if (!trimmed || !trimmed.includes('=')) return;
+        const idx = trimmed.indexOf('=');
+        const k = trimmed.slice(0, idx).trim();
+        const v = trimmed.slice(idx + 1).trim();
+        if (k && v) projects[k] = v;
+      });
+      body.projects = projects;
+    }
     try {
       const res = await api('/api/v1/admin/deploy/agent-b-script', {
         method: 'POST',
-        body: JSON.stringify({
-          node_id: fd.get('node_id'),
-          node_token: fd.get('node_token'),
-          rotate_token: fd.get('rotate_token') === 'on',
-          install_dir: fd.get('install_dir'),
-          state_dir: fd.get('state_dir'),
-          release_id: fd.get('release_id'),
-          projects,
-        }),
+        body: JSON.stringify(body),
       });
       lastBScript = res.script || '';
       const out = document.getElementById('b-script-output');
@@ -1372,6 +1553,4 @@ function setupEvents() {
 
 setupEvents();
 updateAuthControls();
-// Always attempt initial load first so trusted IPs bypass login seamlessly;
-// untrusted clients without a valid cached localStorage token will fall back to login modal on 401.
 refreshAll();

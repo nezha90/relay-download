@@ -332,7 +332,13 @@ func (s *Server) handleAdminBatchUpgrade(w http.ResponseWriter, r *http.Request)
 			continue
 		}
 		if node.Role != rel.Role {
-			res.Skipped[nid] = fmt.Sprintf("角色不匹配 (节点为 %s，版本包为 %s)", node.Role, rel.Role)
+			roleLabel := func(r string) string {
+				if r == protocol.RoleAgentA {
+					return "分发节点"
+				}
+				return "接收节点"
+			}
+			res.Skipped[nid] = fmt.Sprintf("角色不匹配 (节点为%s，版本包为%s)", roleLabel(node.Role), roleLabel(rel.Role))
 			continue
 		}
 		// Check platform match if node has reported OS/Arch in heartbeat.
@@ -474,7 +480,7 @@ func (s *Server) handleAdminDeployAgentA(w http.ResponseWriter, r *http.Request)
 		Host:           req.Host,
 		Status:         "running",
 		Step:           "init",
-		Logs:           []string{fmt.Sprintf("[%s] 开始部署公网 A 节点 %s -> %s", time.Now().Format("15:04:05"), req.NodeID, req.Host)},
+		Logs:           []string{fmt.Sprintf("[%s] 开始部署公网分发节点 %s -> %s", time.Now().Format("15:04:05"), req.NodeID, req.Host)},
 		PublicAddr:     pubAddr,
 		ReleaseVersion: rel.Version,
 		StartedAt:      time.Now().UTC(),
