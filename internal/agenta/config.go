@@ -27,6 +27,8 @@ type Config struct {
 	TLSKey               string   `yaml:"tls_key"`
 	CACert               string   `yaml:"ca_cert"`
 	DataDir              string   `yaml:"data_dir"`
+	StorageDirs          []string `yaml:"storage_dirs,omitempty"`         // multi-disk cache roots managed by Center or YAML
+	AwaitDiskSelection   bool     `yaml:"await_disk_selection,omitempty"` // if true, activate online & scan host disks, wait until Center selects data disks
 	MaxDiskUsagePct      float64  `yaml:"max_disk_usage_pct"`
 	MinFreeDiskBytes     uint64   `yaml:"min_free_disk_bytes"`
 	LeaseTTLSec          int      `yaml:"lease_ttl_sec"`

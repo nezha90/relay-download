@@ -971,7 +971,114 @@ function renderProjectScope(projects, schedule, node) {
   `;
 }
 
+function findNewHostDisks(n) {
+  if (!n || n.awaiting_disk) return [];
+  const hostDisks = n.host_disks || [];
+  if (!hostDisks.length) return [];
+  const configured = new Set([...(n.storage_dirs || []), ...((n.disks || []).map(d => d.path))]);
+  if (!configured.size) return [];
+  return hostDisks.filter(hd => {
+    if (hd.is_system) return false;
+    if (configured.has(hd.suggested_dir)) return false;
+    const mntPrefix = hd.mount_point.endsWith('/') ? hd.mount_point : hd.mount_point + '/';
+    for (const p of configured) {
+      if (p === hd.mount_point || p.startsWith(mntPrefix)) return false;
+    }
+    return true;
+  });
+}
+
+function analyzeNodeDiskAlerts(n) {
+  const disks = n.disks || [];
+  const lockedSet = new Set(n.unplug_locked_disks || []);
+  let detached = 0;
+  let reinsert = 0;
+  let safeEject = 0;
+  for (const d of disks) {
+    if (d.detached) {
+      detached++;
+    } else if (d.unplug_latched || lockedSet.has(d.path)) {
+      reinsert++;
+    } else if (d.safe_to_eject) {
+      safeEject++;
+    }
+  }
+  const newDisks = findNewHostDisks(n);
+  return { detached, reinsert, safeEject, newCount: newDisks.length };
+}
+
+function renderNodeDiskAlertBadges(n) {
+  const st = analyzeNodeDiskAlerts(n);
+  const parts = [];
+  if (st.detached > 0) parts.push(`<span class="badge detached">⚠ ${st.detached} 块盘已拔出</span>`);
+  if (st.reinsert > 0) parts.push(`<span class="badge reinsert">🔌 ${st.reinsert} 块盘重插待确认</span>`);
+  if (st.safeEject > 0) parts.push(`<span class="badge safe-eject">✓ ${st.safeEject} 块盘可安全拔出</span>`);
+  if (st.newCount > 0) parts.push(`<span class="badge new-disk">+ 发现 ${st.newCount} 块新盘</span>`);
+  return parts.join('');
+}
+
+function renderDiskMiniItem(d, disabledSet, lockedSet, watermarkPct) {
+  const isLocked = !!(d.unplug_latched || lockedSet.has(d.path));
+  const enabled = d.enabled !== false && !disabledSet.has(d.path) && !isLocked && !d.detached;
+  const pct = Number(d.used_pct || 0);
+  let itemCls = '';
+  let barCls = '';
+  let stTag = '';
+  let detailHtml = '';
+
+  if (d.detached) {
+    itemCls = ' detached';
+    stTag = '<span class="badge detached">⚠ 已拔出/未挂载</span>';
+    detailHtml = `<div class="muted">${esc(d.status_reason || '已自动锁定 · 防止写进系统盘')}</div>`;
+  } else if (isLocked) {
+    itemCls = ' reinsert';
+    stTag = '<span class="badge reinsert">🔌 重插待确认</span>';
+    detailHtml = `
+      <div class="bar-wrap"><div class="bar-fill" style="width:${Math.min(100, pct).toFixed(1)}%"></div></div>
+      <div class="muted">${esc(d.status_reason || '已重新挂载，请在配置中人工确认启用')} · 剩 ${fmtBytes(d.free_bytes)}</div>
+    `;
+  } else if (!enabled) {
+    itemCls = d.safe_to_eject ? ' safe-eject' : ' disabled';
+    if (d.safe_to_eject) {
+      stTag = '<span class="badge safe-eject">✓ 可安全拔盘</span>';
+    } else if ((d.in_flight || 0) > 0) {
+      stTag = `<span class="badge alarm">排空中 (${d.in_flight})</span>`;
+    } else {
+      stTag = '<span class="badge offline">已停用</span>';
+    }
+    detailHtml = `
+      <div class="bar-wrap"><div class="bar-fill" style="width:${Math.min(100, pct).toFixed(1)}%"></div></div>
+      <div class="muted">${esc(d.status_reason || '已停用')} · 剩 ${fmtBytes(d.free_bytes)} / ${fmtBytes(d.total_bytes)}</div>
+    `;
+  } else {
+    barCls = d.low_space || pct >= watermarkPct ? 'red' : 'green';
+    stTag = d.low_space
+      ? '<span class="badge alarm">触达水位</span>'
+      : `<span class="badge online">启用${(d.in_flight || 0) > 0 ? ` · 在途 ${d.in_flight}` : ''}</span>`;
+    detailHtml = `
+      <div class="bar-wrap"><div class="bar-fill ${barCls}" style="width:${Math.min(100, pct).toFixed(1)}%"></div></div>
+      <div class="muted">剩 ${fmtBytes(d.free_bytes)} / ${fmtBytes(d.total_bytes)} (${pct.toFixed(1)}%)</div>
+    `;
+  }
+  return `
+    <div class="disk-mini-item${itemCls}">
+      <div class="disk-mini-head">
+        <span class="mono" title="${esc(d.path)}">${esc(d.path)}</span>
+        ${stTag}
+      </div>
+      ${detailHtml}
+    </div>
+  `;
+}
+
 function renderReceiverDisks(n) {
+  if (n.awaiting_disk) {
+    const foundCnt = (n.host_disks || []).length;
+    return `
+      <div><span class="badge awaiting">⚠ 待选择数据盘（未激活）</span></div>
+      <div class="muted" style="margin-top:4px">${foundCnt > 0 ? `已扫描到 ${foundCnt} 块物理盘，请点右侧「选择数据盘并激活」` : '请点右侧「选择数据盘并激活」'}</div>
+    `;
+  }
   const polBadge = `<span class="badge">${esc(diskPolicyLabel(n.disk_policy))}</span>`;
   const disks = n.disks || [];
   if (!disks.length) {
@@ -981,30 +1088,41 @@ function renderReceiverDisks(n) {
     `;
   }
   const disabledSet = new Set(n.disabled_disks || []);
-  const items = disks.map(d => {
-    const enabled = d.enabled !== false && !disabledSet.has(d.path);
-    const pct = Number(d.used_pct || 0);
-    const barCls = !enabled ? '' : (d.low_space || pct >= 90 ? 'red' : 'green');
-    const stTag = !enabled
-      ? '<span class="badge offline">已停用</span>'
-      : (d.low_space ? '<span class="badge alarm">低空间</span>' : '<span class="badge online">启用</span>');
-    return `
-      <div class="disk-mini-item${enabled ? '' : ' disabled'}">
-        <div class="disk-mini-head">
-          <span class="mono" title="${esc(d.path)}">${esc(d.path)}</span>
-          ${stTag}
-        </div>
-        <div class="bar-wrap"><div class="bar-fill ${barCls}" style="width:${Math.min(100, pct).toFixed(1)}%"></div></div>
-        <div class="muted">剩 ${fmtBytes(d.free_bytes)} / ${fmtBytes(d.total_bytes)} (${pct.toFixed(1)}%)</div>
-      </div>
-    `;
-  }).join('');
+  const lockedSet = new Set(n.unplug_locked_disks || []);
+  const activeCnt = disks.filter(d => d.enabled !== false && !disabledSet.has(d.path) && !d.detached && !d.unplug_latched && !lockedSet.has(d.path)).length;
+  const items = disks.map(d => renderDiskMiniItem(d, disabledSet, lockedSet, 90)).join('');
   return `
     <div style="margin-bottom:5px;display:flex;gap:4px;flex-wrap:wrap;align-items:center">
       ${polBadge}
-      ${n.storage_dirs && n.storage_dirs.length ? '<span class="badge online">磁盘池托管</span>' : ''}
+      ${activeCnt > 1 ? `<span class="badge accent">${activeCnt} 盘并发</span>` : ''}
     </div>
     <div class="disk-mini-list">${items}</div>
+  `;
+}
+
+function renderDispatchDisks(n) {
+  if (n.awaiting_disk) {
+    const foundCnt = (n.host_disks || []).length;
+    return `
+      <div><span class="badge awaiting">⚠ 待选缓存盘（未激活）</span></div>
+      <div class="muted" style="margin-top:4px">${foundCnt > 0 ? `已扫描到 ${foundCnt} 块物理盘，请点右侧激活` : '请点右侧「选择数据盘并激活」'}</div>
+    `;
+  }
+  const disks = n.disks || [];
+  if (disks.length > 0) {
+    const disabledSet = new Set(n.disabled_disks || []);
+    const lockedSet = new Set(n.unplug_locked_disks || []);
+    const activeCnt = disks.filter(d => d.enabled !== false && !disabledSet.has(d.path) && !d.detached && !d.unplug_latched && !lockedSet.has(d.path)).length;
+    const items = disks.map(d => renderDiskMiniItem(d, disabledSet, lockedSet, 85)).join('');
+    return `
+      ${activeCnt > 1 ? `<div style="margin-bottom:5px"><span class="badge accent">${activeCnt} 盘并发缓存</span></div>` : ''}
+      <div class="disk-mini-list">${items}</div>
+    `;
+  }
+  const pct = Number(n.disk_used_pct || 0).toFixed(1);
+  return `
+    <div class="bar-wrap"><div class="bar-fill ${n.disk_alarm ? 'red' : ''}" style="width:${Math.min(100, Number(pct))}%"></div></div>
+    <div class="muted">${pct}% (剩余 ${fmtBytes(n.disk_free_bytes)})</div>
   `;
 }
 
@@ -1028,30 +1146,33 @@ function renderNodes(nodes, winHours) {
   document.getElementById('nodes-a-tbody').innerHTML = as.length ? as.map(n => {
     const queued = (n.availability || []).reduce((a, x) => a + (x.ready_count || 0) + (x.claimed_count || 0), 0);
     const queuedBytes = (n.availability || []).reduce((a, x) => a + (x.ready_bytes || 0), 0);
-    const pct = (n.disk_used_pct || 0).toFixed(1);
     const verStr = n.version ? `${n.version}${n.arch ? ' · ' + n.arch : ''}` : '-';
     const checked = selectedNodes.agent_a.has(n.id) ? 'checked' : '';
+    const diskAlerts = analyzeNodeDiskAlerts(n);
+    const rowCls = n.awaiting_disk ? 'row-awaiting-disk' : (diskAlerts.detached > 0 ? 'row-disk-alert' : '');
+    const diskBtn = n.awaiting_disk
+      ? `<button class="btn sm activate" data-action="edit-a-disks" data-id="${esc(n.id)}">⚡ 选择数据盘并激活</button>`
+      : `<button class="btn sm primary" data-action="edit-a-disks" data-id="${esc(n.id)}">管理数据盘</button>`;
     const pauseBtn = n.paused
       ? `<button class="btn sm success" data-action="toggle-pause-node" data-id="${esc(n.id)}" data-paused="1">启动</button>`
       : `<button class="btn sm warn" data-action="toggle-pause-node" data-id="${esc(n.id)}" data-paused="0">暂停</button>`;
     return `
-      <tr>
+      <tr class="${rowCls}">
         <td><input type="checkbox" class="node-chk" data-role="agent_a" data-id="${esc(n.id)}" ${checked} /></td>
         <td><strong>${esc(n.name)}</strong><div class="mono muted">${esc(n.id)}</div></td>
         <td>
           <div style="display:flex;gap:4px;flex-wrap:wrap;align-items:center">
             <span class="badge ${n.online ? 'online pulse' : 'offline'}">${n.online ? '在线' : '离线'}</span>
+            ${n.awaiting_disk ? '<span class="badge awaiting">待选盘 · 未激活</span>' : ''}
             ${n.paused ? '<span class="badge alarm">已暂停</span>' : ''}
-            ${n.disk_alarm ? '<span class="badge alarm">水位告警</span>' : ''}
+            ${n.disk_alarm && diskAlerts.detached === 0 ? '<span class="badge alarm">水位告警</span>' : ''}
+            ${renderNodeDiskAlertBadges(n)}
             ${renderUpgradeBadge(n)}
           </div>
           <div class="mono muted" style="margin-top:3px">${esc(verStr)}</div>
         </td>
         <td class="mono">${esc(n.public_addr || '-')}</td>
-        <td>
-          <div class="bar-wrap"><div class="bar-fill ${n.disk_alarm ? 'red' : ''}" style="width:${Math.min(100, pct)}%"></div></div>
-          <div class="muted">${pct}% (剩余 ${fmtBytes(n.disk_free_bytes)})</div>
-        </td>
+        <td>${renderDispatchDisks(n)}</td>
         <td>
           <div>${fmtNum(queued)} 文件</div>
           <div class="muted">${fmtBytes(queuedBytes)}</div>
@@ -1062,6 +1183,7 @@ function renderNodes(nodes, winHours) {
         </td>
         <td>
           <div class="btn-row">
+            ${diskBtn}
             ${pauseBtn}
             <button class="btn sm" data-action="open-a-script" data-id="${esc(n.id)}">安装脚本</button>
             <button class="btn sm danger" data-action="delete-node" data-id="${esc(n.id)}">删除</button>
@@ -1074,17 +1196,24 @@ function renderNodes(nodes, winHours) {
   document.getElementById('nodes-b-tbody').innerHTML = bs.length ? bs.map(n => {
     const verStr = n.version ? `${n.version}${n.arch ? ' · ' + n.arch : ''}` : '-';
     const checked = selectedNodes.agent_b.has(n.id) ? 'checked' : '';
+    const diskAlerts = analyzeNodeDiskAlerts(n);
+    const rowCls = n.awaiting_disk ? 'row-awaiting-disk' : (diskAlerts.detached > 0 ? 'row-disk-alert' : '');
+    const cfgBtn = n.awaiting_disk
+      ? `<button class="btn sm activate" data-action="edit-node-projects" data-id="${esc(n.id)}">⚡ 选择数据盘并激活</button>`
+      : `<button class="btn sm primary" data-action="edit-node-projects" data-id="${esc(n.id)}">配置项目与磁盘</button>`;
     const pauseBtn = n.paused
       ? `<button class="btn sm success" data-action="toggle-pause-node" data-id="${esc(n.id)}" data-paused="1">启动</button>`
       : `<button class="btn sm warn" data-action="toggle-pause-node" data-id="${esc(n.id)}" data-paused="0">暂停</button>`;
     return `
-      <tr>
+      <tr class="${rowCls}">
         <td><input type="checkbox" class="node-chk" data-role="agent_b" data-id="${esc(n.id)}" ${checked} /></td>
         <td><strong>${esc(n.name)}</strong><div class="mono muted">${esc(n.id)}</div></td>
         <td>
           <div style="display:flex;gap:4px;flex-wrap:wrap;align-items:center">
             <span class="badge ${n.online ? 'online pulse' : 'offline'}">${n.online ? '在线' : '离线'}</span>
+            ${n.awaiting_disk ? '<span class="badge awaiting">待选盘 · 未激活</span>' : ''}
             ${n.paused ? '<span class="badge alarm">已暂停</span>' : ''}
+            ${renderNodeDiskAlertBadges(n)}
             ${renderUpgradeBadge(n)}
           </div>
           <div class="mono muted" style="margin-top:3px">${esc(verStr)}</div>
@@ -1101,8 +1230,8 @@ function renderNodes(nodes, winHours) {
         </td>
         <td>
           <div class="btn-row">
+            ${cfgBtn}
             ${pauseBtn}
-            <button class="btn sm primary" data-action="edit-node-projects" data-id="${esc(n.id)}">配置项目与磁盘</button>
             <button class="btn sm" data-action="open-b-script" data-id="${esc(n.id)}">安装脚本</button>
             <button class="btn sm danger" data-action="delete-node" data-id="${esc(n.id)}">删除</button>
           </div>
@@ -1555,43 +1684,294 @@ function renderEditProjectChecks(selectedList) {
   }).join('');
 }
 
+function matchConfiguredDirForHostDisk(hd, configuredList, allHostDisks) {
+  if (configuredList.includes(hd.suggested_dir)) return hd.suggested_dir;
+  if (!hd.is_system) {
+    const mntPrefix = hd.mount_point.endsWith('/') ? hd.mount_point : hd.mount_point + '/';
+    for (const d of configuredList) {
+      if (d === hd.mount_point || d.startsWith(mntPrefix)) return d;
+    }
+    return '';
+  }
+  const otherPrefixes = allHostDisks
+    .filter(x => !x.is_system)
+    .map(x => (x.mount_point.endsWith('/') ? x.mount_point : x.mount_point + '/'));
+  for (const d of configuredList) {
+    if (!otherPrefixes.some(pfx => d === pfx.slice(0, -1) || d.startsWith(pfx))) {
+      return d;
+    }
+  }
+  return '';
+}
+
+function renderHostDiskPicker(wrap, node, watermarkPct) {
+  if (!wrap) return;
+  const disabledSet = new Set(node.disabled_disks || []);
+  const lockedSet = new Set(node.unplug_locked_disks || []);
+  const diskByPath = new Map((node.disks || []).map(d => [d.path, d]));
+  const configuredList = Array.from(new Set([...(node.storage_dirs || []), ...((node.disks || []).map(d => d.path))]));
+  const hostDisks = node.host_disks || [];
+
+  if (hostDisks.length > 0) {
+    const matchedConfigured = new Set();
+    const hostRows = hostDisks.map(hd => {
+      const cfgPath = matchConfiguredDirForHostDisk(hd, configuredList, hostDisks);
+      const isConfigured = !!cfgPath;
+      const targetPath = cfgPath || hd.suggested_dir;
+      if (isConfigured) matchedConfigured.add(cfgPath);
+
+      const dStat = diskByPath.get(targetPath);
+      const isLocked = !!(lockedSet.has(targetPath) || (dStat && dStat.unplug_latched));
+      const isDisabled = disabledSet.has(targetPath) || isLocked;
+      const checked = isConfigured && !isDisabled;
+
+      const pct = Number(hd.used_pct || 0);
+      const overWM = pct >= watermarkPct || (hd.total_bytes >= 50 * 1024 * 1024 * 1024 && hd.free_bytes <= 10 * 1024 * 1024 * 1024);
+      const barCls = !checked ? '' : (overWM ? 'red' : 'green');
+      const kindBadge = hd.is_system
+        ? `<span class="badge alarm">系统盘 · 强制水位 ≤${watermarkPct}%</span>`
+        : `<span class="badge accent">数据盘 · 强制水位 ≤${watermarkPct}%</span>`;
+
+      let stateBadge = '';
+      let subText = '';
+      let rowCls = '';
+      if (isLocked) {
+        rowCls = ' is-reinsert';
+        stateBadge = '<span class="badge reinsert">🔌 曾拔出重插 · 待人工确认</span>';
+        subText = '磁盘曾拔出/重挂已自动锁定 · 确认无误后打开左侧开关并保存即可恢复写入';
+      } else if (isConfigured && isDisabled) {
+        if (dStat && dStat.safe_to_eject) {
+          stateBadge = '<span class="badge safe-eject">✓ 已排空 · 可安全卸载拔盘</span>';
+          subText = '在途写入 0 · 当前可安全 umount 拔盘（或重新打开开关恢复）';
+        } else if (dStat && (dStat.in_flight || 0) > 0) {
+          stateBadge = `<span class="badge alarm">排空中 · 在途 ${dStat.in_flight}</span>`;
+          subText = `正在等待 ${dStat.in_flight} 个在途传输完成，归零后再卸载拔盘`;
+        } else {
+          stateBadge = '<span class="badge offline">已停用</span>';
+          subText = (dStat && dStat.status_reason) || '已停用 · 不再写入新文件';
+        }
+      } else if (checked) {
+        if (dStat && (dStat.in_flight || 0) > 0) {
+          stateBadge = `<span class="badge online">启用中 · 在途 ${dStat.in_flight}</span>`;
+        }
+        subText = '启用中 · 允许并发写入（关闭开关可进入安全排空准备拔盘）';
+      } else {
+        if (!hd.is_system && !node.awaiting_disk) {
+          stateBadge = '<span class="badge new-disk">✨ 新发现物理盘</span>';
+        }
+        subText = '未启用 · 勾选并保存即可自动建目录加入并发池';
+      }
+
+      const removeBtn = (isConfigured && isDisabled)
+        ? `<button type="button" class="btn sm ghost" data-toggle-remove-disk="1">移出磁盘池</button>`
+        : '';
+
+      return `
+        <div class="disk-toggle-row${rowCls}" data-disk-row="1">
+          <label class="disk-toggle-left" style="cursor:pointer;flex:1">
+            <input type="checkbox" class="edit-disk-chk" data-source="host" data-configured="${isConfigured ? '1' : '0'}" data-dir="${esc(targetPath)}" value="${esc(targetPath)}" ${checked ? 'checked' : ''} />
+            <div>
+              <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+                <strong class="mono">${esc(hd.mount_point)}</strong>
+                <span class="muted mono">${esc(hd.device)} · ${esc(hd.fs_type)}</span>
+                ${kindBadge}
+                ${stateBadge}
+                ${overWM ? '<span class="badge offline">接近/超水位</span>' : ''}
+              </div>
+              <div class="muted disk-toggle-sub" style="margin-top:3px">目录: <span class="mono">${esc(targetPath)}</span> · ${esc(subText)}${hd.writable === false ? ' · 不可写' : ''}</div>
+            </div>
+          </label>
+          <div class="disk-toggle-right">
+            <div class="bar-wrap" style="width:150px"><div class="bar-fill ${barCls}" style="width:${Math.min(100, pct).toFixed(1)}%"></div></div>
+            <div class="muted">剩余 ${fmtBytes(hd.free_bytes)} / ${fmtBytes(hd.total_bytes)} (${pct.toFixed(1)}%)</div>
+            ${removeBtn ? `<div class="disk-row-actions">${removeBtn}</div>` : ''}
+          </div>
+        </div>
+      `;
+    });
+
+    // Render any configured disks that are currently UNMOUNTED / UNPLUGGED (absent from host_disks) prominently at top!
+    const missingRows = configuredList
+      .filter(p => !matchedConfigured.has(p))
+      .map(p => {
+        const dStat = diskByPath.get(p);
+        const reason = (dStat && dStat.status_reason) || '未检测到该挂载点，已自动锁定并拦截写入（防止穿透写进系统盘）';
+        return `
+          <div class="disk-toggle-row is-detached" data-disk-row="1">
+            <div class="disk-toggle-left" style="flex:1">
+              <input type="checkbox" class="edit-disk-chk" data-source="detached" data-configured="1" data-dir="${esc(p)}" value="${esc(p)}" disabled />
+              <div>
+                <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+                  <strong class="mono">${esc(p)}</strong>
+                  <span class="badge detached">⚠ 已拔出 / 未挂载</span>
+                  <span class="badge offline">已自动锁定</span>
+                </div>
+                <div class="muted disk-toggle-sub" style="margin-top:3px">${esc(reason)} · 重插挂载后点右上角「刷新物理盘」再人工勾选启用</div>
+              </div>
+            </div>
+            <div class="disk-toggle-right">
+              <button type="button" class="btn sm danger" data-toggle-remove-disk="1">移出磁盘池</button>
+            </div>
+          </div>
+        `;
+      });
+
+    wrap.innerHTML = [...missingRows, ...hostRows].join('');
+    return;
+  }
+
+  // Fallback for offline or pre-v1.12.0 nodes that haven't reported host_disks yet.
+  const disks = node.disks || [];
+  if (!disks.length) {
+    wrap.innerHTML = '<div class="empty" style="padding:18px">暂未收到该节点的物理盘扫描列表：请先在目标机执行一键激活脚本上线，然后点击右上角「刷新物理盘」。</div>';
+    return;
+  }
+  wrap.innerHTML = disks.map(d => {
+    const isLocked = !!(d.unplug_latched || lockedSet.has(d.path));
+    const enabled = !disabledSet.has(d.path) && !isLocked && !d.detached;
+    const pct = Number(d.used_pct || 0);
+    const barCls = !enabled ? '' : (d.low_space || pct >= watermarkPct ? 'red' : 'green');
+    return `
+      <div class="disk-toggle-row${d.detached ? ' is-detached' : (isLocked ? ' is-reinsert' : '')}" data-disk-row="1">
+        <label class="disk-toggle-left" style="cursor:pointer;flex:1">
+          <input type="checkbox" class="edit-disk-chk" data-source="legacy" data-configured="1" data-dir="${esc(d.path)}" value="${esc(d.path)}" ${enabled ? 'checked' : ''} ${d.detached ? 'disabled' : ''} />
+          <div>
+            <div class="mono"><strong>${esc(d.path)}</strong> ${d.detached ? '<span class="badge detached">⚠ 已拔出</span>' : (isLocked ? '<span class="badge reinsert">🔌 重插待确认</span>' : '')}</div>
+            <div class="muted disk-toggle-sub">${esc(d.status_reason || (enabled ? '启用中 · 允许写入' : '已停用 · 不再写入新文件'))}${d.low_space ? ' · 触达安全水位' : ''}</div>
+          </div>
+        </label>
+        <div class="disk-toggle-right">
+          <div class="bar-wrap" style="width:150px"><div class="bar-fill ${barCls}" style="width:${Math.min(100, pct).toFixed(1)}%"></div></div>
+          <div class="muted">剩余 ${fmtBytes(d.free_bytes)} / ${fmtBytes(d.total_bytes)} (${pct.toFixed(1)}%)</div>
+        </div>
+      </div>
+    `;
+  }).join('');
+}
+
+function collectDiskSelectionFromPicker(listEl, node) {
+  const chks = Array.from(listEl.querySelectorAll('input.edit-disk-chk'));
+  if (!chks.length) return { hasChks: false };
+  const isLegacyOnly = chks.every(el => el.dataset.source === 'legacy');
+  const storageDirs = [];
+  const disabledDisks = [];
+  let enabledCount = 0;
+
+  for (const el of chks) {
+    const row = el.closest('[data-disk-row]');
+    if (row && row.dataset.removed === '1') {
+      continue;
+    }
+    const dir = el.value;
+    const wasConfigured = el.dataset.configured === '1';
+    if (el.checked) {
+      storageDirs.push(dir);
+      enabledCount++;
+    } else if (wasConfigured) {
+      // Preserve configured disks in storage_dirs while marking disabled so operator sees live
+      // in-flight drain ("可安全拔盘") or detached status until explicitly removed from pool.
+      storageDirs.push(dir);
+      disabledDisks.push(dir);
+    }
+  }
+  return {
+    hasChks: true,
+    isLegacyOnly,
+    storageDirs,
+    disabledDisks,
+    enabledCount,
+    awaiting: !!(node && node.awaiting_disk),
+  };
+}
+
 function renderEditDisksList(node) {
   const sec = document.getElementById('edit-disks-section');
   const wrap = document.getElementById('edit-disks-list');
   const tip = document.getElementById('edit-storage-pool-tip');
-  const disks = node.disks || [];
-  const disabledSet = new Set(node.disabled_disks || []);
-
+  if (sec) sec.classList.remove('hidden');
   if (tip) {
-    const hasPool = !!(node.storage_dirs && node.storage_dirs.length);
-    tip.classList.toggle('hidden', !node.online || hasPool);
+    const hasInfo = (node.host_disks && node.host_disks.length > 0) || (node.disks && node.disks.length > 0);
+    tip.classList.toggle('hidden', !node.online || hasInfo);
   }
-  if (!disks.length) {
-    sec.classList.remove('hidden');
-    wrap.innerHTML = '<div class="muted">等待接收节点上报磁盘信息（升级至 v1.8.0 后自动展示每块挂载盘容量与启停开关）</div>';
-    return;
+  renderHostDiskPicker(wrap, node, 90);
+}
+
+function updateNodeDiskModalBanners(node, role) {
+  if (role === 'agent_b') {
+    const bBanner = document.getElementById('edit-b-awaiting-banner');
+    const bSubmit = document.getElementById('edit-b-submit-btn');
+    if (bBanner) bBanner.classList.toggle('hidden', !node.awaiting_disk);
+    if (bSubmit) {
+      bSubmit.textContent = node.awaiting_disk ? '⚡ 确认所选磁盘并立即激活接收节点' : '保存配置并立即下发';
+      bSubmit.classList.toggle('activate', !!node.awaiting_disk);
+      bSubmit.classList.toggle('primary', !node.awaiting_disk);
+    }
+  } else {
+    const aBanner = document.getElementById('edit-a-awaiting-banner');
+    const aSubmit = document.getElementById('edit-a-submit-btn');
+    if (aBanner) aBanner.classList.toggle('hidden', !node.awaiting_disk);
+    if (aSubmit) {
+      aSubmit.textContent = node.awaiting_disk ? '⚡ 确认所选磁盘并立即激活分发节点' : '保存数据盘配置并热生效';
+      aSubmit.classList.toggle('activate', !!node.awaiting_disk);
+      aSubmit.classList.toggle('primary', !node.awaiting_disk);
+    }
   }
-  sec.classList.remove('hidden');
-  wrap.innerHTML = disks.map(d => {
-    const enabled = !disabledSet.has(d.path);
-    const pct = Number(d.used_pct || 0);
-    const barCls = !enabled ? '' : (d.low_space || pct >= 90 ? 'red' : 'green');
-    return `
-      <label class="disk-toggle-row">
-        <div class="disk-toggle-left">
-          <input type="checkbox" class="edit-disk-chk" value="${esc(d.path)}" ${enabled ? 'checked' : ''} />
-          <div>
-            <div class="mono"><strong>${esc(d.path)}</strong></div>
-            <div class="muted">${enabled ? '启用中 · 允许落盘' : '已停用 · 不再写入新文件'}${d.low_space ? ' · 低于安全余量水位' : ''}${d.writable === false ? ' · 目录不可写' : ''}</div>
-          </div>
-        </div>
-        <div class="disk-toggle-right">
-          <div class="bar-wrap" style="width:140px"><div class="bar-fill ${barCls}" style="width:${Math.min(100, pct).toFixed(1)}%"></div></div>
-          <div class="muted">剩余 ${fmtBytes(d.free_bytes)} / ${fmtBytes(d.total_bytes)} (${pct.toFixed(1)}%)</div>
-        </div>
-      </label>
-    `;
-  }).join('');
+}
+
+async function refreshNodeDisksInModal(nodeId, role, btnEl) {
+  if (!nodeId) return;
+  if (btnEl) {
+    btnEl.disabled = true;
+    btnEl.classList.add('is-loading');
+  }
+  try {
+    const fresh = await api(`/api/v1/admin/nodes/${encodeURIComponent(nodeId)}/disks`);
+    const node = cachedNodes.find(n => n.id === nodeId) || { id: nodeId, role };
+    node.online = !!fresh.online;
+    node.awaiting_disk = !!fresh.awaiting_disk;
+    node.disk_gen = fresh.disk_gen || 0;
+    node.storage_dirs = fresh.storage_dirs || [];
+    node.disabled_disks = fresh.disabled_disks || [];
+    node.unplug_locked_disks = fresh.unplug_locked_disks || [];
+    node.disks = fresh.disks || [];
+    node.host_disks = fresh.host_disks || [];
+    if (role === 'agent_b') {
+      renderEditDisksList(node);
+    } else {
+      renderHostDiskPicker(document.getElementById('edit-a-disks-list'), node, 85);
+    }
+    updateNodeDiskModalBanners(node, role);
+    const cnt = (node.host_disks || []).length;
+    showToast(
+      cnt > 0 ? `已刷新物理盘：共扫描到 ${cnt} 块已挂载磁盘` : '已刷新：节点暂未上报物理盘（请确认节点已在线）',
+      cnt > 0 ? 'success' : 'info'
+    );
+  } catch (e) {
+    if (e.message !== 'unauthorized') showToast(`刷新物理盘失败: ${e.message}`, 'error');
+  } finally {
+    if (btnEl) {
+      btnEl.disabled = false;
+      btnEl.classList.remove('is-loading');
+    }
+  }
+}
+
+function openEditADisksModal(nodeId) {
+  const node = cachedNodes.find(n => n.id === nodeId);
+  if (!node) return;
+  const form = document.getElementById('edit-a-disks-form');
+  if (!form) return;
+  form.reset();
+  form.elements.node_id.value = node.id;
+  document.getElementById('edit-a-disks-title').textContent = node.awaiting_disk
+    ? `⚡ 选择分发节点数据盘并激活: ${node.name || node.id}`
+    : `选择分发节点数据盘: ${node.name || node.id}`;
+  renderHostDiskPicker(document.getElementById('edit-a-disks-list'), node, 85);
+  updateNodeDiskModalBanners(node, 'agent_a');
+  openModal('edit-a-disks-modal');
+  if (node.online) {
+    refreshNodeDisksInModal(node.id, 'agent_a', document.getElementById('btn-refresh-a-disks'));
+  }
 }
 
 function openEditNodeProjectsModal(nodeId) {
@@ -1615,7 +1995,9 @@ function openEditNodeProjectsModal(nodeId) {
       liveBanner.classList.add('hidden');
     }
   }
-  document.getElementById('edit-node-title').textContent = `配置接收节点: ${node.name || node.id}`;
+  document.getElementById('edit-node-title').textContent = node.awaiting_disk
+    ? `⚡ 选择接收节点数据盘并激活: ${node.name || node.id}`
+    : `配置接收节点: ${node.name || node.id}`;
 
   const projs = node.projects || [];
   const defaultSingle = projs.length === 1 ? projs[0] : (cachedProjects[0]?.project?.id || '');
@@ -1634,13 +2016,18 @@ function openEditNodeProjectsModal(nodeId) {
   form.elements.projects.value = projs.join(',');
   renderEditProjectChecks(projs);
   renderEditDisksList(node);
+  updateNodeDiskModalBanners(node, 'agent_b');
   syncEditNodeProjectMode();
   openModal('edit-node-modal');
+  if (node.online) {
+    refreshNodeDisksInModal(node.id, 'agent_b', document.getElementById('btn-refresh-b-disks'));
+  }
 }
 
 function syncBScriptMode() {
   const form = document.getElementById('b-script-form');
-  const mode = form.elements.script_mode.value || 'pool';
+  const mode = form.elements.script_mode.value || 'await';
+  document.getElementById('b-script-await-wrap')?.classList.toggle('hidden', mode !== 'await');
   document.getElementById('b-script-pool-wrap').classList.toggle('hidden', mode !== 'pool');
   document.getElementById('b-script-single-wrap').classList.toggle('hidden', mode !== 'single');
   document.getElementById('b-script-multi-wrap').classList.toggle('hidden', mode !== 'multi');
@@ -1655,7 +2042,7 @@ function openBScriptModal(nodeId, presetToken = '') {
   if (!presetToken && node && !node.online) {
     form.elements.rotate_token.checked = true;
   }
-  document.getElementById('b-script-title').textContent = `内网接收节点一键安装脚本: ${nodeId}`;
+  document.getElementById('b-script-title').textContent = `内网接收节点一键激活脚本: ${nodeId}`;
   document.getElementById('b-script-output').classList.add('hidden');
   document.getElementById('b-script-steps-tip').classList.add('hidden');
   document.getElementById('btn-copy-b-exec').classList.add('hidden');
@@ -1666,12 +2053,12 @@ function openBScriptModal(nodeId, presetToken = '') {
   const nodeProjs = (node && node.projects) || [];
   const defaultProj = nodeProjs.length === 1 ? nodeProjs[0] : (cachedProjects[0]?.project?.id || '');
   populateProjectSelect(document.getElementById('b-script-single-project'), defaultProj, false);
-  form.elements.script_mode.value = 'pool';
+  form.elements.script_mode.value = (node && node.storage_dirs && node.storage_dirs.length) ? 'pool' : 'await';
   form.elements.storage_dirs.value = (node && node.storage_dirs && node.storage_dirs.length)
     ? node.storage_dirs.join('\n')
     : '/mnt/sda/relay-delivery\n/mnt/sdb/relay-delivery';
   if (defaultProj) {
-    form.elements.single_dest_dirs.value = `/data/relay-b/files/${defaultProj}`;
+    form.elements.single_dest_dirs.value = `/data/relay-delivery/${defaultProj}`;
   }
   syncBScriptMode();
   openModal('b-script-modal');
@@ -1686,7 +2073,9 @@ function openAScriptModal(nodeId, presetToken = '') {
   form.elements.node_token.value = presetToken;
   form.elements.public_addr.value = (node && node.public_addr) || '';
   form.elements.rotate_token.checked = !presetToken && !(node && node.online);
-  document.getElementById('a-script-title').textContent = `分发节点自动化安装脚本: ${nodeId}`;
+  form.elements.await_disk_selection.checked = true;
+  document.getElementById('a-script-datadir-wrap')?.classList.add('hidden');
+  document.getElementById('a-script-title').textContent = `分发节点一键激活脚本: ${nodeId}`;
   document.getElementById('a-script-output').classList.add('hidden');
   document.getElementById('a-script-token-box').classList.add('hidden');
   document.getElementById('btn-copy-a-exec').classList.add('hidden');
@@ -1770,6 +2159,7 @@ function setupEvents() {
       case 'view-deploy-task': viewDeployTaskLog(id); break;
       case 'open-a-script': openAScriptModal(id); break;
       case 'open-b-script': openBScriptModal(id); break;
+      case 'edit-a-disks': openEditADisksModal(id); break;
       case 'edit-node-projects': openEditNodeProjectsModal(id); break;
       case 'edit-account': openAccountModal(id); break;
       case 'rotate-account': rotateAccountToken(id); break;
@@ -1896,15 +2286,37 @@ function setupEvents() {
     });
   });
 
-  document.getElementById('edit-disks-list').addEventListener('change', (e) => {
-    const chk = e.target.closest('input.edit-disk-chk');
-    if (!chk) return;
-    const row = chk.closest('.disk-toggle-row');
-    const sub = row && row.querySelector('.disk-toggle-left .muted');
-    if (sub) {
-      sub.textContent = chk.checked ? '启用中 · 允许落盘' : '已停用 · 不再写入新文件';
-    }
-  });
+  const bindDiskPickerEvents = (listId) => {
+    const el = document.getElementById(listId);
+    if (!el) return;
+    el.addEventListener('change', (e) => {
+      const chk = e.target.closest('input.edit-disk-chk');
+      if (!chk) return;
+      const row = chk.closest('.disk-toggle-row');
+      const sub = row && row.querySelector('.disk-toggle-sub');
+      const dir = chk.dataset.dir || chk.value || '';
+      if (sub) {
+        const msg = chk.checked
+          ? '已勾选启用 · 保存后立即生效（重插锁定将同步解除）'
+          : (chk.dataset.configured === '1'
+            ? '保存后停用写入 · 等待在途写入归零即可安全卸载拔盘'
+            : '未启用 · 不会写入该磁盘');
+        sub.innerHTML = `目录: <span class="mono">${esc(dir)}</span> · ${esc(msg)}`;
+      }
+    });
+    el.addEventListener('click', (e) => {
+      const btn = e.target.closest('button[data-toggle-remove-disk]');
+      if (!btn) return;
+      const row = btn.closest('[data-disk-row]');
+      if (!row) return;
+      const nowRemoved = row.dataset.removed !== '1';
+      row.dataset.removed = nowRemoved ? '1' : '0';
+      row.classList.toggle('is-removed', nowRemoved);
+      btn.textContent = nowRemoved ? '撤销移出' : '移出磁盘池';
+    });
+  };
+  bindDiskPickerEvents('edit-disks-list');
+  bindDiskPickerEvents('edit-a-disks-list');
 
   document.getElementById('create-project-form').addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -2074,7 +2486,8 @@ function setupEvents() {
       projs = [];
     }
 
-    const diskChks = Array.from(document.querySelectorAll('#edit-disks-list input.edit-disk-chk'));
+    const node = cachedNodes.find(n => n.id === nodeId);
+    const sel = collectDiskSelectionFromPicker(document.getElementById('edit-disks-list'), node);
     const body = {
       name,
       projects: projs,
@@ -2084,14 +2497,20 @@ function setupEvents() {
       max_concurrent_override: Number(fd.get('max_concurrent_override') || 0),
       rate_limit_mbps: Number(fd.get('rate_limit_mbps') || 0),
     };
-    if (diskChks.length > 0) {
-      const disabledDisks = diskChks.filter(el => !el.checked).map(el => el.value);
-      if (disabledDisks.length === diskChks.length) {
-        if (!confirm('你已停用该节点的全部磁盘，保存后该节点将暂停下载直到重新启用至少一块磁盘。确认保存吗？')) {
+    if (sel.hasChks) {
+      if (sel.awaiting && sel.enabledCount === 0) {
+        showToast('请至少勾选 1 块已挂载的物理磁盘才能激活接收节点', 'error');
+        return;
+      }
+      if (!sel.awaiting && sel.enabledCount === 0) {
+        if (!confirm('当前没有处于启用状态的磁盘，保存后该节点将在排空在途写入后暂停拉取，直到重新启用至少一块磁盘。确认保存（准备拔盘）吗？')) {
           return;
         }
       }
-      body.disabled_disks = disabledDisks;
+      if (!sel.isLegacyOnly) {
+        body.storage_dirs = sel.storageDirs;
+      }
+      body.disabled_disks = sel.disabledDisks;
     }
 
     try {
@@ -2100,10 +2519,62 @@ function setupEvents() {
         body: JSON.stringify(body),
       });
       closeModal('edit-node-modal');
-      showToast(`节点 ${nodeId} 配置已保存，2 秒内下发热生效`, 'success');
+      showToast(`节点 ${nodeId} 磁盘与配置已保存，2 秒内自动建目录并热生效`, 'success');
       refreshAll();
     } catch (err) {
       if (err.message !== 'unauthorized') showToast(`更新节点配置失败: ${err.message}`, 'error');
+    }
+  });
+
+  // Live physical disk refresh buttons inside Receiver & Dispatch modals
+  document.getElementById('btn-refresh-b-disks')?.addEventListener('click', (e) => {
+    const nodeId = document.getElementById('edit-node-form')?.elements?.node_id?.value;
+    refreshNodeDisksInModal(nodeId, 'agent_b', e.currentTarget);
+  });
+  document.getElementById('btn-refresh-a-disks')?.addEventListener('click', (e) => {
+    const nodeId = document.getElementById('edit-a-disks-form')?.elements?.node_id?.value;
+    refreshNodeDisksInModal(nodeId, 'agent_a', e.currentTarget);
+  });
+
+  // Save Dispatch Node multi-disk selection (supports safe-eject disable & unplug re-confirm)
+  document.getElementById('edit-a-disks-form')?.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    const nodeId = String(fd.get('node_id') || '').trim();
+    const node = cachedNodes.find(n => n.id === nodeId);
+    const sel = collectDiskSelectionFromPicker(document.getElementById('edit-a-disks-list'), node);
+    if (!sel.hasChks) {
+      showToast('暂未检测到物理盘，请先在目标分发机执行激活脚本上线后再刷新选择', 'error');
+      return;
+    }
+    if (sel.awaiting && sel.enabledCount === 0) {
+      showToast('请至少勾选 1 块已挂载的物理磁盘才能激活分发节点', 'error');
+      return;
+    }
+    if (!sel.awaiting && sel.enabledCount === 0) {
+      if (!confirm('当前没有启用的缓存盘，保存后该分发节点将停止接收新上传直到重新启用磁盘。确认保存（准备拔盘）吗？')) {
+        return;
+      }
+    }
+    const payload = { disabled_disks: sel.disabledDisks };
+    if (!sel.isLegacyOnly) {
+      payload.storage_dirs = sel.storageDirs;
+    }
+    try {
+      await api(`/api/v1/admin/nodes/${encodeURIComponent(nodeId)}`, {
+        method: 'PUT',
+        body: JSON.stringify(payload),
+      });
+      closeModal('edit-a-disks-modal');
+      showToast(
+        sel.enabledCount > 0
+          ? `分发节点 ${nodeId} 数据盘配置已生效（启用 ${sel.enabledCount} 块盘，2 秒内同步）`
+          : `分发节点 ${nodeId} 磁盘已停用排空，待在途写入归零即可安全拔盘`,
+        'success'
+      );
+      refreshAll();
+    } catch (err) {
+      if (err.message !== 'unauthorized') showToast(`保存分发数据盘失败: ${err.message}`, 'error');
     }
   });
 
@@ -2198,7 +2669,7 @@ function setupEvents() {
   document.getElementById('b-script-form').addEventListener('submit', async (e) => {
     e.preventDefault();
     const fd = new FormData(e.target);
-    const scriptMode = String(fd.get('script_mode') || 'pool');
+    const scriptMode = String(fd.get('script_mode') || 'await');
     const body = {
       node_id: fd.get('node_id'),
       node_token: fd.get('node_token'),
@@ -2207,7 +2678,9 @@ function setupEvents() {
       state_dir: fd.get('state_dir'),
       release_id: fd.get('release_id'),
     };
-    if (scriptMode === 'pool') {
+    if (scriptMode === 'await') {
+      body.await_disk_selection = true;
+    } else if (scriptMode === 'pool') {
       const storageDirs = String(fd.get('storage_dirs') || '')
         .split(/[\n,]/)
         .map(s => s.trim())
@@ -2278,18 +2751,23 @@ function setupEvents() {
   let lastAScriptNodeId = '';
   const aScriptForm = document.getElementById('a-script-form');
   if (aScriptForm) {
+    aScriptForm.elements.await_disk_selection?.addEventListener('change', (e) => {
+      document.getElementById('a-script-datadir-wrap')?.classList.toggle('hidden', e.target.checked);
+    });
     aScriptForm.addEventListener('submit', async (e) => {
       e.preventDefault();
       const fd = new FormData(e.target);
+      const awaitDisk = fd.get('await_disk_selection') === 'on';
       const body = {
         node_id: String(fd.get('node_id') || '').trim(),
         node_token: String(fd.get('node_token') || '').trim(),
         rotate_token: fd.get('rotate_token') === 'on',
+        await_disk_selection: awaitDisk,
         public_addr: String(fd.get('public_addr') || '').trim(),
         public_port: Number(fd.get('public_port') || 8443),
         local_port: Number(fd.get('local_port') || 18081),
         install_dir: String(fd.get('install_dir') || '/opt/relay-agent-a').trim(),
-        data_dir: String(fd.get('data_dir') || '/data/relay-a').trim(),
+        data_dir: awaitDisk ? '' : String(fd.get('data_dir') || '/data/relay-a').trim(),
         release_id: String(fd.get('release_id') || '').trim(),
       };
       try {

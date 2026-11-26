@@ -22,6 +22,10 @@ type LiveAState struct {
 	DiskFreeBytes        uint64
 	DiskUsedPct          float64
 	DiskAlarm            bool
+	StorageDirs          []string
+	Disks                []protocol.DiskStatus
+	HostDisks            []protocol.HostDisk
+	AwaitingDisk         bool
 	Paused               bool
 	ActiveStreams        int
 	MaxConcurrentStreams int
@@ -35,6 +39,7 @@ type LiveBState struct {
 	Projects            []string
 	StorageDirs         []string
 	Disks               []protocol.DiskStatus
+	HostDisks           []protocol.HostDisk
 	ProjectSchedule     string
 	DiskPolicy          string
 	ConcurrencyMode     string
@@ -50,6 +55,7 @@ type LiveBState struct {
 	DiskTotalBytes      uint64
 	DiskFreeBytes       uint64
 	DiskUsedPct         float64
+	AwaitingDisk        bool
 	Paused              bool
 	ActiveCount         int
 	LastSeen            time.Time
@@ -104,6 +110,10 @@ func (h *Hub) UpdateA(hb protocol.AgentAHeartbeatReq) {
 		DiskFreeBytes:        hb.DiskFreeBytes,
 		DiskUsedPct:          hb.DiskUsedPct,
 		DiskAlarm:            hb.DiskAlarm,
+		StorageDirs:          append([]string(nil), hb.StorageDirs...),
+		Disks:                append([]protocol.DiskStatus(nil), hb.Disks...),
+		HostDisks:            append([]protocol.HostDisk(nil), hb.HostDisks...),
+		AwaitingDisk:         hb.AwaitingDisk,
 		Paused:               hb.Paused,
 		ActiveStreams:        hb.ActiveStreams,
 		MaxConcurrentStreams: hb.MaxConcurrentStreams,
@@ -112,7 +122,7 @@ func (h *Hub) UpdateA(hb protocol.AgentAHeartbeatReq) {
 	}
 	h.mu.Unlock()
 
-	if !hb.Paused {
+	if !hb.Paused && !hb.AwaitingDisk {
 		for _, av := range wakeupProjects {
 			h.WakeupB(av.ProjectID, av.ReadyCount)
 		}
@@ -132,6 +142,7 @@ func (h *Hub) UpdateB(hb protocol.AgentBHeartbeatReq) {
 		Projects:            append([]string(nil), hb.Projects...),
 		StorageDirs:         append([]string(nil), hb.StorageDirs...),
 		Disks:               append([]protocol.DiskStatus(nil), hb.Disks...),
+		HostDisks:           append([]protocol.HostDisk(nil), hb.HostDisks...),
 		ProjectSchedule:     hb.ProjectSchedule,
 		DiskPolicy:          hb.DiskPolicy,
 		ConcurrencyMode:     hb.ConcurrencyMode,
@@ -147,6 +158,7 @@ func (h *Hub) UpdateB(hb protocol.AgentBHeartbeatReq) {
 		DiskTotalBytes:      hb.DiskTotalBytes,
 		DiskFreeBytes:       hb.DiskFreeBytes,
 		DiskUsedPct:         hb.DiskUsedPct,
+		AwaitingDisk:        hb.AwaitingDisk,
 		Paused:              hb.Paused,
 		ActiveCount:         activeCnt,
 		LastSeen:            now,
@@ -281,7 +293,7 @@ func (h *Hub) WakeupB(projectID string, readyCount int) {
 		seen[bID] = struct{}{}
 		active := 0
 		if st, ok := h.bNodes[bID]; ok {
-			if st.Paused {
+			if st.Paused || st.AwaitingDisk {
 				return
 			}
 			active = st.ActiveCount
@@ -324,7 +336,7 @@ func (h *Hub) DiscoverCandidates(projectID string) []protocol.DiscoverCandidate 
 	h.mu.RLock()
 	list := make([]protocol.DiscoverCandidate, 0)
 	for _, st := range h.aNodes {
-		if !h.IsOnline(st.LastSeen) || st.Paused {
+		if !h.IsOnline(st.LastSeen) || st.Paused || st.AwaitingDisk {
 			continue
 		}
 		av, ok := st.Availability[projectID]
@@ -366,6 +378,9 @@ func (h *Hub) Snapshot() (map[string]*LiveAState, map[string]*LiveBState) {
 	aOut := make(map[string]*LiveAState, len(h.aNodes))
 	for k, st := range h.aNodes {
 		cp := *st
+		cp.StorageDirs = append([]string(nil), st.StorageDirs...)
+		cp.Disks = append([]protocol.DiskStatus(nil), st.Disks...)
+		cp.HostDisks = append([]protocol.HostDisk(nil), st.HostDisks...)
 		cp.Availability = make(map[string]protocol.ProjectAvailability, len(st.Availability))
 		for pk, pv := range st.Availability {
 			cp.Availability[pk] = pv
@@ -378,6 +393,7 @@ func (h *Hub) Snapshot() (map[string]*LiveAState, map[string]*LiveBState) {
 		cp.Projects = append([]string(nil), st.Projects...)
 		cp.StorageDirs = append([]string(nil), st.StorageDirs...)
 		cp.Disks = append([]protocol.DiskStatus(nil), st.Disks...)
+		cp.HostDisks = append([]protocol.HostDisk(nil), st.HostDisks...)
 		bOut[k] = &cp
 	}
 	return aOut, bOut
@@ -398,7 +414,7 @@ func (h *Hub) ActiveReceiversByProject(projectIDs []string, dbNodes []protocol.N
 	h.mu.RLock()
 	onlineB := make([]*LiveBState, 0, len(h.bNodes))
 	for _, st := range h.bNodes {
-		if h.IsOnline(st.LastSeen) && !st.Paused && !nodePaused[st.NodeID] {
+		if h.IsOnline(st.LastSeen) && !st.Paused && !st.AwaitingDisk && !nodePaused[st.NodeID] {
 			onlineB = append(onlineB, st)
 		}
 	}
@@ -443,13 +459,13 @@ func (h *Hub) ComputeClusterQuotas(node *StoredNode, projects []protocol.Project
 	h.mu.RLock()
 	var totalDispatchStreams int
 	for _, aSt := range h.aNodes {
-		if h.IsOnline(aSt.LastSeen) && !aSt.Paused && aSt.MaxConcurrentStreams > 0 {
+		if h.IsOnline(aSt.LastSeen) && !aSt.Paused && !aSt.AwaitingDisk && aSt.MaxConcurrentStreams > 0 {
 			totalDispatchStreams += aSt.MaxConcurrentStreams
 		}
 	}
 	onlineB := make([]*LiveBState, 0, len(h.bNodes))
 	for _, bSt := range h.bNodes {
-		if h.IsOnline(bSt.LastSeen) && !bSt.Paused && !nodePaused[bSt.NodeID] {
+		if h.IsOnline(bSt.LastSeen) && !bSt.Paused && !bSt.AwaitingDisk && !nodePaused[bSt.NodeID] {
 			onlineB = append(onlineB, bSt)
 		}
 	}

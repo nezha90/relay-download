@@ -151,46 +151,44 @@
 
           <div id="guide-a-steps-ssh" class="step-grid">
             <div class="step-item">
-              <div class="step-title"><span class="step-num">1</span>确认已有 Linux 发布包</div>
-              <div class="step-desc">前往「部署与版本」确认已上传 <code>分发节点 (linux/amd64)</code> 二进制包（通常已预置最新版，无需重复上传）。</div>
-              <button type="button" class="btn sm" data-switch-tab="deploy">查看发布包</button>
-            </div>
-            <div class="step-item">
-              <div class="step-title"><span class="step-num">2</span>填写目标机与目录参数</div>
-              <div class="step-desc">点击「一键部署分发节点 (SSH)」，填写目标机公网 IP、节点 ID（如 <code>edge-02</code>）、数据缓存盘路径（如 <code>/data/relay-a</code>）。</div>
+              <div class="step-title"><span class="step-num">1</span>一键 SSH 激活上线</div>
+              <div class="step-desc">点击「一键部署分发节点 (SSH)」，填入公网 IP 与节点 ID，预检后一键激活并自动扫描本机全部物理盘。</div>
               <button type="button" class="btn sm primary" data-trigger-click="open-deploy-a-from-tab">打开一键部署</button>
             </div>
             <div class="step-item">
-              <div class="step-title"><span class="step-num">3</span>执行环境预检</div>
-              <div class="step-desc">点击「1. 执行环境预检」，自动检测 root 权限、systemd、8443/18081 端口占用与磁盘剩余空间。</div>
+              <div class="step-title"><span class="step-num">2</span>网页勾选数据盘（多盘并发）</div>
+              <div class="step-desc">节点上线后点「选择数据盘」（可点刷新实时扫新挂硬盘），勾选 1 块或多块盘自动建 <code>&lt;盘&gt;/relay-cache</code> 目录，支持多盘并发传大文件。</div>
             </div>
             <div class="step-item">
-              <div class="step-title"><span class="step-num">4</span>一键安装并保存上传密钥</div>
-              <div class="step-desc">点击「2. 确认一键部署」，自动签发 IP 证书并拉起服务；复制弹窗里的 <code>X-Local-Token</code> 给业务方即可开始推送。</div>
+              <div class="step-title"><span class="step-num">3</span>强制水位防写爆保护</div>
+              <div class="step-desc">无论数据盘或系统盘 <code>/</code> 均强制启用安全水位（≤85% 且至少预留 10GB），超水位自动拒收/切盘，绝不撑爆系统。</div>
+            </div>
+            <div class="step-item">
+              <div class="step-title"><span class="step-num">4</span>保存上传密钥并随时热控</div>
+              <div class="step-desc">保存 <code>X-Local-Token</code> 给上游推流即可；日常可随时点「暂停/启动」或热增减缓存数据盘。</div>
             </div>
           </div>
 
           <div id="guide-a-steps-manual" class="step-grid hidden">
             <div class="step-item">
-              <div class="step-title"><span class="step-num">1</span>无公网机先映射 8443 端口</div>
-              <div class="step-desc">若分发机无独立公网 IP，请先用路由器 NAT / 云 LB / FRP 将该机 TCP <code>8443</code> 映射到外部接收机可达的 <code>公网IP:端口</code> 或域名（有公网 IP 仅需放行防火墙 8443）。</div>
-              <div class="cmd-copy-row">
-                <code>frpc tcp: local_port=8443 -&gt; remote_port=8443</code>
-                <button type="button" class="btn sm" data-copy-text="[[proxies]]&#10;name = &quot;relay-agent-a&quot;&#10;type = &quot;tcp&quot;&#10;localIP = &quot;127.0.0.1&quot;&#10;localPort = 8443&#10;remotePort = 8443">复制FRP示例</button>
+              <div class="step-title"><span class="step-num">1</span>登记分发节点（无公网先做映射）</div>
+              <div class="step-desc">无独立公网 IP 时，先用 NAT/FRP 将 TCP <code>8443</code> 映射到公网可达地址；点「+ 手动注册分发节点」填节点 ID 与映射地址（<strong>无需先填磁盘</strong>）。</div>
+              <div class="btn-row">
+                <button type="button" class="btn sm primary" data-trigger-click="open-create-node-a">注册分发节点</button>
+                <button type="button" class="btn sm" data-copy-text="[[proxies]]&#10;name = &quot;relay-agent-a&quot;&#10;type = &quot;tcp&quot;&#10;localIP = &quot;127.0.0.1&quot;&#10;localPort = 8443&#10;remotePort = 8443">复制FRP</button>
               </div>
             </div>
             <div class="step-item">
-              <div class="step-title"><span class="step-num">2</span>控制台手动注册分发节点</div>
-              <div class="step-desc">点击「+ 手动注册分发节点」，填写节点 ID，并在「公网地址」填入外部可达地址（如 <code>https://映射IP或域名:8443</code>），保存生成的接入密钥。</div>
-              <button type="button" class="btn sm primary" data-trigger-click="open-create-node-a">手动注册分发节点</button>
+              <div class="step-title"><span class="step-num">2</span>执行激活脚本上线并扫盘</div>
+              <div class="step-desc">点击该节点「安装脚本」→「复制一键执行命令」粘贴到目标机回车，自动签发证书并上线扫描所有物理盘（未选盘前不接收上传）。</div>
             </div>
             <div class="step-item">
-              <div class="step-title"><span class="step-num">3</span>生成并执行自动化安装脚本</div>
-              <div class="step-desc">在下方列表点该节点的「安装脚本」，中心自动签发对应 IP/域名证书并生成全自动安装脚本；一键复制「终端一键执行命令」到目标机粘贴回车。</div>
+              <div class="step-title"><span class="step-num">3</span>网页刷新并勾选数据盘激活</div>
+              <div class="step-desc">列表亮起「⚠ 待选盘 · 未激活」后，点显眼的「⚡ 选择数据盘并激活」，勾选 1 块或多块盘自动建 <code>relay-cache</code> 目录并立即激活！</div>
             </div>
             <div class="step-item">
-              <div class="step-title"><span class="step-num">4</span>上线验证与本机推流测试</div>
-              <div class="step-desc">3 秒内本页自动变为「在线」。可随时点「暂停/启动」控制是否允许下游拉取，或一键复制服务状态排查命令。</div>
+              <div class="step-title"><span class="step-num">4</span>验证运行与日常免 SSH 管控</div>
+              <div class="step-desc">激活后即可多盘并发缓存传输大文件；新插硬盘挂载后点「刷新物理盘」直接勾选用上，随时可暂停/启动。</div>
               <div class="cmd-copy-row">
                 <code>sudo systemctl status relay-agent-a --no-pager</code>
                 <button type="button" class="btn sm" data-copy-text="sudo systemctl status relay-agent-a --no-pager">复制</button>
@@ -255,25 +253,25 @@
 
           <div class="step-grid">
             <div class="step-item">
-              <div class="step-title"><span class="step-num">1</span>准备 Linux 接收机与挂载盘</div>
-              <div class="step-desc">登录你的本地 Linux 机器，确认硬盘已挂载好落盘目录（例如 <code>/mnt/sda/relay-delivery</code>），并可访问本中心。</div>
+              <div class="step-title"><span class="step-num">1</span>登记新接收节点（免填磁盘路径）</div>
+              <div class="step-desc">点击下方按钮给本地存储机/NAS 取个编号（如 <code>nas-02</code>）和备注名，选好下载项目即可，<strong>完全不用提前手敲硬盘目录</strong>。</div>
+              <button type="button" class="btn sm primary" data-trigger-click="open-create-node-b">+ 立即注册接收节点</button>
+            </div>
+            <div class="step-item">
+              <div class="step-title"><span class="step-num">2</span>执行一键激活脚本上线扫盘</div>
+              <div class="step-desc">创建后点「生成一键安装脚本」→「复制一键执行命令」，粘贴到接收机终端回车。节点 3 秒上线并<strong>自动扫描机器上全部物理盘</strong>（未选盘前暂不下载）。</div>
               <div class="cmd-copy-row">
                 <code id="guide-b-check-cmd">curl -kI https://.../healthz</code>
                 <button type="button" class="btn sm" id="btn-copy-b-check-cmd">复制检测</button>
               </div>
             </div>
             <div class="step-item">
-              <div class="step-title"><span class="step-num">2</span>在页面注册接收节点</div>
-              <div class="step-desc">点击下方按钮给这台机器取个编号（如 <code>nas-02</code>）和备注名，选好要下载的项目（单项目专享/全部项目），生成专属接入密钥。</div>
-              <button type="button" class="btn sm primary" data-trigger-click="open-create-node-b">+ 立即注册接收节点</button>
+              <div class="step-title"><span class="step-num">3</span>网页刷新并勾选数据盘激活</div>
+              <div class="step-desc">列表亮起「⚠ 待选盘 · 未激活」后，点显眼的<strong>「⚡ 选择数据盘并激活」</strong>（新插硬盘可点刷新物理盘），勾选 1 块或多块盘自动建 <code>relay-delivery</code> 目录，支持多盘并发写盘！</div>
             </div>
             <div class="step-item">
-              <div class="step-title"><span class="step-num">3</span>一键生成并运行自动化脚本</div>
-              <div class="step-desc">在创建成功提示里点「生成一键安装脚本」（或下方列表点「安装脚本」），填入本地磁盘挂载目录，点「复制一键执行命令」粘贴到接收机终端回车即可全自动安装并开机自启。</div>
-            </div>
-            <div class="step-item">
-              <div class="step-title"><span class="step-num">4</span>上线验证与网页随时管控</div>
-              <div class="step-desc">安装完 3 秒内，本页列表该机器自动变「在线」并显示各硬盘余量。之后切换项目、启停单盘、限速、<strong>暂停/启动下载</strong>、升级版本全在网页点按钮生效，无需再 SSH。</div>
+              <div class="step-title"><span class="step-num">4</span>强制水位保护 & 免 SSH 热控</div>
+              <div class="step-desc">无论数据盘还是系统盘 <code>/</code> 均强制启用水位保护（≤90% 且保留 ≥10GB）；后续热增减硬盘、切项目、<strong>暂停/启动</strong>、热升级全在网页完成。</div>
               <div class="cmd-copy-row">
                 <code>sudo systemctl status relay-agent-b --no-pager</code>
                 <button type="button" class="btn sm" data-copy-text="sudo systemctl status relay-agent-b --no-pager">复制</button>
@@ -568,6 +566,9 @@
         </div>
         <button class="btn ghost" type="button" data-close-modal="edit-node-modal">关闭</button>
       </div>
+      <div id="edit-b-awaiting-banner" class="banner warn hidden" style="margin-bottom:12px">
+        <strong>⚡ 当前接收节点尚未激活：</strong>请从下方勾选至少 1 块物理磁盘并点击保存，系统将自动创建统一目录 <code>&lt;挂载点&gt;/relay-delivery/&lt;项目ID&gt;/</code> 并立即开始多盘并发下载！
+      </div>
       <form id="edit-node-form" class="form-stack">
         <input type="hidden" name="node_id" />
         <label>显示名称
@@ -614,7 +615,13 @@
         </div>
 
         <div class="config-section">
-          <div class="config-section-title">2. 落盘磁盘池与选盘策略</div>
+          <div class="disk-sec-head">
+            <div class="config-section-title">2. 选择数据盘与选盘策略（支持多盘并发 · 全盘强制水位 ≤90% 且保留 ≥10GB）</div>
+            <button type="button" id="btn-refresh-b-disks" class="btn sm">
+              <svg class="ico ico-sm ico-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/></svg>
+              <span>刷新物理盘</span>
+            </button>
+          </div>
           <label>多磁盘选盘策略
             <select name="disk_policy">
               <option value="affinity_hash">同源亲和均匀 (推荐：音视频与 .info.json 同盘，满盘自动溢出)</option>
@@ -624,11 +631,11 @@
             </select>
           </label>
           <div id="edit-disks-section">
-            <div class="muted" style="margin-bottom:6px">磁盘启停控制（取消勾选将立即暂停写入该磁盘，自动切至其余启用盘）：</div>
+            <div class="muted" style="margin-bottom:6px">勾选即可自动创建统一目录 <code>&lt;挂载点&gt;/relay-delivery</code> 并开启多盘并发落盘；<strong>准备拔盘</strong>时先关闭开关等在途写入归零再卸载，<strong>直接拔盘</strong>也会自动锁定防穿透写进系统盘（重插后需人工勾选确认启用）。</div>
             <div id="edit-disks-list" class="disk-toggle-list"></div>
           </div>
           <div id="edit-storage-pool-tip" class="banner warn hidden" style="margin-top:6px;margin-bottom:0">
-            提示：该接收节点当前未配置通用磁盘池 (<code>storage_dirs</code>)，切换到未在本地 YAML 映射过的新项目可能无法自动建目录；建议升级至 v1.8.0 并配置 <code>storage_dirs</code> 实现彻底免 SSH 切换。
+            提示：当前节点尚未上报物理盘信息（等待上线心跳或升级至最新版自动探测）。
           </div>
         </div>
 
@@ -655,7 +662,38 @@
           </div>
         </div>
 
-        <button type="submit" class="btn primary full">保存配置并立即下发</button>
+        <button type="submit" id="edit-b-submit-btn" class="btn primary full">保存配置并立即下发</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- Edit Dispatch Node Data Disks Modal (Admin Only) -->
+  <div id="edit-a-disks-modal" class="overlay hidden">
+    <div class="modal-card wide">
+      <div class="modal-head">
+        <div>
+          <h3 id="edit-a-disks-title">选择分发节点数据盘</h3>
+          <p class="muted">勾选 1 块或多块物理盘作为中转缓存盘（支持多盘并发传大文件，全盘强制水位保护 ≤85% 且预留 ≥10GB）</p>
+        </div>
+        <button class="btn ghost" type="button" data-close-modal="edit-a-disks-modal">关闭</button>
+      </div>
+      <div id="edit-a-awaiting-banner" class="banner warn hidden" style="margin-bottom:12px">
+        <strong>⚡ 当前分发节点尚未激活：</strong>请勾选下方至少 1 块物理磁盘并点击保存，系统将自动创建统一缓存目录 <code>&lt;挂载点&gt;/relay-cache</code> 并立即激活接流！
+      </div>
+      <form id="edit-a-disks-form" class="form-stack">
+        <input type="hidden" name="node_id" />
+        <div class="config-section">
+          <div class="disk-sec-head">
+            <div class="config-section-title">本机已挂载物理盘列表（自动过滤系统虚拟分区）</div>
+            <button type="button" id="btn-refresh-a-disks" class="btn sm">
+              <svg class="ico ico-sm ico-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/></svg>
+              <span>刷新物理盘</span>
+            </button>
+          </div>
+          <div class="muted">勾选即可自动创建 <code>&lt;挂载点&gt;/relay-cache</code>（系统盘自动建 <code>/data/relay-cache</code>）并开启多盘并发缓存；停用等待在途排空可安全拔盘，直接拔盘自动锁定防穿透写系统盘，重插后需人工勾选确认启用。</div>
+          <div id="edit-a-disks-list" class="disk-toggle-list"></div>
+        </div>
+        <button type="submit" id="edit-a-submit-btn" class="btn primary full">保存数据盘配置并热生效</button>
       </form>
     </div>
   </div>
@@ -763,8 +801,12 @@
         </div>
         <div class="radio-row">
           <label class="radio-opt">
-            <input type="radio" name="script_mode" value="pool" checked />
-            <span>磁盘池全托管 (推荐：前端随时切换任意项目免 SSH)</span>
+            <input type="radio" name="script_mode" value="await" checked />
+            <span>先激活上线，再在网页勾选物理盘 (推荐 · 免填路径)</span>
+          </label>
+          <label class="radio-opt">
+            <input type="radio" name="script_mode" value="pool" />
+            <span>预设磁盘池路径 (storage_dirs)</span>
           </label>
           <label class="radio-opt">
             <input type="radio" name="script_mode" value="single" />
@@ -775,7 +817,10 @@
             <span>手动多项目目录映射</span>
           </label>
         </div>
-        <div id="b-script-pool-wrap" class="form-stack">
+        <div id="b-script-await-wrap" class="banner pass" style="margin:0">
+          <strong>推荐流程：</strong>脚本执行后节点先在线待命并自动扫描目标机所有物理盘（不会误写系统盘），随后在网页点显眼的「⚡ 选择数据盘并激活」勾选数据盘即可自动建目录开跑！
+        </div>
+        <div id="b-script-pool-wrap" class="form-stack hidden">
           <label>物理磁盘根目录池 storage_dirs (每行一个挂载目录，任意项目自动落盘至 <code>&lt;盘目录&gt;/&lt;项目ID&gt;/</code>)
             <textarea name="storage_dirs" rows="2" placeholder="/mnt/sda/relay-delivery&#10;/mnt/sdb/relay-delivery"></textarea>
           </label>
@@ -842,10 +887,14 @@
           <label>安装目录
             <input name="install_dir" value="/opt/relay-agent-a" autocomplete="off" />
           </label>
-          <label>中转缓存数据目录
+          <label id="a-script-datadir-wrap">预设缓存目录 (可选)
             <input name="data_dir" value="/data/relay-a" autocomplete="off" />
           </label>
         </div>
+        <label class="toggle">
+          <input name="await_disk_selection" type="checkbox" checked />
+          <span>先激活上线，再在网页勾选物理数据盘 (推荐：上线自动扫描物理盘，勾选后自动创建 <code>relay-cache</code> 目录并激活)</span>
+        </label>
         <div class="btn-row">
           <label class="toggle">
             <input name="rotate_token" type="checkbox" checked />

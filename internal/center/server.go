@@ -23,6 +23,7 @@ import (
 	"relay-download/internal/deployer"
 	"relay-download/internal/pki"
 	"relay-download/internal/protocol"
+	"relay-download/internal/transfer"
 )
 
 var validIDRe = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
@@ -298,6 +299,7 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("POST /api/v1/admin/projects", s.requireSuperAdmin(s.handleAdminUpsertProject))
 	mux.HandleFunc("DELETE /api/v1/admin/projects/{id}", s.requireSuperAdmin(s.handleAdminDeleteProject))
 	mux.HandleFunc("GET /api/v1/admin/nodes", s.requireConsole(s.handleAdminListNodes))
+	mux.HandleFunc("GET /api/v1/admin/nodes/{id}/disks", s.requireConsole(s.handleAdminGetNodeDisks))
 	mux.HandleFunc("POST /api/v1/admin/nodes", s.requireConsole(s.handleAdminCreateNode))
 	mux.HandleFunc("PUT /api/v1/admin/nodes/{id}", s.requireConsole(s.handleAdminUpdateNode))
 	mux.HandleFunc("DELETE /api/v1/admin/nodes/{id}", s.requireConsole(s.handleAdminDeleteNode))
@@ -372,6 +374,36 @@ func (s *Server) isTrustedAdminRequest(r *http.Request) bool {
 	return false
 }
 
+func (s *Server) processUnplugLatches(ctx context.Context, node *StoredNode, disks []protocol.DiskStatus) {
+	if len(disks) == 0 {
+		return
+	}
+	var toLock []string
+	for _, d := range disks {
+		if !d.UnplugLatched || d.LatchedGen != node.DiskGen {
+			continue
+		}
+		p := strings.TrimSpace(d.Path)
+		if p == "" || validateSafeDiskPath(p) != nil {
+			continue
+		}
+		toLock = append(toLock, p)
+	}
+	if len(toLock) == 0 {
+		return
+	}
+	newDis, newLock, changed, err := s.store.AutoLockUnpluggedDisks(ctx, node.ID, node.DiskGen, toLock)
+	if err != nil {
+		s.logger.Warn("auto-lock unplugged disks failed", "node_id", node.ID, "disks", toLock, "err", err)
+		return
+	}
+	if changed {
+		node.DisabledDisks = newDis
+		node.UnplugLockedDisks = newLock
+		s.logger.Warn("auto-locked unplugged/swapped disks until manual confirmation", "node_id", node.ID, "disks", toLock, "disk_gen", node.DiskGen)
+	}
+}
+
 func (s *Server) handleAHeartbeat(w http.ResponseWriter, r *http.Request, node *StoredNode) {
 	var req protocol.AgentAHeartbeatReq
 	if err := protocol.DecodeJSON(r.Body, &req); err != nil {
@@ -387,6 +419,28 @@ func (s *Server) handleAHeartbeat(w http.ResponseWriter, r *http.Request, node *
 	req.OS = sanitizeSingleLine(req.OS, 32)
 	req.Arch = sanitizeSingleLine(req.Arch, 32)
 	req.UpgradeError = sanitizeSingleLine(req.UpgradeError, 256)
+	if len(req.StorageDirs) > 64 {
+		req.StorageDirs = req.StorageDirs[:64]
+	}
+	for i := range req.StorageDirs {
+		req.StorageDirs[i] = sanitizeSingleLine(req.StorageDirs[i], 256)
+	}
+	if len(req.Disks) > 64 {
+		req.Disks = req.Disks[:64]
+	}
+	for i := range req.Disks {
+		req.Disks[i].Path = sanitizeSingleLine(req.Disks[i].Path, 256)
+		req.Disks[i].StatusReason = sanitizeSingleLine(req.Disks[i].StatusReason, 160)
+	}
+	if len(req.HostDisks) > 64 {
+		req.HostDisks = req.HostDisks[:64]
+	}
+	for i := range req.HostDisks {
+		req.HostDisks[i].Device = sanitizeSingleLine(req.HostDisks[i].Device, 128)
+		req.HostDisks[i].MountPoint = sanitizeSingleLine(req.HostDisks[i].MountPoint, 256)
+		req.HostDisks[i].FSType = sanitizeSingleLine(req.HostDisks[i].FSType, 32)
+		req.HostDisks[i].SuggestedDir = sanitizeSingleLine(req.HostDisks[i].SuggestedDir, 256)
+	}
 	// Pin public_addr to the Center-registered address to prevent SSRF via spoofed heartbeats.
 	if node.PublicAddr != "" {
 		req.PublicAddr = node.PublicAddr
@@ -414,9 +468,17 @@ func (s *Server) handleAHeartbeat(w http.ResponseWriter, r *http.Request, node *
 		s.ensureKnownProjects(r.Context(), availIDs)
 	}
 	req.Paused = node.Paused
+	s.processUnplugLatches(r.Context(), node, req.Disks)
 	s.hub.UpdateA(req)
 	hbResp := s.processNodeHeartbeatUpgrade(r.Context(), node.ID, req.Version, req.UpgradeAttemptID, req.UpgradeStatus, req.UpgradeError)
 	hbResp.Paused = node.Paused
+	hbResp.DiskGen = node.DiskGen
+	if len(node.StorageDirs) > 0 {
+		hbResp.StorageDirs = append([]string(nil), node.StorageDirs...)
+	}
+	if len(node.DisabledDisks) > 0 {
+		hbResp.DisabledDisks = append([]string(nil), node.DisabledDisks...)
+	}
 	if projs, err := s.store.ListProjects(r.Context()); err == nil && len(projs) > 0 {
 		projIDs := make([]string, 0, len(projs))
 		affMap := make(map[string]bool, len(projs))
@@ -487,6 +549,16 @@ func (s *Server) handleBHeartbeat(w http.ResponseWriter, r *http.Request, node *
 	}
 	for i := range req.Disks {
 		req.Disks[i].Path = sanitizeSingleLine(req.Disks[i].Path, 256)
+		req.Disks[i].StatusReason = sanitizeSingleLine(req.Disks[i].StatusReason, 160)
+	}
+	if len(req.HostDisks) > 64 {
+		req.HostDisks = req.HostDisks[:64]
+	}
+	for i := range req.HostDisks {
+		req.HostDisks[i].Device = sanitizeSingleLine(req.HostDisks[i].Device, 128)
+		req.HostDisks[i].MountPoint = sanitizeSingleLine(req.HostDisks[i].MountPoint, 256)
+		req.HostDisks[i].FSType = sanitizeSingleLine(req.HostDisks[i].FSType, 32)
+		req.HostDisks[i].SuggestedDir = sanitizeSingleLine(req.HostDisks[i].SuggestedDir, 256)
 	}
 	if len(node.Projects) > 0 {
 		filtered := make([]string, 0, len(req.Projects))
@@ -498,9 +570,11 @@ func (s *Server) handleBHeartbeat(w http.ResponseWriter, r *http.Request, node *
 		req.Projects = filtered
 	}
 	req.Paused = node.Paused
+	s.processUnplugLatches(r.Context(), node, req.Disks)
 	s.hub.UpdateB(req)
 	hbResp := s.processNodeHeartbeatUpgrade(r.Context(), node.ID, req.Version, req.UpgradeAttemptID, req.UpgradeStatus, req.UpgradeError)
 	hbResp.Paused = node.Paused
+	hbResp.DiskGen = node.DiskGen
 
 	projs, _ := s.store.ListProjects(r.Context())
 	knownIDs := make([]string, 0, len(projs))
@@ -516,7 +590,9 @@ func (s *Server) handleBHeartbeat(w http.ResponseWriter, r *http.Request, node *
 		KnownProjects:      knownIDs,
 		ProjectSchedule:    node.ProjectSchedule,
 		DiskPolicy:         node.DiskPolicy,
+		StorageDirs:        append([]string(nil), node.StorageDirs...),
 		DisabledDisks:      append([]string(nil), node.DisabledDisks...),
+		DiskGen:            node.DiskGen,
 		ConcurrencyMode:    node.ConcurrencyMode,
 		MaxConcurrent:      maxConc,
 		SuggestedStreamCap: suggestedStreamCap,
@@ -1023,7 +1099,10 @@ func (s *Server) handleAdminListNodes(w http.ResponseWriter, r *http.Request) {
 			Projects:              n.Projects,
 			ProjectSchedule:       n.ProjectSchedule,
 			DiskPolicy:            n.DiskPolicy,
+			StorageDirs:           append([]string(nil), n.StorageDirs...),
 			DisabledDisks:         n.DisabledDisks,
+			UnplugLockedDisks:     n.UnplugLockedDisks,
+			DiskGen:               n.DiskGen,
 			ConcurrencyMode:       n.ConcurrencyMode,
 			MaxConcurrentOverride: n.MaxConcurrentOverride,
 			RateLimitMBps:         n.RateLimitMBps,
@@ -1058,6 +1137,12 @@ func (s *Server) handleAdminListNodes(w http.ResponseWriter, r *http.Request) {
 				v.DiskFreeBytes = st.DiskFreeBytes
 				v.DiskUsedPct = st.DiskUsedPct
 				v.DiskAlarm = st.DiskAlarm
+				if len(st.StorageDirs) > 0 {
+					v.StorageDirs = st.StorageDirs
+				}
+				v.Disks = st.Disks
+				v.HostDisks = st.HostDisks
+				v.AwaitingDisk = st.AwaitingDisk
 				for _, av := range st.Availability {
 					v.Availability = append(v.Availability, av)
 				}
@@ -1080,8 +1165,12 @@ func (s *Server) handleAdminListNodes(w http.ResponseWriter, r *http.Request) {
 				v.Version = st.Version
 				v.OS = st.OS
 				v.Arch = st.Arch
-				v.StorageDirs = st.StorageDirs
+				if len(st.StorageDirs) > 0 {
+					v.StorageDirs = st.StorageDirs
+				}
 				v.Disks = st.Disks
+				v.HostDisks = st.HostDisks
+				v.AwaitingDisk = st.AwaitingDisk
 				v.EffectiveConcurrent = st.EffectiveConcurrent
 				v.MaxConcurrentCap = st.MaxConcurrentCap
 				v.EffectiveStreams = st.EffectiveStreams
@@ -1105,12 +1194,93 @@ type createNodeReq struct {
 	Projects              []string `json:"projects"`
 	ProjectSchedule       string   `json:"project_schedule,omitempty"`
 	DiskPolicy            string   `json:"disk_policy,omitempty"`
+	StorageDirs           []string `json:"storage_dirs,omitempty"`
 	DisabledDisks         []string `json:"disabled_disks,omitempty"`
 	ConcurrencyMode       string   `json:"concurrency_mode,omitempty"`
 	MaxConcurrentOverride int      `json:"max_concurrent_override,omitempty"`
 	RateLimitMBps         float64  `json:"rate_limit_mbps,omitempty"`
 	PublicAddr            string   `json:"public_addr"`
 	Token                 string   `json:"token,omitempty"`
+}
+
+func (s *Server) handleAdminGetNodeDisks(w http.ResponseWriter, r *http.Request) {
+	principal := principalFromRequest(r)
+	nodeID := strings.TrimSpace(r.PathValue("id"))
+	node, err := s.store.GetNode(r.Context(), nodeID)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			protocol.WriteError(w, http.StatusNotFound, "node not found")
+			return
+		}
+		protocol.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if !principal.CanAccessNode(*node) {
+		protocol.WriteError(w, http.StatusForbidden, "account not authorized to inspect this node")
+		return
+	}
+	aSnap, bSnap := s.hub.Snapshot()
+	resp := map[string]any{
+		"id":                  node.ID,
+		"role":                node.Role,
+		"online":              false,
+		"awaiting_disk":       false,
+		"disk_gen":            node.DiskGen,
+		"storage_dirs":        node.StorageDirs,
+		"disabled_disks":      node.DisabledDisks,
+		"unplug_locked_disks": node.UnplugLockedDisks,
+		"disks":               []protocol.DiskStatus{},
+		"host_disks":          []protocol.HostDisk{},
+	}
+	if node.Role == protocol.RoleAgentA {
+		if st, ok := aSnap[node.ID]; ok {
+			resp["online"] = s.hub.IsOnline(st.LastSeen)
+			resp["awaiting_disk"] = st.AwaitingDisk
+			if len(st.StorageDirs) > 0 {
+				resp["storage_dirs"] = st.StorageDirs
+			}
+			if st.Disks != nil {
+				resp["disks"] = st.Disks
+			}
+			if st.HostDisks != nil {
+				resp["host_disks"] = st.HostDisks
+			}
+		}
+	} else {
+		if st, ok := bSnap[node.ID]; ok {
+			resp["online"] = s.hub.IsOnline(st.LastSeen)
+			resp["awaiting_disk"] = st.AwaitingDisk
+			if len(st.StorageDirs) > 0 {
+				resp["storage_dirs"] = st.StorageDirs
+			}
+			if st.Disks != nil {
+				resp["disks"] = st.Disks
+			}
+			if st.HostDisks != nil {
+				resp["host_disks"] = st.HostDisks
+			}
+		}
+	}
+	protocol.WriteJSON(w, http.StatusOK, resp)
+}
+
+func cleanStorageDirList(raw []string) ([]string, error) {
+	out := make([]string, 0, len(raw))
+	seen := make(map[string]struct{}, len(raw))
+	for _, p := range raw {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if err := deployer.ValidateAbsDir(p); err != nil || !transfer.IsSafeStorageDir(p) {
+			return nil, fmt.Errorf("invalid or forbidden data disk directory %q", p)
+		}
+		if _, dup := seen[p]; !dup {
+			seen[p] = struct{}{}
+			out = append(out, p)
+		}
+	}
+	return out, nil
 }
 
 func cleanDiskPathList(raw []string) ([]string, error) {
@@ -1199,6 +1369,11 @@ func (s *Server) handleAdminCreateNode(w http.ResponseWriter, r *http.Request) {
 		protocol.WriteError(w, http.StatusForbidden, "receiver node projects must be within this account's allowed project list")
 		return
 	}
+	cleanStorageDirs, err := cleanStorageDirList(req.StorageDirs)
+	if err != nil {
+		protocol.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	cleanDisks, err := cleanDiskPathList(req.DisabledDisks)
 	if err != nil {
 		protocol.WriteError(w, http.StatusBadRequest, err.Error())
@@ -1241,6 +1416,7 @@ func (s *Server) handleAdminCreateNode(w http.ResponseWriter, r *http.Request) {
 		Projects:              cleanProjects,
 		ProjectSchedule:       sched,
 		DiskPolicy:            dp,
+		StorageDirs:           cleanStorageDirs,
 		DisabledDisks:         cleanDisks,
 		ConcurrencyMode:       cm,
 		MaxConcurrentOverride: req.MaxConcurrentOverride,
@@ -1265,6 +1441,7 @@ type updateNodeReq struct {
 	Projects              *[]string `json:"projects,omitempty"`
 	ProjectSchedule       string    `json:"project_schedule,omitempty"`
 	DiskPolicy            string    `json:"disk_policy,omitempty"`
+	StorageDirs           *[]string `json:"storage_dirs,omitempty"`
 	DisabledDisks         *[]string `json:"disabled_disks,omitempty"`
 	ConcurrencyMode       string    `json:"concurrency_mode,omitempty"`
 	MaxConcurrentOverride *int      `json:"max_concurrent_override,omitempty"`
@@ -1324,6 +1501,16 @@ func (s *Server) handleAdminUpdateNode(w http.ResponseWriter, r *http.Request) {
 		}
 		rec.DiskPolicy = dp
 	}
+	diskConfigTouched := false
+	if req.StorageDirs != nil {
+		cleanStorage, err := cleanStorageDirList(*req.StorageDirs)
+		if err != nil {
+			protocol.WriteError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		rec.StorageDirs = cleanStorage
+		diskConfigTouched = true
+	}
 	if req.DisabledDisks != nil {
 		cleanDisks, err := cleanDiskPathList(*req.DisabledDisks)
 		if err != nil {
@@ -1331,6 +1518,24 @@ func (s *Server) handleAdminUpdateNode(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		rec.DisabledDisks = cleanDisks
+		diskConfigTouched = true
+	}
+	if diskConfigTouched {
+		// Operator explicitly updated or re-confirmed disk configuration -> bump DiskGen so any
+		// prior unplug latch for re-enabled disks clears cleanly, and prune unplug locks for disks
+		// that are now re-enabled or removed from disabled_disks.
+		rec.DiskGen++
+		disSet := make(map[string]struct{}, len(rec.DisabledDisks))
+		for _, p := range rec.DisabledDisks {
+			disSet[p] = struct{}{}
+		}
+		keptLocks := make([]string, 0, len(rec.UnplugLockedDisks))
+		for _, p := range rec.UnplugLockedDisks {
+			if _, stillDis := disSet[p]; stillDis {
+				keptLocks = append(keptLocks, p)
+			}
+		}
+		rec.UnplugLockedDisks = keptLocks
 	}
 	if req.ConcurrencyMode != "" {
 		cm := normalizeConcurrencyMode(req.ConcurrencyMode)

@@ -20,15 +20,16 @@ type Config struct {
 	CenterURL            string              `yaml:"center_url"`
 	CenterToken          string              `yaml:"center_token"`
 	CACert               string              `yaml:"ca_cert"`
-	StorageDirs          []string            `yaml:"storage_dirs,omitempty"`     // managed disk pool roots: any project lands in <storage_dir>/<project_id>/
-	ProjectSchedule      string              `yaml:"project_schedule,omitempty"` // default multi-project schedule: "fifo" | "fair" | "random" (overridable by Center)
-	DiskPolicy           string              `yaml:"disk_policy,omitempty"`      // default disk placement: "affinity_hash" | "most_free" | "round_robin" | "first" (overridable by Center)
-	ConcurrencyMode      string              `yaml:"concurrency_mode,omitempty"` // default concurrency control: "auto" (adaptive BBR/AIMD) | "manual" (overridable by Center)
-	OnlyProject          string              `yaml:"only_project,omitempty"`     // optional: strictly restrict this receiver node locally to download ONLY this single project
-	DestDir              string              `yaml:"dest_dir,omitempty"`         // optional shorthand single destination directory when only_project is set
-	DestDirs             []string            `yaml:"dest_dirs,omitempty"`        // optional shorthand multiple destination directories when only_project is set
-	Projects             map[string]string   `yaml:"projects,omitempty"`         // project_id -> single local dest directory
-	ProjectDirs          map[string][]string `yaml:"project_dirs,omitempty"`     // project_id -> multiple local dest directories for balanced multi-disk placement
+	StorageDirs          []string            `yaml:"storage_dirs,omitempty"`         // managed disk pool roots: any project lands in <storage_dir>/<project_id>/
+	AwaitDiskSelection   bool                `yaml:"await_disk_selection,omitempty"` // if true, activate online & scan host disks, stay standby until Center assigns storage_dirs
+	ProjectSchedule      string              `yaml:"project_schedule,omitempty"`     // default multi-project schedule: "fifo" | "fair" | "random" (overridable by Center)
+	DiskPolicy           string              `yaml:"disk_policy,omitempty"`          // default disk placement: "affinity_hash" | "most_free" | "round_robin" | "first" (overridable by Center)
+	ConcurrencyMode      string              `yaml:"concurrency_mode,omitempty"`     // default concurrency control: "auto" (adaptive BBR/AIMD) | "manual" (overridable by Center)
+	OnlyProject          string              `yaml:"only_project,omitempty"`         // optional: strictly restrict this receiver node locally to download ONLY this single project
+	DestDir              string              `yaml:"dest_dir,omitempty"`             // optional shorthand single destination directory when only_project is set
+	DestDirs             []string            `yaml:"dest_dirs,omitempty"`            // optional shorthand multiple destination directories when only_project is set
+	Projects             map[string]string   `yaml:"projects,omitempty"`             // project_id -> single local dest directory
+	ProjectDirs          map[string][]string `yaml:"project_dirs,omitempty"`         // project_id -> multiple local dest directories for balanced multi-disk placement
 	StateDir             string              `yaml:"state_dir"`
 	MaxConcurrent        int                 `yaml:"max_concurrent"`
 	StreamProtocol       string              `yaml:"stream_protocol,omitempty"`       // "h2" (default, TLS 1.3 HTTP/2) or "h1" (TLS 1.3 HTTP/1.1, removes 4MiB H2 flow-control cap for 10Gbps)
@@ -41,6 +42,7 @@ type Config struct {
 	ClaimBatchSize       int                 `yaml:"claim_batch_size,omitempty"`      // max files claimed per RPC
 	AckBatchIntervalMs   int                 `yaml:"ack_batch_interval_ms,omitempty"` // ms to buffer verified on-disk ACKs before batch-ack (<=0 = immediate)
 	AckBatchSize         int                 `yaml:"ack_batch_size,omitempty"`        // flush early once pending ACKs hit this count
+	MaxDiskUsagePct      float64             `yaml:"max_disk_usage_pct,omitempty"`    // mandatory per-disk watermark ceiling (default 90.0%)
 	MinFreeDiskBytes     uint64              `yaml:"min_free_disk_bytes"`
 	RateLimitMBps        float64             `yaml:"rate_limit_mbps"`
 	PollIntervalSec      int                 `yaml:"poll_interval_sec"`
@@ -152,6 +154,12 @@ func (c *Config) ApplyDefaults() {
 	if c.AckBatchSize <= 0 {
 		c.AckBatchSize = 50
 	}
+	if c.MaxDiskUsagePct <= 0 {
+		c.MaxDiskUsagePct = 90.0
+	}
+	if c.MaxDiskUsagePct > 95.0 {
+		c.MaxDiskUsagePct = 95.0
+	}
 	if c.PollIntervalSec <= 0 {
 		c.PollIntervalSec = 10
 	}
@@ -188,13 +196,13 @@ func (c *Config) Validate() error {
 	default:
 		return fmt.Errorf("concurrency_mode must be 'auto' or 'manual' (got %q)", c.ConcurrencyMode)
 	}
-	if len(c.ProjectIDs()) == 0 && len(c.StorageDirs) == 0 {
+	if !c.AwaitDiskSelection && len(c.ProjectIDs()) == 0 && len(c.StorageDirs) == 0 {
 		if c.OnlyProject != "" {
 			return fmt.Errorf("only_project %q requires a destination directory (storage_dirs, dest_dir, dest_dirs, projects, or project_dirs)", c.OnlyProject)
 		}
 		return errors.New("at least one storage_dirs root or project destination mapping is required")
 	}
-	if c.OnlyProject != "" && len(c.DestDirsFor(c.OnlyProject)) == 0 {
+	if !c.AwaitDiskSelection && c.OnlyProject != "" && len(c.DestDirsFor(c.OnlyProject)) == 0 {
 		return fmt.Errorf("only_project %q requires a valid destination directory", c.OnlyProject)
 	}
 	return nil

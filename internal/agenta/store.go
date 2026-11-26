@@ -33,6 +33,7 @@ type FileRecord struct {
 	FileID         string     `json:"file_id"`
 	ProjectID      string     `json:"project_id"`
 	Filename       string     `json:"filename"`
+	DataPath       string     `json:"data_path,omitempty"`
 	Size           int64      `json:"size"`
 	SHA256         string     `json:"sha256"`
 	Status         string     `json:"status"`
@@ -298,6 +299,48 @@ func (s *Store) Get(fileID string) (*FileRecord, error) {
 	}
 	cp := cloneFileRecord(rec)
 	return &cp, nil
+}
+
+func (s *Store) DataPathFor(fileID string) string {
+	s.idxMu.RLock()
+	rec, ok := s.records[fileID]
+	s.idxMu.RUnlock()
+	if !ok {
+		return ""
+	}
+	return rec.DataPath
+}
+
+func (s *Store) AllFilePaths() map[string]string {
+	s.idxMu.RLock()
+	out := make(map[string]string, len(s.records))
+	for id, rec := range s.records {
+		out[id] = rec.DataPath
+	}
+	s.idxMu.RUnlock()
+	return out
+}
+
+// CountFilesInRoot returns the number of queued (ready or claimed) files residing under storage root.
+func (s *Store) CountFilesInRoot(root, defaultReadyDir string) int {
+	cleanRoot := filepath.Clean(strings.TrimSpace(root))
+	if cleanRoot == "" || cleanRoot == "." {
+		return 0
+	}
+	prefix := cleanRoot + string(filepath.Separator)
+	s.idxMu.RLock()
+	defer s.idxMu.RUnlock()
+	n := 0
+	for _, rec := range s.records {
+		p := rec.DataPath
+		if p == "" {
+			p = filepath.Join(defaultReadyDir, rec.FileID+".dat")
+		}
+		if strings.HasPrefix(filepath.Clean(p), prefix) {
+			n++
+		}
+	}
+	return n
 }
 
 // ClaimNext atomically picks the oldest READY file for projectID that fits availDiskBytes

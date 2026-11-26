@@ -934,7 +934,15 @@ func RenderAgentBInstallScript(centerPublicURL string, caCertPEM []byte, node pr
 	}
 
 	var destDir string
-	if len(storageDirs) > 0 && onlyProject == "" {
+	awaitDisk := req.AwaitDiskSelection
+	if awaitDisk {
+		// Activate-first mode: node comes online, scans physical host disks, and stays standby until user selects disks in Console.
+		storageDirs = nil
+		projects = nil
+		projectDirs = nil
+		destDirs = nil
+		onlyProject = ""
+	} else if len(storageDirs) > 0 && onlyProject == "" {
 		// Managed disk-pool mode (recommended): Center controls projects, scheduling, and disk toggles dynamically.
 		projects = nil
 		projectDirs = nil
@@ -954,8 +962,8 @@ func RenderAgentBInstallScript(centerPublicURL string, caCertPEM []byte, node pr
 			destDirs = nil
 		}
 	} else if len(projects) == 0 && len(projectDirs) == 0 {
-		// Default fallback: managed storage pool under /data/relay-b/files so Console can switch projects anytime.
-		storageDirs = []string{"/data/relay-b/files"}
+		// Default fallback: wait for disk selection in Console so we never guess paths or write to "/" unintentionally.
+		awaitDisk = true
 	}
 	maxConc := req.MaxConcurrent
 	if maxConc <= 0 {
@@ -976,6 +984,7 @@ func RenderAgentBInstallScript(centerPublicURL string, caCertPEM []byte, node pr
 		CenterToken:          tokVal,
 		CACert:               filepath.Join(installDir, "certs", "ca.crt"),
 		StorageDirs:          storageDirs,
+		AwaitDiskSelection:   awaitDisk,
 		OnlyProject:          onlyProject,
 		DestDir:              destDir,
 		DestDirs:             destDirs,
@@ -984,6 +993,7 @@ func RenderAgentBInstallScript(centerPublicURL string, caCertPEM []byte, node pr
 		StateDir:             stateDir,
 		MaxConcurrent:        maxConc,
 		AckBatchIntervalMs:   req.AckBatchIntervalMs,
+		MaxDiskUsagePct:      90.0,
 		MinFreeDiskBytes:     req.MinFreeDiskBytes,
 		PollIntervalSec:      10,
 		HeartbeatIntervalSec: 2,
@@ -1103,7 +1113,10 @@ func RenderAgentAInstallScript(
 		installDir = "/opt/relay-agent-a"
 	}
 	dataDir := strings.TrimSpace(req.DataDir)
-	if dataDir == "" {
+	awaitDisk := req.AwaitDiskSelection
+	if awaitDisk {
+		dataDir = filepath.Join(installDir, "state")
+	} else if dataDir == "" {
 		dataDir = "/data/relay-a"
 	}
 	if err := ValidateAbsDir(installDir); err != nil {
@@ -1165,6 +1178,7 @@ func RenderAgentAInstallScript(
 		TLSKey:                 keyPath,
 		CACert:                 filepath.Join(installDir, "certs", "ca.crt"),
 		DataDir:                dataDir,
+		AwaitDiskSelection:     awaitDisk,
 		Projects:               append([]string(nil), node.Projects...),
 		MaxDiskUsagePct:        maxDiskPct,
 		LeaseTTLSec:            leaseTTL,

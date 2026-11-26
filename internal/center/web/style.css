@@ -557,6 +557,56 @@ body {
   box-shadow: 0 6px 16px rgba(245, 158, 11, 0.24);
 }
 
+.btn.activate {
+  background: linear-gradient(180deg, #f59e0b 0%, #d97706 100%);
+  border-color: rgba(253, 230, 138, 0.55);
+  color: #0b1120;
+  font-weight: 700;
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.34) inset, 0 0 0 0 rgba(245, 158, 11, 0.55), 0 6px 18px rgba(245, 158, 11, 0.38);
+  animation: activatePulse 2.1s infinite;
+}
+.btn.activate:hover:not(:disabled) {
+  background: linear-gradient(180deg, #fbbf24 0%, #ea580c 100%);
+  color: #fff;
+  box-shadow: 0 8px 24px rgba(245, 158, 11, 0.52);
+}
+@keyframes activatePulse {
+  0%   { box-shadow: 0 1px 0 rgba(255, 255, 255, 0.34) inset, 0 0 0 0 rgba(245, 158, 11, 0.55), 0 6px 18px rgba(245, 158, 11, 0.35); }
+  70%  { box-shadow: 0 1px 0 rgba(255, 255, 255, 0.34) inset, 0 0 0 8px rgba(245, 158, 11, 0), 0 6px 18px rgba(245, 158, 11, 0.35); }
+  100% { box-shadow: 0 1px 0 rgba(255, 255, 255, 0.34) inset, 0 0 0 0 rgba(245, 158, 11, 0), 0 6px 18px rgba(245, 158, 11, 0.35); }
+}
+
+.badge.awaiting {
+  color: #fef3c7;
+  border-color: rgba(251, 191, 36, 0.72);
+  background: rgba(245, 158, 11, 0.24);
+  font-weight: 650;
+}
+.badge.awaiting::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #fbbf24;
+  animation: activatePulse 1.8s infinite;
+}
+
+.row-awaiting-disk {
+  background: rgba(245, 158, 11, 0.065) !important;
+  box-shadow: inset 3px 0 0 #f59e0b;
+}
+.row-awaiting-disk:hover {
+  background: rgba(245, 158, 11, 0.11) !important;
+}
+
+.disk-sec-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
 .btn.ghost {
   background: transparent;
   border-color: transparent;
@@ -1279,4 +1329,66 @@ input[type="checkbox"], input[type="radio"] {
   flex-wrap: wrap;
   padding-top: 8px;
   border-top: 1px dashed rgba(148, 163, 184, 0.16);
+}
+
+/* ---------------- Disk Hot-Plug / Unplug / Safe-Eject States ---------------- */
+.row-disk-alert {
+  background: rgba(239, 68, 68, 0.08) !important;
+}
+.row-disk-alert td:first-child {
+  box-shadow: inset 3px 0 0 var(--red);
+}
+.badge.detached {
+  background: rgba(239, 68, 68, 0.22);
+  color: #fecaca;
+  border-color: rgba(239, 68, 68, 0.65);
+  font-weight: 600;
+  animation: pulseBadge 1.8s ease-in-out infinite;
+}
+.badge.reinsert {
+  background: rgba(245, 158, 11, 0.22);
+  color: #fde68a;
+  border-color: rgba(245, 158, 11, 0.62);
+  font-weight: 600;
+}
+.badge.safe-eject {
+  background: rgba(56, 189, 248, 0.18);
+  color: #bae6fd;
+  border-color: rgba(56, 189, 248, 0.52);
+  font-weight: 600;
+}
+.badge.new-disk {
+  background: rgba(59, 130, 246, 0.18);
+  color: #bfdbfe;
+  border-color: rgba(96, 165, 250, 0.5);
+}
+.disk-mini-item.detached {
+  border-color: rgba(239, 68, 68, 0.55);
+  background: rgba(239, 68, 68, 0.08);
+}
+.disk-mini-item.reinsert {
+  border-color: rgba(245, 158, 11, 0.52);
+  background: rgba(245, 158, 11, 0.07);
+}
+.disk-mini-item.safe-eject {
+  border-color: rgba(56, 189, 248, 0.42);
+  background: rgba(56, 189, 248, 0.06);
+}
+.disk-toggle-row.is-detached {
+  border-color: rgba(239, 68, 68, 0.55);
+  background: rgba(239, 68, 68, 0.09);
+}
+.disk-toggle-row.is-reinsert {
+  border-color: rgba(245, 158, 11, 0.55);
+  background: rgba(245, 158, 11, 0.08);
+}
+.disk-toggle-row.is-removed {
+  opacity: 0.45;
+  text-decoration: line-through;
+}
+.disk-row-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 4px;
 }

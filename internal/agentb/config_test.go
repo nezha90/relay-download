@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"relay-download/internal/protocol"
+	"relay-download/internal/transfer"
 )
 
 func TestSingleProjectOnlyConfigAndShorthandDirs(t *testing.T) {
@@ -107,6 +108,7 @@ func TestStorageDirsPoolDirectiveAndDiskPolicies(t *testing.T) {
 		wakeupCh:        make(chan string, 16),
 		projectSchedule: cfg.ProjectSchedule,
 		diskPolicy:      cfg.DiskPolicy,
+		diskHealth:      transfer.NewDiskHealthTracker(),
 	}
 
 	// 1. Center directive in "all" mode populates activeProjectIDs in exact KnownProjects (FIFO) order.

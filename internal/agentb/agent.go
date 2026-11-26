@@ -25,8 +25,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"golang.org/x/sys/unix"
-
 	"relay-download/internal/pki"
 	"relay-download/internal/protocol"
 	"relay-download/internal/transfer"
@@ -57,9 +55,9 @@ type Agent struct {
 	streamGate *DynamicGate
 	adaptive   *AdaptiveController
 	wakeupCh   chan string
-	ackWakeCh chan struct{}
-	hbWakeCh  chan struct{}
-	updater   *updater.Updater
+	ackWakeCh  chan struct{}
+	hbWakeCh   chan struct{}
+	updater    *updater.Updater
 
 	discMu    sync.Mutex
 	discCache map[string]cachedDiscover
@@ -71,7 +69,14 @@ type Agent struct {
 	knownOrder      []string            // Center-reported known projects ordered by created_at ASC
 	projectSchedule string              // "fifo" | "fair" | "random"
 	diskPolicy      string              // "affinity_hash" | "most_free" | "round_robin" | "first"
-	disabledDisks   map[string]struct{} // cleaned root paths disabled via Console
+	dirStorageDirs  []string            // Center-managed data disk pool roots (overrides cfg.StorageDirs when non-empty)
+	disabledDisks   map[string]struct{} // cleaned root paths disabled via Console or auto-locked on unplug
+	diskGen         int64               // monotonic Center disk-config generation
+	diskHealth      *transfer.DiskHealthTracker
+
+	hostDiskMu     sync.Mutex
+	hostDisksCache []protocol.HostDisk
+	hostDisksAt    time.Time
 
 	sseMu     sync.Mutex
 	sseCancel context.CancelFunc
@@ -105,14 +110,26 @@ func New(cfg *Config, logger *slog.Logger) (*Agent, error) {
 		logger = slog.Default()
 	}
 
+	diskHealth := transfer.NewDiskHealthTracker()
 	for _, sd := range cfg.StorageDirs {
-		if err := os.MkdirAll(sd, 0o755); err != nil {
+		if err := diskHealth.SafeMkdirAll(sd, sd, true); err != nil {
+			probe := diskHealth.ProbeRoot(sd, true, cfg.MaxDiskUsagePct, cfg.MinFreeDiskBytes, 0)
+			if probe.Detached {
+				logger.Warn("storage dir detached at startup, skipping mkdir to protect root filesystem", "dir", sd, "reason", probe.StatusReason)
+				continue
+			}
 			return nil, fmt.Errorf("init storage dir %s: %w", sd, err)
 		}
 	}
 	for _, proj := range cfg.ProjectIDs() {
 		for _, dir := range cfg.DestDirsFor(proj) {
-			if err := os.MkdirAll(filepath.Join(dir, ".relay_tmp"), 0o755); err != nil {
+			root := transfer.MatchRootForPath(dir, cfg.DiskRoots())
+			if err := diskHealth.SafeMkdirAll(root, filepath.Join(dir, ".relay_tmp"), true); err != nil {
+				probe := diskHealth.ProbeRoot(root, true, cfg.MaxDiskUsagePct, cfg.MinFreeDiskBytes, 0)
+				if probe.Detached {
+					logger.Warn("dest dir detached at startup, skipping mkdir", "project", proj, "dir", dir, "reason", probe.StatusReason)
+					continue
+				}
 				return nil, fmt.Errorf("init dest dir for project %s (%s): %w", proj, dir, err)
 			}
 		}
@@ -270,6 +287,7 @@ func New(cfg *Config, logger *slog.Logger) (*Agent, error) {
 		discCache:       make(map[string]cachedDiscover),
 		projectSchedule: cfg.ProjectSchedule,
 		diskPolicy:      cfg.DiskPolicy,
+		diskHealth:      diskHealth,
 	}
 	upgradeClient := &http.Client{
 		Transport: &http.Transport{
@@ -550,32 +568,153 @@ func (a *Agent) isDirDisabledLocked(dir string) bool {
 	return false
 }
 
+func (a *Agent) effectiveStorageDirsLocked() []string {
+	if len(a.dirStorageDirs) > 0 {
+		return a.dirStorageDirs
+	}
+	return a.cfg.StorageDirs
+}
+
+func (a *Agent) effectiveStorageDirs() []string {
+	a.dirMu.RLock()
+	out := append([]string(nil), a.effectiveStorageDirsLocked()...)
+	a.dirMu.RUnlock()
+	return out
+}
+
+func (a *Agent) destDirsFor(projectID string) []string {
+	a.dirMu.RLock()
+	dynStorage := append([]string(nil), a.dirStorageDirs...)
+	a.dirMu.RUnlock()
+	if len(dynStorage) == 0 {
+		return a.cfg.DestDirsFor(projectID)
+	}
+	only := strings.TrimSpace(a.cfg.OnlyProject)
+	if only != "" && projectID != only {
+		return nil
+	}
+	if !SafeProjectSubdir(projectID) {
+		return nil
+	}
+	out := make([]string, 0, len(dynStorage))
+	for _, sd := range dynStorage {
+		out = append(out, filepath.Join(sd, projectID))
+	}
+	return out
+}
+
+func (a *Agent) diskRoots() []string {
+	a.dirMu.RLock()
+	dynStorage := append([]string(nil), a.dirStorageDirs...)
+	a.dirMu.RUnlock()
+	if len(dynStorage) > 0 {
+		return dynStorage
+	}
+	return a.cfg.DiskRoots()
+}
+
+func (a *Agent) awaitingDisk() bool {
+	return len(a.diskRoots()) == 0
+}
+
+func (a *Agent) cachedHostDisks() []protocol.HostDisk {
+	// /proc/mounts + statfs on a handful of mounts takes <0.2ms on Linux, so scan fresh
+	// on every heartbeat (2s) so newly mounted disks appear immediately upon refresh.
+	disks := DiscoverHostDisks()
+	a.hostDiskMu.Lock()
+	a.hostDisksCache = disks
+	a.hostDisksAt = time.Now()
+	a.hostDiskMu.Unlock()
+	return disks
+}
+
+func (a *Agent) isDiskRootDisabled(root string) bool {
+	a.dirMu.RLock()
+	dis := a.isDiskRootDisabledLocked(root)
+	a.dirMu.RUnlock()
+	return dis
+}
+
+func (a *Agent) diskRootForDestDir(dir string) string {
+	return transfer.MatchRootForPath(dir, a.diskRoots())
+}
+
+func (a *Agent) evictReadyDirsForRoot(root string) {
+	cleanRoot := filepath.Clean(strings.TrimSpace(root))
+	if cleanRoot == "" || cleanRoot == "." {
+		return
+	}
+	prefix := cleanRoot + string(filepath.Separator)
+	a.readyDirs.Range(func(k, _ any) bool {
+		if s, ok := k.(string); ok {
+			cs := filepath.Clean(s)
+			if cs == cleanRoot || strings.HasPrefix(cs, prefix) {
+				a.readyDirs.Delete(k)
+			}
+		}
+		return true
+	})
+}
+
+func (a *Agent) handleLocalDiskErr(root string, err error) bool {
+	if err == nil {
+		return false
+	}
+	if a.diskHealth.ReportIOError(root, err) {
+		a.evictReadyDirsForRoot(root)
+		a.logger.Error("receiver disk I/O fault detected, auto-locking disk", "root", root, "err", err)
+		a.triggerHeartbeat()
+		return true
+	}
+	if transfer.IsDiskIOError(err) {
+		a.evictReadyDirsForRoot(root)
+		return true
+	}
+	probe := a.diskHealth.ProbeRoot(root, !a.isDiskRootDisabled(root), a.cfg.MaxDiskUsagePct, a.cfg.MinFreeDiskBytes, 0)
+	if probe.Detached || probe.UnplugLatched || !probe.Mounted {
+		a.evictReadyDirsForRoot(root)
+		a.logger.Warn("receiver disk detached during transfer, aborting file to protect source", "root", root, "reason", probe.StatusReason, "err", err)
+		a.triggerHeartbeat()
+		return true
+	}
+	return false
+}
+
 // enabledDestDirsFor returns destination directories for projectID after filtering out any
-// disk roots disabled from the Center console.
+// disk roots disabled from the Center console or fenced by hot-unplug/IO-fault detection.
 func (a *Agent) enabledDestDirsFor(projectID string) []string {
-	dirs := a.cfg.DestDirsFor(projectID)
+	dirs := a.destDirsFor(projectID)
 	if len(dirs) == 0 {
 		return nil
 	}
+	roots := a.diskRoots()
 	a.dirMu.RLock()
 	defer a.dirMu.RUnlock()
-	if len(a.disabledDisks) == 0 {
-		return dirs
-	}
 	out := make([]string, 0, len(dirs))
 	for _, d := range dirs {
-		if !a.isDirDisabledLocked(d) {
-			out = append(out, d)
+		if a.isDirDisabledLocked(d) {
+			continue
 		}
+		root := transfer.MatchRootForPath(d, roots)
+		if a.diskHealth.IsBlocked(root) {
+			continue
+		}
+		out = append(out, d)
 	}
 	return out
 }
 
 func (a *Agent) ensureDestDirReady(dir string) error {
+	root := a.diskRootForDestDir(dir)
+	if a.diskHealth.IsBlocked(root) {
+		a.readyDirs.Delete(dir)
+		return fmt.Errorf("storage root %s is disabled or detached", root)
+	}
 	if _, ok := a.readyDirs.Load(dir); ok {
 		return nil
 	}
-	if err := os.MkdirAll(filepath.Join(dir, ".relay_tmp"), 0o755); err != nil {
+	if err := a.diskHealth.SafeMkdirAll(root, filepath.Join(dir, ".relay_tmp"), true); err != nil {
+		a.readyDirs.Delete(dir)
 		return err
 	}
 	a.readyDirs.Store(dir, struct{}{})
@@ -590,6 +729,7 @@ func (a *Agent) activeProjectIDs() []string {
 	allowedOrder := append([]string(nil), a.allowedOrder...)
 	allowedSet := a.allowedProjects
 	knownOrder := append([]string(nil), a.knownOrder...)
+	hasPool := len(a.effectiveStorageDirsLocked()) > 0
 	a.dirMu.RUnlock()
 
 	if only := strings.TrimSpace(a.cfg.OnlyProject); only != "" {
@@ -598,20 +738,19 @@ func (a *Agent) activeProjectIDs() []string {
 				return nil
 			}
 		}
-		if len(a.cfg.DestDirsFor(only)) > 0 {
+		if len(a.destDirsFor(only)) > 0 {
 			return []string{only}
 		}
 		return nil
 	}
 
 	localIDs := a.cfg.ProjectIDs()
-	hasPool := len(a.cfg.StorageDirs) > 0
 
 	if hasPool {
 		if mode == "selected" {
 			out := make([]string, 0, len(allowedOrder))
 			for _, p := range allowedOrder {
-				if len(a.cfg.DestDirsFor(p)) > 0 {
+				if len(a.destDirsFor(p)) > 0 {
 					out = append(out, p)
 				}
 			}
@@ -620,7 +759,7 @@ func (a *Agent) activeProjectIDs() []string {
 		seen := make(map[string]struct{}, len(knownOrder)+len(localIDs))
 		out := make([]string, 0, len(knownOrder)+len(localIDs))
 		for _, p := range knownOrder {
-			if len(a.cfg.DestDirsFor(p)) == 0 {
+			if len(a.destDirsFor(p)) == 0 {
 				continue
 			}
 			if _, dup := seen[p]; !dup {
@@ -674,7 +813,7 @@ func (a *Agent) activeProjectIDs() []string {
 }
 
 func (a *Agent) isProjectAllowed(projectID string) bool {
-	if len(a.cfg.DestDirsFor(projectID)) == 0 {
+	if len(a.destDirsFor(projectID)) == 0 {
 		return false
 	}
 	a.dirMu.RLock()
@@ -718,13 +857,15 @@ func (a *Agent) applyDirective(dir *protocol.ReceiverDirective, legacyAllowed []
 	}
 
 	var (
-		nextMode     string
-		nextAllowed  []string
-		nextAllowSet map[string]struct{}
-		nextKnown    []string
-		nextSched    = a.cfg.ProjectSchedule
-		nextDiskPol  = a.cfg.DiskPolicy
-		nextDisabled map[string]struct{}
+		nextMode        string
+		nextAllowed     []string
+		nextAllowSet    map[string]struct{}
+		nextKnown       []string
+		nextSched       = a.cfg.ProjectSchedule
+		nextDiskPol     = a.cfg.DiskPolicy
+		nextStorageDirs []string
+		nextDisabled    map[string]struct{}
+		nextDiskGen     int64
 	)
 
 	if dir != nil {
@@ -773,6 +914,29 @@ func (a *Agent) applyDirective(dir *protocol.ReceiverDirective, legacyAllowed []
 				}
 			}
 		}
+		nextDiskGen = dir.DiskGen
+		a.diskHealth.ApplyConfig(dir.DisabledDisks, nextDiskGen)
+		if len(dir.StorageDirs) > 0 {
+			seenSD := make(map[string]struct{}, len(dir.StorageDirs))
+			for _, d := range dir.StorageDirs {
+				d = strings.TrimSpace(d)
+				if !IsSafeStorageDir(d) {
+					continue
+				}
+				d = filepath.Clean(d)
+				if _, dup := seenSD[d]; !dup {
+					seenSD[d] = struct{}{}
+					nextStorageDirs = append(nextStorageDirs, d)
+					if _, isDis := nextDisabled[d]; !isDis {
+						if err := a.diskHealth.SafeMkdirAll(d, d, true); err != nil && a.logger != nil {
+							a.logger.Warn("skipping mkdir for unavailable storage dir", "dir", d, "err", err)
+						}
+					} else {
+						a.evictReadyDirsForRoot(d)
+					}
+				}
+			}
+		}
 	} else if len(legacyAllowed) > 0 {
 		nextMode = "selected"
 		nextAllowSet = make(map[string]struct{}, len(legacyAllowed))
@@ -797,7 +961,9 @@ func (a *Agent) applyDirective(dir *protocol.ReceiverDirective, legacyAllowed []
 		!equalStringSlices(a.knownOrder, nextKnown)
 	policyChanged := a.projectSchedule != nextSched ||
 		a.diskPolicy != nextDiskPol ||
-		!equalStringSet(a.disabledDisks, nextDisabled)
+		!equalStringSlices(a.dirStorageDirs, nextStorageDirs) ||
+		!equalStringSet(a.disabledDisks, nextDisabled) ||
+		a.diskGen != nextDiskGen
 
 	a.directiveMode = nextMode
 	a.allowedOrder = nextAllowed
@@ -805,7 +971,11 @@ func (a *Agent) applyDirective(dir *protocol.ReceiverDirective, legacyAllowed []
 	a.knownOrder = nextKnown
 	a.projectSchedule = nextSched
 	a.diskPolicy = nextDiskPol
+	a.dirStorageDirs = nextStorageDirs
 	a.disabledDisks = nextDisabled
+	if nextDiskGen > a.diskGen {
+		a.diskGen = nextDiskGen
+	}
 	a.dirMu.Unlock()
 
 	if dir != nil {
@@ -857,7 +1027,7 @@ func (a *Agent) adaptiveLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if a.paused.Load() {
+			if a.paused.Load() || a.awaitingDisk() {
 				continue
 			}
 			snap := a.adaptive.Evaluate(interval, a.workGate.InFlight(), a.pendingAckCount.Load())
@@ -930,8 +1100,9 @@ func (a *Agent) triggerAckFlush() {
 func (a *Agent) sseProjectsQuery() string {
 	a.dirMu.RLock()
 	mode := a.directiveMode
+	hasPool := len(a.effectiveStorageDirsLocked()) > 0
 	a.dirMu.RUnlock()
-	if len(a.cfg.StorageDirs) > 0 && a.cfg.OnlyProject == "" && (mode == "" || mode == "all") {
+	if hasPool && a.cfg.OnlyProject == "" && (mode == "" || mode == "all") {
 		return "*"
 	}
 	return strings.Join(a.activeProjectIDs(), ",")
@@ -1067,7 +1238,7 @@ func (a *Agent) dispatchLoop(ctx context.Context) {
 }
 
 func (a *Agent) scanAllProjects(ctx context.Context) {
-	if a.paused.Load() {
+	if a.paused.Load() || a.awaitingDisk() {
 		return
 	}
 	ids := a.activeProjectIDs()
@@ -1181,7 +1352,10 @@ func (a *Agent) chooseDestDir(projectID, filename string, fileSize int64) string
 	}
 	fits := func(d string) bool {
 		free := a.availableDiskFor(d)
-		return free >= need && (a.cfg.MinFreeDiskBytes == 0 || free > 0)
+		if free == 0 {
+			return false
+		}
+		return free >= need
 	}
 	pickMostFree := func() string {
 		bestDir := dirs[0]
@@ -1293,9 +1467,9 @@ func (a *Agent) scanProjectWithLimit(ctx context.Context, projectID string, maxS
 			}
 
 			availDisk := a.availableDiskForProject(projectID)
-			if availDisk == 0 && a.cfg.MinFreeDiskBytes > 0 {
+			if availDisk == 0 {
 				releaseSlots(reserved)
-				a.logger.Warn("insufficient local disk space, skipping claim", "project", projectID, "dest_dirs", dirs)
+				a.logger.Warn("no healthy disk space above mandatory watermark, skipping claim", "project", projectID, "dest_dirs", dirs)
 				return totalClaimed
 			}
 
@@ -1406,36 +1580,18 @@ func (a *Agent) scanProjectWithLimit(ctx context.Context, projectID string, maxS
 	return totalClaimed
 }
 
-func diskUsageWithParentFallback(dir string) (total, free uint64, usedPct float64, err error) {
-	cur := filepath.Clean(dir)
-	for {
-		total, free, usedPct, err = transfer.DiskUsage(cur)
-		if err == nil {
-			return total, free, usedPct, nil
-		}
-		if !errors.Is(err, os.ErrNotExist) {
-			return 0, 0, 0, err
-		}
-		parent := filepath.Dir(cur)
-		if parent == cur {
-			return 0, 0, 0, err
-		}
-		cur = parent
-	}
-}
-
 func (a *Agent) availableDiskFor(dir string) uint64 {
-	_, free, _, err := diskUsageWithParentFallback(dir)
-	if err != nil {
+	root := a.diskRootForDestDir(dir)
+	if a.isDiskRootDisabled(root) || a.diskHealth.IsBlocked(root) {
 		return 0
 	}
-	if a.cfg.MinFreeDiskBytes == 0 {
-		return free
-	}
-	if free <= a.cfg.MinFreeDiskBytes {
+	probe := a.diskHealth.ProbeRoot(root, true, a.cfg.MaxDiskUsagePct, a.cfg.MinFreeDiskBytes, 0)
+	if probe.Detached || probe.UnplugLatched || !probe.Mounted || !probe.Writable {
+		a.evictReadyDirsForRoot(root)
 		return 0
 	}
-	return free - a.cfg.MinFreeDiskBytes
+	usable, _ := transfer.MandatoryWatermarkFree(probe.TotalBytes, probe.FreeBytes, a.cfg.MaxDiskUsagePct, a.cfg.MinFreeDiskBytes)
+	return usable
 }
 
 func (a *Agent) discover(ctx context.Context, projectID string) (*protocol.DiscoverResp, error) {
@@ -1552,15 +1708,21 @@ func (a *Agent) runDownload(ctx context.Context, dl ActiveDownload) {
 	a.activeCount.Add(1)
 	defer a.activeCount.Add(-1)
 
+	diskRoot := a.diskRootForDestDir(dl.DestDir)
+	a.diskHealth.BeginIO(diskRoot)
+	defer a.diskHealth.EndIO(diskRoot)
+
 	// Background lease renewer so even slow SHA256 hashing or brief reconnects never lose the lease.
 	renewCtx, stopRenew := context.WithCancel(ctx)
 	defer stopRenew()
 	go a.leaseRenewLoop(renewCtx, &dl)
 
-	if err := os.MkdirAll(filepath.Dir(dl.PartPath), 0o755); err != nil {
-		a.logger.Error("create tmp dir failed", "err", err)
+	if err := a.diskHealth.SafeMkdirAll(diskRoot, filepath.Dir(dl.PartPath), !a.isDiskRootDisabled(diskRoot)); err != nil {
+		a.logger.Error("create tmp dir failed (disk unavailable)", "root", diskRoot, "err", err)
+		a.evictReadyDirsForRoot(diskRoot)
+		a.triggerHeartbeat()
 		_ = a.store.DeleteActive(dl.FileID)
-		_ = a.sendNack(ctx, dl, "mkdir tmp failed")
+		_ = a.sendNack(ctx, dl, "dest disk unavailable: "+err.Error())
 		return
 	}
 
@@ -1594,6 +1756,13 @@ func (a *Agent) runDownload(ctx context.Context, dl ActiveDownload) {
 				_ = os.Remove(dl.PartPath)
 				_ = os.Remove(bitmapPath)
 				_ = a.store.DeleteActive(dl.FileID)
+				return
+			}
+			if a.handleLocalDiskErr(diskRoot, chunkErr) {
+				_ = os.Remove(dl.PartPath)
+				_ = os.Remove(bitmapPath)
+				_ = a.store.DeleteActive(dl.FileID)
+				_ = a.sendNack(ctx, dl, "receiver disk detached/io fault")
 				return
 			}
 			a.logger.Warn("chunked download failed, falling back to resumable single-stream", "file_id", dl.FileID, "err", chunkErr)
@@ -1650,6 +1819,13 @@ func (a *Agent) runDownload(ctx context.Context, dl ActiveDownload) {
 			_ = a.store.DeleteActive(dl.FileID)
 			return
 		}
+		// Local destination disk unplugged or I/O fault: immediately abort and NACK so source is preserved & retried on another healthy disk.
+		if streamErr != nil && a.handleLocalDiskErr(diskRoot, streamErr) {
+			_ = os.Remove(dl.PartPath)
+			_ = a.store.DeleteActive(dl.FileID)
+			_ = a.sendNack(ctx, dl, "receiver disk detached/io fault")
+			return
+		}
 
 		if writtenNow > 0 {
 			// Progress made before network drop -> reset backoff and record resume.
@@ -1679,6 +1855,7 @@ func (a *Agent) runDownload(ctx context.Context, dl ActiveDownload) {
 	if actualSHA == "" || resumed {
 		_, computed, err := transfer.HashFile(ctx, dl.PartPath)
 		if err != nil {
+			a.handleLocalDiskErr(diskRoot, err)
 			a.logger.Error("hash downloaded file failed", "file_id", dl.FileID, "err", err)
 			_ = os.Remove(dl.PartPath)
 			_ = a.store.DeleteActive(dl.FileID)
@@ -1711,8 +1888,9 @@ func (a *Agent) runDownload(ctx context.Context, dl ActiveDownload) {
 		_ = os.Remove(dl.PartPath)
 		a.commitMu.Unlock()
 	} else {
-		if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
+		if err := a.diskHealth.SafeMkdirAll(diskRoot, filepath.Dir(targetPath), !a.isDiskRootDisabled(diskRoot)); err != nil {
 			a.commitMu.Unlock()
+			a.handleLocalDiskErr(diskRoot, err)
 			a.logger.Error("mkdir target parent failed", "err", err)
 			_ = os.Remove(dl.PartPath)
 			_ = a.store.DeleteActive(dl.FileID)
@@ -1724,6 +1902,7 @@ func (a *Agent) runDownload(ctx context.Context, dl ActiveDownload) {
 		}
 		if err := os.Rename(dl.PartPath, targetPath); err != nil {
 			a.commitMu.Unlock()
+			a.handleLocalDiskErr(diskRoot, err)
 			a.logger.Error("atomic rename failed", "src", dl.PartPath, "dst", targetPath, "err", err)
 			_ = os.Remove(dl.PartPath)
 			_ = a.store.DeleteActive(dl.FileID)
@@ -2601,6 +2780,7 @@ func (a *Agent) flushPendingAcks(ctx context.Context) {
 			go func(d string) {
 				defer syncWG.Done()
 				if err := transfer.SyncFS(d); err != nil {
+					a.handleLocalDiskErr(a.diskRootForDestDir(d), err)
 					a.logger.Warn("syncfs dest dir failed, deferring ACK", "dir", d, "err", err)
 					failMu.Lock()
 					failedDirs[d] = true
@@ -2675,7 +2855,7 @@ func (a *Agent) heartbeatLoop(ctx context.Context) {
 }
 
 func (a *Agent) sendHeartbeat(ctx context.Context) {
-	roots := a.cfg.DiskRoots()
+	roots := a.diskRoots()
 	disks := make([]protocol.DiskStatus, 0, len(roots))
 	var totalDisk, freeDisk uint64
 	var usedPct float64
@@ -2684,44 +2864,52 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 	var allTotal, allFree uint64
 
 	a.dirMu.RLock()
+	enabledByRoot := make(map[string]bool, len(roots))
 	for _, root := range roots {
-		enabled := !a.isDiskRootDisabledLocked(root)
-		t, f, pct, err := diskUsageWithParentFallback(root)
-		writable := err == nil && unix.Access(root, unix.W_OK) == nil
-		lowSpace := err == nil && a.cfg.MinFreeDiskBytes > 0 && f <= a.cfg.MinFreeDiskBytes
+		enabledByRoot[root] = !a.isDiskRootDisabledLocked(root)
+	}
+	a.dirMu.RUnlock()
+
+	for _, root := range roots {
+		enabled := enabledByRoot[root]
+		probe := a.diskHealth.ProbeRoot(root, enabled, a.cfg.MaxDiskUsagePct, a.cfg.MinFreeDiskBytes, 0)
+		if probe.Detached || probe.UnplugLatched {
+			a.evictReadyDirsForRoot(root)
+		}
 		disks = append(disks, protocol.DiskStatus{
-			Path:       root,
-			TotalBytes: t,
-			FreeBytes:  f,
-			UsedPct:    pct,
-			Enabled:    enabled,
-			LowSpace:   lowSpace,
-			Writable:   writable,
+			Path:          root,
+			TotalBytes:    probe.TotalBytes,
+			FreeBytes:     probe.FreeBytes,
+			UsedPct:       probe.UsedPct,
+			Enabled:       enabled && !probe.UnplugLatched,
+			LowSpace:      probe.LowSpace,
+			Writable:      probe.Writable,
+			Detached:      probe.Detached,
+			UnplugLatched: probe.UnplugLatched,
+			LatchedGen:    probe.LatchedGen,
+			InFlight:      probe.InFlight,
+			SafeToEject:   probe.SafeToEject,
+			StatusReason:  probe.StatusReason,
 		})
-		if err == nil {
-			var st unix.Stat_t
-			devKey := uint64(0)
-			hasDev := unix.Stat(root, &st) == nil
-			if hasDev {
-				devKey = uint64(st.Dev)
-			}
+		if probe.Mounted && !probe.Detached {
+			devKey := probe.DevID
+			hasDev := probe.HasDev
 			if !hasDev || func() bool { _, dup := seenAllDev[devKey]; return !dup }() {
 				if hasDev {
 					seenAllDev[devKey] = struct{}{}
 				}
-				allTotal += t
-				allFree += f
+				allTotal += probe.TotalBytes
+				allFree += probe.FreeBytes
 			}
-			if enabled && (!hasDev || func() bool { _, dup := seenEnabledDev[devKey]; return !dup }()) {
+			if enabled && !probe.UnplugLatched && (!hasDev || func() bool { _, dup := seenEnabledDev[devKey]; return !dup }()) {
 				if hasDev {
 					seenEnabledDev[devKey] = struct{}{}
 				}
-				totalDisk += t
-				freeDisk += f
+				totalDisk += probe.TotalBytes
+				freeDisk += probe.FreeBytes
 			}
 		}
 	}
-	a.dirMu.RUnlock()
 
 	if totalDisk == 0 && allTotal > 0 {
 		totalDisk = allTotal
@@ -2749,8 +2937,9 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 		NodeID:              a.cfg.NodeID,
 		Name:                a.cfg.NodeName,
 		Projects:            a.activeProjectIDs(),
-		StorageDirs:         append([]string(nil), a.cfg.StorageDirs...),
+		StorageDirs:         a.effectiveStorageDirs(),
 		Disks:               disks,
+		HostDisks:           a.cachedHostDisks(),
 		ProjectSchedule:     a.effectiveProjectSchedule(),
 		DiskPolicy:          a.effectiveDiskPolicy(),
 		ConcurrencyMode:     snap.Mode,
@@ -2769,6 +2958,7 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 		DiskTotalBytes:   totalDisk,
 		DiskFreeBytes:    freeDisk,
 		DiskUsedPct:      usedPct,
+		AwaitingDisk:     a.awaitingDisk(),
 		Paused:           a.paused.Load(),
 		ActiveCount:      int(a.activeCount.Load()),
 	}

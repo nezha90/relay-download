@@ -73,13 +73,31 @@ const (
 )
 
 type DiskStatus struct {
-	Path       string  `json:"path"`
-	TotalBytes uint64  `json:"total_bytes"`
-	FreeBytes  uint64  `json:"free_bytes"`
-	UsedPct    float64 `json:"used_pct"`
-	Enabled    bool    `json:"enabled"`
-	LowSpace   bool    `json:"low_space,omitempty"`
-	Writable   bool    `json:"writable"`
+	Path          string  `json:"path"`
+	TotalBytes    uint64  `json:"total_bytes"`
+	FreeBytes     uint64  `json:"free_bytes"`
+	UsedPct       float64 `json:"used_pct"`
+	Enabled       bool    `json:"enabled"`
+	LowSpace      bool    `json:"low_space,omitempty"`
+	Writable      bool    `json:"writable"`
+	Detached      bool    `json:"detached,omitempty"`       // true: backing mount missing, root-fallback, read-only, or I/O fault
+	UnplugLatched bool    `json:"unplug_latched,omitempty"` // true: unplug/swap detected at LatchedGen; locked until manual re-enable
+	LatchedGen    int64   `json:"latched_gen,omitempty"`    // node disk_gen when UnplugLatched was recorded
+	InFlight      int     `json:"in_flight,omitempty"`      // active writes/reads currently targeting this disk
+	SafeToEject   bool    `json:"safe_to_eject,omitempty"`  // true: disabled, still mounted, and zero in-flight/pending I/O
+	StatusReason  string  `json:"status_reason,omitempty"`  // human-readable disk health status
+}
+
+type HostDisk struct {
+	Device       string  `json:"device"`
+	MountPoint   string  `json:"mount_point"`
+	FSType       string  `json:"fs_type"`
+	TotalBytes   uint64  `json:"total_bytes"`
+	FreeBytes    uint64  `json:"free_bytes"`
+	UsedPct      float64 `json:"used_pct"`
+	Writable     bool    `json:"writable"`
+	SuggestedDir string  `json:"suggested_dir"`
+	IsSystem     bool    `json:"is_system,omitempty"`
 }
 
 type ReceiverDirective struct {
@@ -89,7 +107,9 @@ type ReceiverDirective struct {
 	KnownProjects      []string `json:"known_projects,omitempty"`       // all projects ordered by created_at ASC
 	ProjectSchedule    string   `json:"project_schedule,omitempty"`     // "fifo" | "fair" | "random"
 	DiskPolicy         string   `json:"disk_policy,omitempty"`          // "affinity_hash" | "most_free" | "round_robin" | "first"
-	DisabledDisks      []string `json:"disabled_disks,omitempty"`       // storage root dirs disabled via console
+	StorageDirs        []string `json:"storage_dirs,omitempty"`         // optional Center-managed data disk pool roots (overrides local storage_dirs when non-empty)
+	DisabledDisks      []string `json:"disabled_disks,omitempty"`       // storage root dirs disabled via console or auto-locked on unplug
+	DiskGen            int64    `json:"disk_gen,omitempty"`             // monotonic operator disk-config generation (clears prior unplug latch on re-enable)
 	ConcurrencyMode    string   `json:"concurrency_mode,omitempty"`     // "auto" | "manual"
 	MaxConcurrent      int      `json:"max_concurrent,omitempty"`       // >0 overrides effective upper concurrency cap
 	SuggestedStreamCap int      `json:"suggested_stream_cap,omitempty"` // >0 cluster-wide fair-share stream ceiling from dispatch capacity
@@ -122,7 +142,10 @@ type NodeRecord struct {
 	Projects              []string  `json:"projects"`
 	ProjectSchedule       string    `json:"project_schedule,omitempty"`
 	DiskPolicy            string    `json:"disk_policy,omitempty"`
+	StorageDirs           []string  `json:"storage_dirs,omitempty"`
 	DisabledDisks         []string  `json:"disabled_disks,omitempty"`
+	UnplugLockedDisks     []string  `json:"unplug_locked_disks,omitempty"`
+	DiskGen               int64     `json:"disk_gen,omitempty"`
 	ConcurrencyMode       string    `json:"concurrency_mode,omitempty"`
 	MaxConcurrentOverride int       `json:"max_concurrent_override,omitempty"`
 	RateLimitMBps         float64   `json:"rate_limit_mbps,omitempty"`
@@ -149,10 +172,14 @@ type AgentAHeartbeatReq struct {
 	UpgradeAttemptID string                `json:"upgrade_attempt_id,omitempty"`
 	UpgradeStatus    string                `json:"upgrade_status,omitempty"`
 	UpgradeError     string                `json:"upgrade_error,omitempty"`
-	DiskTotalBytes   uint64                `json:"disk_total_bytes"`
-	DiskFreeBytes    uint64                `json:"disk_free_bytes"`
-	DiskUsedPct      float64               `json:"disk_used_pct"`
+	DiskTotalBytes       uint64                `json:"disk_total_bytes"`
+	DiskFreeBytes        uint64                `json:"disk_free_bytes"`
+	DiskUsedPct          float64               `json:"disk_used_pct"`
 	DiskAlarm            bool                  `json:"disk_alarm"`
+	StorageDirs          []string              `json:"storage_dirs,omitempty"`
+	Disks                []DiskStatus          `json:"disks,omitempty"`
+	HostDisks            []HostDisk            `json:"host_disks,omitempty"`
+	AwaitingDisk         bool                  `json:"awaiting_disk,omitempty"`
 	Paused               bool                  `json:"paused,omitempty"`
 	ActiveStreams        int                   `json:"active_streams,omitempty"`
 	MaxConcurrentStreams int                   `json:"max_concurrent_streams,omitempty"`
@@ -180,6 +207,7 @@ type AgentBHeartbeatReq struct {
 	Projects              []string          `json:"projects"`
 	StorageDirs           []string          `json:"storage_dirs,omitempty"`
 	Disks                 []DiskStatus      `json:"disks,omitempty"`
+	HostDisks             []HostDisk        `json:"host_disks,omitempty"`
 	ProjectSchedule       string            `json:"project_schedule,omitempty"`
 	DiskPolicy            string            `json:"disk_policy,omitempty"`
 	ConcurrencyMode       string            `json:"concurrency_mode,omitempty"`
@@ -198,6 +226,7 @@ type AgentBHeartbeatReq struct {
 	DiskTotalBytes        uint64            `json:"disk_total_bytes"`
 	DiskFreeBytes         uint64            `json:"disk_free_bytes"`
 	DiskUsedPct           float64           `json:"disk_used_pct"`
+	AwaitingDisk          bool              `json:"awaiting_disk,omitempty"`
 	Paused                bool              `json:"paused,omitempty"`
 	ActiveCount           int               `json:"active_count"`
 	LegacyActiveTransfers []json.RawMessage `json:"active_transfers,omitempty"`
@@ -213,6 +242,9 @@ type UpgradeDirective struct {
 
 type HeartbeatResp struct {
 	Paused          bool                `json:"paused,omitempty"`
+	StorageDirs     []string            `json:"storage_dirs,omitempty"`   // for agent_a: Center-selected multi-disk cache roots
+	DisabledDisks   []string            `json:"disabled_disks,omitempty"` // for agent_a: disabled / unplug-locked cache roots
+	DiskGen         int64               `json:"disk_gen,omitempty"`       // monotonic operator disk-config generation
 	Upgrade         *UpgradeDirective   `json:"upgrade,omitempty"`
 	AllowedProjects []string            `json:"allowed_projects,omitempty"`
 	Directive       *ReceiverDirective  `json:"directive,omitempty"`
@@ -457,10 +489,13 @@ type LiveNodeView struct {
 	ProjectSchedule       string                `json:"project_schedule,omitempty"`
 	DiskPolicy            string                `json:"disk_policy,omitempty"`
 	DisabledDisks         []string              `json:"disabled_disks,omitempty"`
+	UnplugLockedDisks     []string              `json:"unplug_locked_disks,omitempty"`
+	DiskGen               int64                 `json:"disk_gen,omitempty"`
 	ConcurrencyMode       string                `json:"concurrency_mode,omitempty"`
 	MaxConcurrentOverride int                   `json:"max_concurrent_override,omitempty"`
 	RateLimitMBps         float64               `json:"rate_limit_mbps,omitempty"`
 	Paused                bool                  `json:"paused,omitempty"`
+	AwaitingDisk          bool                  `json:"awaiting_disk,omitempty"`
 	EffectiveConcurrent   int                   `json:"effective_concurrent,omitempty"`
 	MaxConcurrentCap      int                   `json:"max_concurrent_cap,omitempty"`
 	EffectiveStreams      int                   `json:"effective_streams,omitempty"`
@@ -469,6 +504,7 @@ type LiveNodeView struct {
 	AdaptiveReason        string                `json:"adaptive_reason,omitempty"`
 	StorageDirs           []string              `json:"storage_dirs,omitempty"`
 	Disks                 []DiskStatus          `json:"disks,omitempty"`
+	HostDisks             []HostDisk            `json:"host_disks,omitempty"`
 	PublicAddr            string                `json:"public_addr,omitempty"`
 	Online                bool                  `json:"online"`
 	Version           string                `json:"version,omitempty"`
@@ -652,6 +688,7 @@ type AgentBScriptReq struct {
 	NodeID             string              `json:"node_id"`
 	NodeToken          string              `json:"node_token,omitempty"`
 	RotateToken        bool                `json:"rotate_token,omitempty"`
+	AwaitDiskSelection bool                `json:"await_disk_selection,omitempty"`
 	InstallDir         string              `json:"install_dir,omitempty"`
 	StateDir           string              `json:"state_dir,omitempty"`
 	StorageDirs        []string            `json:"storage_dirs,omitempty"`
@@ -675,6 +712,7 @@ type AgentAScriptReq struct {
 	NodeID               string  `json:"node_id"`
 	NodeToken            string  `json:"node_token,omitempty"`
 	RotateToken          bool    `json:"rotate_token,omitempty"`
+	AwaitDiskSelection   bool    `json:"await_disk_selection,omitempty"`
 	PublicAddr           string  `json:"public_addr,omitempty"`
 	PublicPort           int     `json:"public_port,omitempty"`
 	LocalPort            int     `json:"local_port,omitempty"`

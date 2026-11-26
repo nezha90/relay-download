@@ -40,6 +40,13 @@ type Agent struct {
 	uploadDir string
 	readyDir  string
 
+	storageMu     sync.RWMutex
+	storageDirs   []string
+	disabledDisks map[string]struct{}
+	diskGen       int64
+	diskHealth    *transfer.DiskHealthTracker
+	diskRRIdx     atomic.Uint64
+
 	localSrv  *http.Server
 	publicSrv *http.Server
 
@@ -102,13 +109,29 @@ func New(cfg *Config, logger *slog.Logger) (*Agent, error) {
 		limiter = transfer.NewRateLimiter(int64(cfg.RateLimitMBps * 1024 * 1024))
 	}
 
+	diskHealth := transfer.NewDiskHealthTracker()
+	initStorage := make([]string, 0, len(cfg.StorageDirs))
+	for _, sd := range cfg.StorageDirs {
+		sd = strings.TrimSpace(sd)
+		if sd == "" {
+			continue
+		}
+		clean := filepath.Clean(sd)
+		_ = diskHealth.SafeMkdirAll(clean, filepath.Join(clean, "uploading"), true)
+		_ = diskHealth.SafeMkdirAll(clean, filepath.Join(clean, "ready"), true)
+		initStorage = append(initStorage, clean)
+	}
+
 	a := &Agent{
-		cfg:       cfg,
-		store:     store,
-		logger:    logger.With("component", "agent-a", "node_id", cfg.NodeID),
-		uploadDir: uploadDir,
-		readyDir:  readyDir,
-		limiter:   limiter,
+		cfg:           cfg,
+		store:         store,
+		logger:        logger.With("component", "agent-a", "node_id", cfg.NodeID),
+		uploadDir:     uploadDir,
+		readyDir:      readyDir,
+		storageDirs:   initStorage,
+		disabledDisks: make(map[string]struct{}),
+		diskHealth:    diskHealth,
+		limiter:       limiter,
 		httpClient: &http.Client{
 			Timeout: 15 * time.Second,
 			Transport: &http.Transport{
@@ -303,36 +326,160 @@ func (a *Agent) Shutdown(ctx context.Context) error {
 	return shutdownErr
 }
 
+func (a *Agent) activeCacheDirs() []string {
+	a.storageMu.RLock()
+	dyn := append([]string(nil), a.storageDirs...)
+	a.storageMu.RUnlock()
+	if len(dyn) > 0 {
+		return dyn
+	}
+	if a.cfg.AwaitDiskSelection {
+		return nil
+	}
+	if a.cfg.DataDir != "" {
+		return []string{a.cfg.DataDir}
+	}
+	return nil
+}
+
+func (a *Agent) awaitingDisk() bool {
+	return len(a.activeCacheDirs()) == 0
+}
+
+func (a *Agent) isDiskDisabledLocked(root string) bool {
+	if len(a.disabledDisks) == 0 {
+		return false
+	}
+	_, ok := a.disabledDisks[filepath.Clean(strings.TrimSpace(root))]
+	return ok
+}
+
+func (a *Agent) isDiskDisabled(root string) bool {
+	a.storageMu.RLock()
+	dis := a.isDiskDisabledLocked(root)
+	a.storageMu.RUnlock()
+	return dis
+}
+
+func (a *Agent) applyDiskConfig(dirs, disabled []string, diskGen int64) {
+	disSet := make(map[string]struct{}, len(disabled))
+	for _, d := range disabled {
+		d = strings.TrimSpace(d)
+		if d != "" {
+			disSet[filepath.Clean(d)] = struct{}{}
+		}
+	}
+	a.diskHealth.ApplyConfig(disabled, diskGen)
+
+	clean := make([]string, 0, len(dirs))
+	if len(dirs) > 0 {
+		seen := make(map[string]struct{}, len(dirs))
+		for _, raw := range dirs {
+			raw = strings.TrimSpace(raw)
+			if !transfer.IsSafeStorageDir(raw) {
+				continue
+			}
+			p := filepath.Clean(raw)
+			if _, dup := seen[p]; dup {
+				continue
+			}
+			seen[p] = struct{}{}
+			if _, isDis := disSet[p]; !isDis {
+				_ = a.diskHealth.SafeMkdirAll(p, filepath.Join(p, "uploading"), true)
+				_ = a.diskHealth.SafeMkdirAll(p, filepath.Join(p, "ready"), true)
+			}
+			clean = append(clean, p)
+		}
+	}
+
+	a.storageMu.Lock()
+	changed := a.diskGen != diskGen || len(a.disabledDisks) != len(disSet)
+	if !changed {
+		for k := range disSet {
+			if _, ok := a.disabledDisks[k]; !ok {
+				changed = true
+				break
+			}
+		}
+	}
+	if len(clean) > 0 {
+		if len(a.storageDirs) != len(clean) {
+			changed = true
+		} else {
+			for i := range clean {
+				if a.storageDirs[i] != clean[i] {
+					changed = true
+					break
+				}
+			}
+		}
+		a.storageDirs = clean
+	}
+	a.disabledDisks = disSet
+	if diskGen > a.diskGen {
+		a.diskGen = diskGen
+	}
+	a.storageMu.Unlock()
+	if changed {
+		a.logger.Info("updated dispatch cache disk config from center", "storage_dirs", a.activeCacheDirs(), "disabled_disks", len(disSet), "disk_gen", diskGen)
+	}
+}
+
 func (a *Agent) reconcileOnStartup() error {
-	// Clean any incomplete uploads left from a prior crash.
-	if entries, err := os.ReadDir(a.uploadDir); err == nil {
-		for _, e := range entries {
-			if !e.IsDir() {
-				_ = os.Remove(filepath.Join(a.uploadDir, e.Name()))
+	// Clean any incomplete uploads left from a prior crash across all mounted cache dirs.
+	roots := a.activeCacheDirs()
+	if len(roots) == 0 && a.cfg.DataDir != "" {
+		roots = []string{a.cfg.DataDir}
+	}
+	detachedRoots := make(map[string]bool, len(roots))
+	for _, root := range roots {
+		probe := a.diskHealth.ProbeRoot(root, !a.isDiskDisabled(root), a.cfg.MaxDiskUsagePct, a.cfg.MinFreeDiskBytes, 0)
+		if probe.Detached || !probe.Mounted {
+			detachedRoots[filepath.Clean(root)] = true
+			a.logger.Warn("skipping startup reconcile for detached cache disk", "root", root, "reason", probe.StatusReason)
+			continue
+		}
+		uDir := filepath.Join(root, "uploading")
+		if entries, err := os.ReadDir(uDir); err == nil {
+			for _, e := range entries {
+				if !e.IsDir() {
+					_ = os.Remove(filepath.Join(uDir, e.Name()))
+				}
 			}
 		}
 	}
 
-	knownIDs, err := a.store.AllFileIDs()
-	if err != nil {
-		return err
-	}
-	// Remove DB records whose backing file is missing.
-	for id := range knownIDs {
-		if _, err := os.Stat(a.readyFilePath(id)); errors.Is(err, os.ErrNotExist) {
+	knownPaths := a.store.AllFilePaths()
+	// Remove DB records whose backing file is missing (ONLY when its backing disk is mounted!).
+	for id, dp := range knownPaths {
+		p := dp
+		if p == "" {
+			p = a.readyFilePath(id)
+		}
+		root := transfer.MatchRootForPath(p, roots)
+		if detachedRoots[filepath.Clean(root)] {
+			continue
+		}
+		if _, err := os.Stat(p); errors.Is(err, os.ErrNotExist) {
 			_ = a.store.DeleteRecord(id)
-			delete(knownIDs, id)
+			delete(knownPaths, id)
 		}
 	}
-	// Remove orphaned files in readyDir not present in DB.
-	if entries, err := os.ReadDir(a.readyDir); err == nil {
-		for _, e := range entries {
-			if e.IsDir() {
-				continue
-			}
-			id := strings.TrimSuffix(e.Name(), ".dat")
-			if _, ok := knownIDs[id]; !ok {
-				_ = os.Remove(filepath.Join(a.readyDir, e.Name()))
+	// Remove orphaned files in mounted readyDir(s) not present in DB.
+	for _, root := range roots {
+		if detachedRoots[filepath.Clean(root)] {
+			continue
+		}
+		rDir := filepath.Join(root, "ready")
+		if entries, err := os.ReadDir(rDir); err == nil {
+			for _, e := range entries {
+				if e.IsDir() {
+					continue
+				}
+				id := strings.TrimSuffix(e.Name(), ".dat")
+				if _, ok := knownPaths[id]; !ok {
+					_ = os.Remove(filepath.Join(rDir, e.Name()))
+				}
 			}
 		}
 	}
@@ -343,30 +490,167 @@ func (a *Agent) readyFilePath(fileID string) string {
 	return filepath.Join(a.readyDir, fileID+".dat")
 }
 
-func (a *Agent) diskWatermarkStatus(extraBytes uint64) (total, free uint64, usedPct float64, alarm bool, err error) {
-	total, free, usedPct, err = transfer.DiskUsage(a.cfg.DataDir)
-	if err != nil {
-		return 0, 0, 0, false, err
+func (a *Agent) filePathForID(fileID string) string {
+	if p := a.store.DataPathFor(fileID); p != "" {
+		return p
 	}
-	effFree := free
-	if extraBytes > 0 {
-		if extraBytes >= effFree {
-			effFree = 0
-		} else {
-			effFree -= extraBytes
+	return a.readyFilePath(fileID)
+}
+
+func (a *Agent) readyPathForRecord(rec FileRecord) string {
+	if rec.DataPath != "" {
+		return rec.DataPath
+	}
+	return a.readyFilePath(rec.FileID)
+}
+
+func (a *Agent) checkSingleDiskWatermark(dir string, extraBytes uint64) (total, free, usable uint64, usedPct float64, alarm bool, err error) {
+	enabled := !a.isDiskDisabled(dir)
+	probe := a.diskHealth.ProbeRoot(dir, enabled, a.cfg.MaxDiskUsagePct, a.cfg.MinFreeDiskBytes, 0)
+	if probe.Detached || probe.UnplugLatched || !probe.Mounted || !probe.Writable {
+		return 0, 0, 0, 0, true, fmt.Errorf("cache disk %s unavailable: %s", dir, probe.StatusReason)
+	}
+	usable, overWM := transfer.MandatoryWatermarkFree(probe.TotalBytes, probe.FreeBytes, a.cfg.MaxDiskUsagePct, a.cfg.MinFreeDiskBytes)
+	if overWM || (extraBytes > 0 && usable < extraBytes) {
+		alarm = true
+	}
+	return probe.TotalBytes, probe.FreeBytes, usable, probe.UsedPct, alarm, nil
+}
+
+// pickCacheDir selects a healthy, mounted, enabled cache disk below the mandatory disk watermark,
+// spreading concurrent writes across multiple selected disks and sending large files to the freest disk.
+func (a *Agent) pickCacheDir(extraBytes uint64) (root string, awaiting bool, alarm bool, err error) {
+	roots := a.activeCacheDirs()
+	if len(roots) == 0 {
+		return "", true, false, nil
+	}
+	type cand struct {
+		root   string
+		usable uint64
+	}
+	healthy := make([]cand, 0, len(roots))
+	var lastErr error
+	for _, r := range roots {
+		if a.isDiskDisabled(r) || a.diskHealth.IsBlocked(r) {
+			continue
+		}
+		_, _, usable, _, over, dErr := a.checkSingleDiskWatermark(r, extraBytes)
+		if dErr != nil {
+			lastErr = dErr
+			continue
+		}
+		if !over {
+			healthy = append(healthy, cand{root: r, usable: usable})
 		}
 	}
-	effUsedPct := usedPct
-	if total > 0 && extraBytes > 0 {
-		effUsedPct = (float64(total-effFree) / float64(total)) * 100.0
+	if len(healthy) == 0 {
+		if lastErr != nil {
+			a.triggerHeartbeat()
+			return "", false, true, lastErr
+		}
+		return "", false, true, nil
 	}
-	if a.cfg.MaxDiskUsagePct > 0 && effUsedPct >= a.cfg.MaxDiskUsagePct {
-		alarm = true
+	chosen := healthy[0].root
+	if len(healthy) > 1 {
+		if extraBytes >= 64<<20 {
+			// Large files go to the disk with the most usable headroom above watermark.
+			best := healthy[0]
+			for _, c := range healthy[1:] {
+				if c.usable > best.usable {
+					best = c
+				}
+			}
+			chosen = best.root
+		} else {
+			idx := (a.diskRRIdx.Add(1) - 1) % uint64(len(healthy))
+			chosen = healthy[idx].root
+		}
 	}
-	if a.cfg.MinFreeDiskBytes > 0 && effFree < a.cfg.MinFreeDiskBytes {
-		alarm = true
+	if err := a.diskHealth.SafeMkdirAll(chosen, filepath.Join(chosen, "uploading"), true); err != nil {
+		a.triggerHeartbeat()
+		return "", false, true, err
 	}
+	if err := a.diskHealth.SafeMkdirAll(chosen, filepath.Join(chosen, "ready"), true); err != nil {
+		a.triggerHeartbeat()
+		return "", false, true, err
+	}
+	return chosen, false, false, nil
+}
+
+func (a *Agent) diskWatermarkStatus(extraBytes uint64) (total, free uint64, usedPct float64, alarm bool, err error) {
+	roots := a.activeCacheDirs()
+	if len(roots) == 0 {
+		return 0, 0, 0, false, nil
+	}
+	seenDev := make(map[uint64]struct{}, len(roots))
+	healthyCount := 0
+	var lastErr error
+	for _, r := range roots {
+		enabled := !a.isDiskDisabled(r)
+		probe := a.diskHealth.ProbeRoot(r, enabled, a.cfg.MaxDiskUsagePct, a.cfg.MinFreeDiskBytes, 0)
+		if probe.Detached || !probe.Mounted {
+			lastErr = fmt.Errorf("cache disk %s: %s", r, probe.StatusReason)
+			continue
+		}
+		if enabled && !probe.UnplugLatched && probe.Writable {
+			usable, overWM := transfer.MandatoryWatermarkFree(probe.TotalBytes, probe.FreeBytes, a.cfg.MaxDiskUsagePct, a.cfg.MinFreeDiskBytes)
+			if !overWM && (extraBytes == 0 || usable >= extraBytes) {
+				healthyCount++
+			}
+		}
+		if probe.HasDev {
+			if _, dup := seenDev[probe.DevID]; dup {
+				continue
+			}
+			seenDev[probe.DevID] = struct{}{}
+		}
+		total += probe.TotalBytes
+		free += probe.FreeBytes
+	}
+	if total == 0 && lastErr != nil {
+		return 0, 0, 0, true, lastErr
+	}
+	if total > 0 {
+		usedPct = (float64(total-free) / float64(total)) * 100.0
+	}
+	alarm = healthyCount == 0
 	return total, free, usedPct, alarm, nil
+}
+
+func (a *Agent) collectActiveDiskStatuses() []protocol.DiskStatus {
+	roots := a.activeCacheDirs()
+	out := make([]protocol.DiskStatus, 0, len(roots))
+	for _, r := range roots {
+		enabled := !a.isDiskDisabled(r)
+		queued := 0
+		if !enabled {
+			queued = a.store.CountFilesInRoot(r, a.readyDir)
+		}
+		probe := a.diskHealth.ProbeRoot(r, enabled, a.cfg.MaxDiskUsagePct, a.cfg.MinFreeDiskBytes, queued)
+		out = append(out, protocol.DiskStatus{
+			Path:          r,
+			TotalBytes:    probe.TotalBytes,
+			FreeBytes:     probe.FreeBytes,
+			UsedPct:       probe.UsedPct,
+			Enabled:       enabled && !probe.UnplugLatched,
+			LowSpace:      probe.LowSpace,
+			Writable:      probe.Writable,
+			Detached:      probe.Detached,
+			UnplugLatched: probe.UnplugLatched,
+			LatchedGen:    probe.LatchedGen,
+			InFlight:      probe.InFlight,
+			SafeToEject:   probe.SafeToEject,
+			StatusReason:  probe.StatusReason,
+		})
+	}
+	return out
+}
+
+func (a *Agent) reportDiskWriteErr(root string, err error) {
+	if a.diskHealth.ReportIOError(root, err) {
+		a.logger.Error("dispatch cache disk I/O fault detected, auto-locking disk", "root", root, "err", err)
+		a.triggerHeartbeat()
+	}
 }
 
 func (a *Agent) triggerHeartbeat() {
@@ -406,20 +690,20 @@ func (a *Agent) publicRoutes() http.Handler {
 	return mux
 }
 
-func (a *Agent) enqueueDelete(fileIDs ...string) {
-	if len(fileIDs) == 0 {
+func (a *Agent) enqueueDeletePaths(paths ...string) {
+	if len(paths) == 0 {
 		return
 	}
 	if a.cfg.DeleteBatchIntervalSec <= 0 {
-		for _, id := range fileIDs {
-			if rmErr := os.Remove(a.readyFilePath(id)); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
-				a.logger.Warn("remove verified spool file failed", "file_id", id, "err", rmErr)
+		for _, p := range paths {
+			if rmErr := os.Remove(p); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+				a.logger.Warn("remove verified spool file failed", "path", p, "err", rmErr)
 			}
 		}
 		return
 	}
 	a.deleteMu.Lock()
-	a.deleteQueue = append(a.deleteQueue, fileIDs...)
+	a.deleteQueue = append(a.deleteQueue, paths...)
 	shouldWake := len(a.deleteQueue) >= a.cfg.DeleteBatchSize
 	a.deleteMu.Unlock()
 	if shouldWake {
@@ -442,10 +726,10 @@ func (a *Agent) flushDeleteQueue() {
 
 	var retry []string
 	removed := 0
-	for _, id := range batch {
-		if err := os.Remove(a.readyFilePath(id)); err != nil && !errors.Is(err, os.ErrNotExist) {
-			a.logger.Warn("batched spool unlink failed, will retry", "file_id", id, "err", err)
-			retry = append(retry, id)
+	for _, p := range batch {
+		if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
+			a.logger.Warn("batched spool unlink failed, will retry", "path", p, "err", err)
+			retry = append(retry, p)
 		} else {
 			removed++
 		}
@@ -517,14 +801,18 @@ func (a *Agent) ingestRawBody(w http.ResponseWriter, r *http.Request, projectID,
 	if r.ContentLength > 0 {
 		extraBytes = uint64(r.ContentLength)
 	}
-	_, _, _, alarm, err := a.diskWatermarkStatus(extraBytes)
-	if err != nil {
-		protocol.WriteError(w, http.StatusInternalServerError, "disk check failed: "+err.Error())
+	cacheRoot, awaiting, alarm, err := a.pickCacheDir(extraBytes)
+	if awaiting {
+		protocol.WriteError(w, http.StatusServiceUnavailable, "dispatch node awaiting data disk selection in console")
 		return
 	}
 	if alarm {
 		a.triggerHeartbeat()
 		protocol.WriteError(w, http.StatusInsufficientStorage, "disk watermark exceeded on agent-a")
+		return
+	}
+	if err != nil {
+		protocol.WriteError(w, http.StatusInternalServerError, "disk check failed: "+err.Error())
 		return
 	}
 	if !isValidProjectID(projectID) {
@@ -542,9 +830,12 @@ func (a *Agent) ingestRawBody(w http.ResponseWriter, r *http.Request, projectID,
 	}
 
 	fileID := uuid.NewString()
-	tmpPath := filepath.Join(a.uploadDir, fileID+".tmp")
+	a.diskHealth.BeginIO(cacheRoot)
+	defer a.diskHealth.EndIO(cacheRoot)
+	tmpPath := filepath.Join(cacheRoot, "uploading", fileID+".tmp")
 	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
+		a.reportDiskWriteErr(cacheRoot, err)
 		protocol.WriteError(w, http.StatusInternalServerError, "create temp file: "+err.Error())
 		return
 	}
@@ -552,6 +843,9 @@ func (a *Agent) ingestRawBody(w http.ResponseWriter, r *http.Request, projectID,
 	syncErr := f.Sync()
 	closeErr := f.Close()
 	if copyErr != nil || syncErr != nil || closeErr != nil {
+		a.reportDiskWriteErr(cacheRoot, copyErr)
+		a.reportDiskWriteErr(cacheRoot, syncErr)
+		a.reportDiskWriteErr(cacheRoot, closeErr)
 		_ = os.Remove(tmpPath)
 		protocol.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("upload write failed: %v %v %v", copyErr, syncErr, closeErr))
 		return
@@ -561,14 +855,14 @@ func (a *Agent) ingestRawBody(w http.ResponseWriter, r *http.Request, projectID,
 		protocol.WriteError(w, http.StatusBadRequest, fmt.Sprintf("sha256 mismatch: expected %s got %s", expectedSHA256, actualSHA))
 		return
 	}
-	if _, _, _, postAlarm, err := a.diskWatermarkStatus(0); err == nil && postAlarm {
+	if _, _, _, _, postAlarm, err := a.checkSingleDiskWatermark(cacheRoot, 0); err == nil && postAlarm {
 		_ = os.Remove(tmpPath)
 		a.triggerHeartbeat()
 		protocol.WriteError(w, http.StatusInsufficientStorage, "disk watermark exceeded after upload")
 		return
 	}
 
-	readyPath := a.readyFilePath(fileID)
+	readyPath := filepath.Join(cacheRoot, "ready", fileID+".dat")
 	if err := os.Rename(tmpPath, readyPath); err != nil {
 		_ = os.Remove(tmpPath)
 		protocol.WriteError(w, http.StatusInternalServerError, "commit file: "+err.Error())
@@ -579,6 +873,7 @@ func (a *Agent) ingestRawBody(w http.ResponseWriter, r *http.Request, projectID,
 		FileID:     fileID,
 		ProjectID:  projectID,
 		Filename:   cleanName,
+		DataPath:   readyPath,
 		Size:       written,
 		SHA256:     actualSHA,
 		Status:     protocol.FileStatusReady,
@@ -617,14 +912,18 @@ func (a *Agent) handleLocalUpload(w http.ResponseWriter, r *http.Request) {
 	if r.ContentLength > 0 {
 		extraBytes = uint64(r.ContentLength)
 	}
-	_, _, _, alarm, err := a.diskWatermarkStatus(extraBytes)
-	if err != nil {
-		protocol.WriteError(w, http.StatusInternalServerError, "disk check failed: "+err.Error())
+	cacheRoot, awaiting, alarm, err := a.pickCacheDir(extraBytes)
+	if awaiting {
+		protocol.WriteError(w, http.StatusServiceUnavailable, "dispatch node awaiting data disk selection in console")
 		return
 	}
 	if alarm {
 		a.triggerHeartbeat()
 		protocol.WriteError(w, http.StatusInsufficientStorage, "disk watermark exceeded on agent-a")
+		return
+	}
+	if err != nil {
+		protocol.WriteError(w, http.StatusInternalServerError, "disk check failed: "+err.Error())
 		return
 	}
 
@@ -635,7 +934,9 @@ func (a *Agent) handleLocalUpload(w http.ResponseWriter, r *http.Request) {
 	)
 
 	fileID := uuid.NewString()
-	tmpPath := filepath.Join(a.uploadDir, fileID+".tmp")
+	a.diskHealth.BeginIO(cacheRoot)
+	defer a.diskHealth.EndIO(cacheRoot)
+	tmpPath := filepath.Join(cacheRoot, "uploading", fileID+".tmp")
 	var (
 		written   int64
 		actualSHA string
@@ -696,6 +997,9 @@ func (a *Agent) handleLocalUpload(w http.ResponseWriter, r *http.Request) {
 				closeErr := f.Close()
 				_ = part.Close()
 				if copyErr != nil || syncErr != nil || closeErr != nil {
+					a.reportDiskWriteErr(cacheRoot, copyErr)
+					a.reportDiskWriteErr(cacheRoot, syncErr)
+					a.reportDiskWriteErr(cacheRoot, closeErr)
 					_ = os.Remove(tmpPath)
 					errMsg := fmt.Sprintf("upload write failed: %v %v %v", copyErr, syncErr, closeErr)
 					protocol.WriteError(w, http.StatusInternalServerError, errMsg)
@@ -746,6 +1050,9 @@ func (a *Agent) handleLocalUpload(w http.ResponseWriter, r *http.Request) {
 		syncErr := f.Sync()
 		closeErr := f.Close()
 		if copyErr != nil || syncErr != nil || closeErr != nil {
+			a.reportDiskWriteErr(cacheRoot, copyErr)
+			a.reportDiskWriteErr(cacheRoot, syncErr)
+			a.reportDiskWriteErr(cacheRoot, closeErr)
 			_ = os.Remove(tmpPath)
 			errMsg := fmt.Sprintf("upload write failed: %v %v %v", copyErr, syncErr, closeErr)
 			protocol.WriteError(w, http.StatusInternalServerError, errMsg)
@@ -768,14 +1075,14 @@ func (a *Agent) handleLocalUpload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Re-check disk watermark post-write (in case chunked upload had no Content-Length).
-	if _, _, _, postAlarm, err := a.diskWatermarkStatus(0); err == nil && postAlarm {
+	if _, _, _, _, postAlarm, err := a.checkSingleDiskWatermark(cacheRoot, 0); err == nil && postAlarm {
 		_ = os.Remove(tmpPath)
 		a.triggerHeartbeat()
 		protocol.WriteError(w, http.StatusInsufficientStorage, "disk watermark exceeded after upload")
 		return
 	}
 
-	readyPath := a.readyFilePath(fileID)
+	readyPath := filepath.Join(cacheRoot, "ready", fileID+".dat")
 	if err := os.Rename(tmpPath, readyPath); err != nil {
 		_ = os.Remove(tmpPath)
 		protocol.WriteError(w, http.StatusInternalServerError, "commit file: "+err.Error())
@@ -786,6 +1093,7 @@ func (a *Agent) handleLocalUpload(w http.ResponseWriter, r *http.Request) {
 		FileID:     fileID,
 		ProjectID:  projectID,
 		Filename:   cleanName,
+		DataPath:   readyPath,
 		Size:       written,
 		SHA256:     actualSHA,
 		Status:     protocol.FileStatusReady,
@@ -855,14 +1163,18 @@ func (a *Agent) handleLocalRegister(w http.ResponseWriter, r *http.Request) {
 		protocol.WriteError(w, http.StatusBadRequest, "local_path must exist and be a regular file (symlinks not allowed)")
 		return
 	}
-	_, _, _, alarm, err := a.diskWatermarkStatus(0)
-	if err != nil {
-		protocol.WriteError(w, http.StatusInternalServerError, "disk check failed: "+err.Error())
+	cacheRoot, awaiting, alarm, err := a.pickCacheDir(0)
+	if awaiting {
+		protocol.WriteError(w, http.StatusServiceUnavailable, "dispatch node awaiting data disk selection in console")
 		return
 	}
 	if alarm {
 		a.triggerHeartbeat()
 		protocol.WriteError(w, http.StatusInsufficientStorage, "disk watermark exceeded on agent-a")
+		return
+	}
+	if err != nil {
+		protocol.WriteError(w, http.StatusInternalServerError, "disk check failed: "+err.Error())
 		return
 	}
 
@@ -877,7 +1189,7 @@ func (a *Agent) handleLocalRegister(w http.ResponseWriter, r *http.Request) {
 	}
 
 	fileID := uuid.NewString()
-	readyPath := a.readyFilePath(fileID)
+	readyPath := filepath.Join(cacheRoot, "ready", fileID+".dat")
 	if mode == "hardlink" {
 		if err := os.Link(req.LocalPath, readyPath); err != nil {
 			protocol.WriteError(w, http.StatusInternalServerError, "hardlink failed: "+err.Error())
@@ -885,8 +1197,8 @@ func (a *Agent) handleLocalRegister(w http.ResponseWriter, r *http.Request) {
 		}
 	} else {
 		if err := os.Rename(req.LocalPath, readyPath); err != nil {
-			// Cross-device fallback requires extra space on DataDir: enforce disk watermark before copying.
-			if _, _, _, xAlarm, wErr := a.diskWatermarkStatus(uint64(size)); wErr == nil && xAlarm {
+			// Cross-device fallback requires extra space on cache disk: enforce disk watermark before copying.
+			if _, _, _, _, xAlarm, wErr := a.checkSingleDiskWatermark(cacheRoot, uint64(size)); wErr == nil && xAlarm {
 				a.triggerHeartbeat()
 				protocol.WriteError(w, http.StatusInsufficientStorage, "disk watermark exceeded on agent-a")
 				return
@@ -903,6 +1215,7 @@ func (a *Agent) handleLocalRegister(w http.ResponseWriter, r *http.Request) {
 		FileID:     fileID,
 		ProjectID:  req.ProjectID,
 		Filename:   cleanName,
+		DataPath:   readyPath,
 		Size:       size,
 		SHA256:     actualSHA,
 		Status:     protocol.FileStatusReady,
@@ -976,6 +1289,10 @@ func (a *Agent) handleLocalRegisterBatch(w http.ResponseWriter, r *http.Request)
 		protocol.WriteError(w, http.StatusBadRequest, "items must contain between 1 and 256 entries")
 		return
 	}
+	if a.awaitingDisk() {
+		protocol.WriteError(w, http.StatusServiceUnavailable, "dispatch node awaiting data disk selection in console")
+		return
+	}
 	_, _, _, alarm, err := a.diskWatermarkStatus(0)
 	if err != nil {
 		protocol.WriteError(w, http.StatusInternalServerError, "disk check failed: "+err.Error())
@@ -1037,8 +1354,14 @@ func (a *Agent) handleLocalRegisterBatch(w http.ResponseWriter, r *http.Request)
 			continue
 		}
 
+		cacheRoot, _, cAlarm, cErr := a.pickCacheDir(0)
+		if cErr != nil || cAlarm {
+			a.triggerHeartbeat()
+			results[i].Error = "disk watermark exceeded on agent-a"
+			continue
+		}
 		fileID := uuid.NewString()
-		readyPath := a.readyFilePath(fileID)
+		readyPath := filepath.Join(cacheRoot, "ready", fileID+".dat")
 		if mode == "hardlink" {
 			if err := os.Link(it.LocalPath, readyPath); err != nil {
 				results[i].Error = "hardlink failed: " + err.Error()
@@ -1046,7 +1369,7 @@ func (a *Agent) handleLocalRegisterBatch(w http.ResponseWriter, r *http.Request)
 			}
 		} else {
 			if err := os.Rename(it.LocalPath, readyPath); err != nil {
-				if _, _, _, xAlarm, wErr := a.diskWatermarkStatus(uint64(size)); wErr == nil && xAlarm {
+				if _, _, _, _, xAlarm, wErr := a.checkSingleDiskWatermark(cacheRoot, uint64(size)); wErr == nil && xAlarm {
 					a.triggerHeartbeat()
 					results[i].Error = "disk watermark exceeded on agent-a"
 					continue
@@ -1063,6 +1386,7 @@ func (a *Agent) handleLocalRegisterBatch(w http.ResponseWriter, r *http.Request)
 			FileID:     fileID,
 			ProjectID:  it.ProjectID,
 			Filename:   cleanName,
+			DataPath:   readyPath,
 			Size:       size,
 			SHA256:     actualSHA,
 			Status:     protocol.FileStatusReady,
@@ -1318,8 +1642,21 @@ func (a *Agent) handleStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	f, err := os.Open(a.readyFilePath(fileID))
+	filePath := a.readyPathForRecord(*rec)
+	diskRoot := transfer.MatchRootForPath(filePath, a.activeCacheDirs())
+	a.diskHealth.BeginIO(diskRoot)
+	defer a.diskHealth.EndIO(diskRoot)
+
+	f, err := os.Open(filePath)
 	if err != nil {
+		a.reportDiskWriteErr(diskRoot, err)
+		probe := a.diskHealth.ProbeRoot(diskRoot, !a.isDiskDisabled(diskRoot), a.cfg.MaxDiskUsagePct, a.cfg.MinFreeDiskBytes, 0)
+		if probe.Detached || !probe.Mounted || transfer.IsDiskIOError(err) {
+			a.triggerHeartbeat()
+			w.Header().Set("Retry-After", "5")
+			protocol.WriteError(w, http.StatusServiceUnavailable, "backing cache disk detached/unavailable")
+			return
+		}
 		protocol.WriteError(w, http.StatusNotFound, "backing file missing")
 		return
 	}
@@ -1429,6 +1766,7 @@ func (a *Agent) handleStream(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if rErr != nil {
+			a.reportDiskWriteErr(diskRoot, rErr)
 			return
 		}
 	}
@@ -1483,7 +1821,7 @@ func (a *Agent) handleAck(w http.ResponseWriter, r *http.Request) {
 	var removeFn func(id string) error
 	if a.cfg.DeleteBatchIntervalSec <= 0 {
 		removeFn = func(id string) error {
-			if rmErr := os.Remove(a.readyFilePath(id)); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+			if rmErr := os.Remove(a.filePathForID(id)); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
 				return rmErr
 			}
 			return nil
@@ -1520,7 +1858,7 @@ func (a *Agent) handleAck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if a.cfg.DeleteBatchIntervalSec > 0 {
-		a.enqueueDelete(fileID)
+		a.enqueueDeletePaths(a.readyPathForRecord(*rec))
 	}
 
 	a.triggerEventFlush()
@@ -1548,7 +1886,7 @@ func (a *Agent) handleBatchAck(w http.ResponseWriter, r *http.Request) {
 	var removeFn func(id string) error
 	if a.cfg.DeleteBatchIntervalSec <= 0 {
 		removeFn = func(id string) error {
-			if rmErr := os.Remove(a.readyFilePath(id)); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+			if rmErr := os.Remove(a.filePathForID(id)); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
 				return rmErr
 			}
 			return nil
@@ -1574,11 +1912,11 @@ func (a *Agent) handleBatchAck(w http.ResponseWriter, r *http.Request) {
 
 	if len(deletedRecs) > 0 {
 		if a.cfg.DeleteBatchIntervalSec > 0 {
-			ids := make([]string, len(deletedRecs))
+			paths := make([]string, len(deletedRecs))
 			for i, rec := range deletedRecs {
-				ids[i] = rec.FileID
+				paths[i] = a.readyPathForRecord(rec)
 			}
-			a.enqueueDelete(ids...)
+			a.enqueueDeletePaths(paths...)
 		}
 		a.triggerEventFlush()
 		a.triggerHeartbeat()
@@ -1722,10 +2060,14 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 		UpgradeAttemptID: upgAttempt,
 		UpgradeStatus:    upgStatus,
 		UpgradeError:     upgErr,
-		DiskTotalBytes:   total,
-		DiskFreeBytes:    free,
+		DiskTotalBytes:       total,
+		DiskFreeBytes:        free,
 		DiskUsedPct:          pct,
 		DiskAlarm:            alarm,
+		StorageDirs:          a.activeCacheDirs(),
+		Disks:                a.collectActiveDiskStatuses(),
+		HostDisks:            transfer.DiscoverHostDisks("relay-cache"),
+		AwaitingDisk:         a.awaitingDisk(),
 		Paused:               a.paused.Load(),
 		ActiveStreams:        int(a.activeStreams.Load()),
 		MaxConcurrentStreams: a.cfg.MaxConcurrentStreams,
@@ -1755,6 +2097,9 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 256*1024)).Decode(&hbResp); err == nil {
 		if prev := a.paused.Swap(hbResp.Paused); prev != hbResp.Paused {
 			a.logger.Info("dispatch node pause state updated from center", "paused", hbResp.Paused)
+		}
+		if len(hbResp.StorageDirs) > 0 || hbResp.DiskGen > 0 || len(hbResp.DisabledDisks) > 0 {
+			a.applyDiskConfig(hbResp.StorageDirs, hbResp.DisabledDisks, hbResp.DiskGen)
 		}
 		if hbResp.ActiveReceivers != nil || hbResp.ProjectAffinity != nil {
 			a.store.SetRoutingState(hbResp.ActiveReceivers, hbResp.ProjectAffinity)
