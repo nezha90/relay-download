@@ -86,7 +86,15 @@ func (s *Server) releaseFilePath(filename string) string {
 }
 
 func (s *Server) handleAdminListReleases(w http.ResponseWriter, r *http.Request) {
+	principal := principalFromRequest(r)
 	role := strings.TrimSpace(r.URL.Query().Get("role"))
+	if !principal.IsAdmin() {
+		if role != "" && role != protocol.RoleAgentB {
+			protocol.WriteError(w, http.StatusForbidden, "customer accounts can only list receiver releases")
+			return
+		}
+		role = protocol.RoleAgentB
+	}
 	list, err := s.store.ListReleases(r.Context(), role)
 	if err != nil {
 		protocol.WriteError(w, http.StatusInternalServerError, err.Error())
@@ -298,6 +306,7 @@ func (s *Server) handleNodeDownloadRelease(w http.ResponseWriter, r *http.Reques
 }
 
 func (s *Server) handleAdminBatchUpgrade(w http.ResponseWriter, r *http.Request) {
+	principal := principalFromRequest(r)
 	var req protocol.BatchUpgradeReq
 	if err := protocol.DecodeJSON(r.Body, &req); err != nil {
 		protocol.WriteError(w, http.StatusBadRequest, "invalid json")
@@ -315,6 +324,23 @@ func (s *Server) handleAdminBatchUpgrade(w http.ResponseWriter, r *http.Request)
 		}
 		protocol.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	if !principal.IsAdmin() {
+		if rel.Role != protocol.RoleAgentB {
+			protocol.WriteError(w, http.StatusForbidden, "customer accounts can only upgrade receiver nodes")
+			return
+		}
+		for _, rawID := range req.NodeIDs {
+			nid := strings.TrimSpace(rawID)
+			if nid == "" {
+				continue
+			}
+			node, nErr := s.store.GetNode(r.Context(), nid)
+			if nErr == nil && !principal.CanAccessNode(*node) {
+				protocol.WriteError(w, http.StatusForbidden, "account not authorized to upgrade node "+nid)
+				return
+			}
+		}
 	}
 
 	aSnap, bSnap := s.hub.Snapshot()
@@ -381,7 +407,16 @@ func (s *Server) handleAdminBatchUpgrade(w http.ResponseWriter, r *http.Request)
 }
 
 func (s *Server) handleAdminCancelUpgrade(w http.ResponseWriter, r *http.Request) {
-	_ = s.store.DeleteNodeUpgrade(r.Context(), r.PathValue("id"))
+	principal := principalFromRequest(r)
+	nodeID := strings.TrimSpace(r.PathValue("id"))
+	if !principal.IsAdmin() {
+		node, err := s.store.GetNode(r.Context(), nodeID)
+		if err != nil || !principal.CanAccessNode(*node) {
+			protocol.WriteError(w, http.StatusForbidden, "account not authorized to cancel upgrade for this node")
+			return
+		}
+	}
+	_ = s.store.DeleteNodeUpgrade(r.Context(), nodeID)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -654,6 +689,7 @@ func (s *Server) handleAdminGetDeployTask(w http.ResponseWriter, r *http.Request
 }
 
 func (s *Server) handleAdminAgentBInstallScript(w http.ResponseWriter, r *http.Request) {
+	principal := principalFromRequest(r)
 	var req protocol.AgentBScriptReq
 	if err := protocol.DecodeJSON(r.Body, &req); err != nil {
 		protocol.WriteError(w, http.StatusBadRequest, "invalid json")
@@ -677,9 +713,31 @@ func (s *Server) handleAdminAgentBInstallScript(w http.ResponseWriter, r *http.R
 		protocol.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	if !principal.CanAccessNode(*node) {
+		protocol.WriteError(w, http.StatusForbidden, "account not authorized to generate script for this node")
+		return
+	}
 	if node.Role != protocol.RoleAgentB {
 		protocol.WriteError(w, http.StatusBadRequest, "node is not an agent_b node")
 		return
+	}
+	if !principal.IsAdmin() && len(principal.Projects) > 0 {
+		if op := strings.TrimSpace(req.OnlyProject); op != "" && !principal.AllowsProject(op) {
+			protocol.WriteError(w, http.StatusForbidden, "only_project not authorized for this account")
+			return
+		}
+		for pid := range req.Projects {
+			if !principal.AllowsProject(strings.TrimSpace(pid)) {
+				protocol.WriteError(w, http.StatusForbidden, "project not authorized for this account: "+pid)
+				return
+			}
+		}
+		for pid := range req.ProjectDirs {
+			if !principal.AllowsProject(strings.TrimSpace(pid)) {
+				protocol.WriteError(w, http.StatusForbidden, "project not authorized for this account: "+pid)
+				return
+			}
+		}
 	}
 
 	var rel *protocol.ReleaseRecord

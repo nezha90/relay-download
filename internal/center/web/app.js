@@ -41,9 +41,16 @@ function saveStoredToken(tok) {
 
 let adminToken = loadStoredToken();
 let authTrustedIP = false;
+let authRole = 'admin';
+let authAccountID = '';
+let authAccountName = '';
+let authProjects = [];
 let cachedReleases = [];
 let cachedProjects = [];
 let cachedNodes = [];
+let cachedAccounts = [];
+let lastAccountToken = '';
+let lastAccountLoginURL = '';
 let lastPrecheck = null;
 let activeDeployTaskId = '';
 let activeLogModalTaskId = '';
@@ -134,11 +141,57 @@ async function api(path, opts = {}) {
   return data;
 }
 
+function isCustomer() {
+  return authRole === 'customer';
+}
+
+function isScopedCustomer() {
+  return isCustomer() && Array.isArray(authProjects) && authProjects.length > 0;
+}
+
 function updateAuthControls() {
   const trustedBadge = document.getElementById('trusted-badge');
+  const roleBadge = document.getElementById('role-badge');
   const logoutBtn = document.getElementById('logout-btn');
-  if (trustedBadge) trustedBadge.classList.toggle('hidden', !authTrustedIP);
+  if (trustedBadge) trustedBadge.classList.toggle('hidden', !authTrustedIP || isCustomer());
+  if (roleBadge) {
+    if (isCustomer()) {
+      const label = authAccountName || authAccountID || '客户账号';
+      roleBadge.textContent = `客户 · ${label}`;
+      roleBadge.title = isScopedCustomer()
+        ? `客户受限账号（仅限接收节点 · 授权项目: ${authProjects.join(', ')}）`
+        : '客户受限账号（仅限运维接收节点，不可访问分发节点）';
+      roleBadge.classList.remove('hidden');
+    } else {
+      roleBadge.classList.add('hidden');
+    }
+  }
   if (logoutBtn) logoutBtn.classList.toggle('hidden', !adminToken);
+}
+
+function applyRoleUI() {
+  const cust = isCustomer();
+  document.querySelectorAll('[data-admin-only="1"]').forEach(el => {
+    el.classList.toggle('hidden', cust);
+  });
+  const projDesc = document.getElementById('projects-section-desc');
+  if (projDesc) {
+    projDesc.textContent = cust
+      ? '只读查看已授权项目的阶段传输速率、完成总量与待传输积压'
+      : '业务方 PUT 上传新项目时将自动发现并建档；也可手动提前创建并自定义同名冲突策略';
+  }
+  if (cust) {
+    const activeTab = document.querySelector('.tab.active');
+    if (activeTab && activeTab.dataset.adminOnly === '1') {
+      document.querySelectorAll('.tab').forEach(b => b.classList.remove('active'));
+      document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+      const dashTab = document.querySelector('.tab[data-tab="dashboard"]');
+      if (dashTab) dashTab.classList.add('active');
+      const dashPanel = document.getElementById('tab-dashboard');
+      if (dashPanel) dashPanel.classList.add('active');
+    }
+  }
+  updateAuthControls();
 }
 
 function showLogin(msg = '') {
@@ -207,16 +260,24 @@ async function refreshAll() {
     });
     if (selectedProjectFilter) ovQS.set('project', selectedProjectFilter);
 
-    const [overview, nodes, releases, tasks] = await Promise.all([
-      api(`/api/v1/admin/overview?${ovQS.toString()}`),
-      api(`/api/v1/admin/nodes?hours=${encodeURIComponent(hours)}`),
-      api('/api/v1/admin/releases'),
-      api('/api/v1/admin/deploy/tasks'),
-    ]);
+    const overview = await api(`/api/v1/admin/overview?${ovQS.toString()}`);
 
     authTrustedIP = !!overview.auth_trusted_ip;
+    authRole = overview.auth_role || 'admin';
+    authAccountID = overview.auth_account_id || '';
+    authAccountName = overview.auth_account_name || '';
+    authProjects = Array.isArray(overview.auth_projects) ? overview.auth_projects : [];
     hideLogin();
-    updateAuthControls();
+    applyRoleUI();
+
+    const adminFetches = isCustomer()
+      ? [Promise.resolve([]), Promise.resolve([])]
+      : [api('/api/v1/admin/deploy/tasks'), api('/api/v1/admin/accounts')];
+    const [nodes, releases, tasks, accounts] = await Promise.all([
+      api(`/api/v1/admin/nodes?hours=${encodeURIComponent(hours)}`),
+      api('/api/v1/admin/releases'),
+      ...adminFetches,
+    ]);
 
     const snapEl = document.getElementById('snapshot-time');
     if (snapEl && overview.generated_at) {
@@ -226,12 +287,16 @@ async function refreshAll() {
     cachedProjects = overview.projects || [];
     cachedNodes = nodes || [];
     cachedReleases = releases || [];
+    cachedAccounts = accounts || [];
     syncProjectFilterOptions(cachedProjects);
     renderDashboard(overview);
     renderProjects(cachedProjects, overview.window_hours || hours);
     renderNodes(cachedNodes, overview.window_hours || hours);
     renderReleases(cachedReleases);
-    renderDeployTasks(tasks || []);
+    if (!isCustomer()) {
+      renderDeployTasks(tasks || []);
+      renderAccounts(cachedAccounts);
+    }
   } catch (e) {
     if (e.message !== 'unauthorized') console.error(e);
   } finally {
@@ -310,11 +375,17 @@ function renderDashboard(ov) {
       value: `${fmtNum(ov.all_time_completed)} 文件`,
       sub: `累计 ${fmtBytes(ov.all_time_bytes)} · 失败 ${fmtNum(ov.all_time_failed)}`,
     },
-    {
-      label: '在线节点 (分发 / 接收)',
-      value: `${ov.online_a_nodes}/${ov.total_a_nodes} · ${ov.online_b_nodes}/${ov.total_b_nodes}`,
-      sub: `项目 ${ov.total_projects} · 待传输积压 ${fmtNum(ov.queued_files)} (${fmtBytes(ov.queued_bytes)})`,
-    },
+    isCustomer()
+      ? {
+          label: '在线接收节点',
+          value: `${ov.online_b_nodes}/${ov.total_b_nodes}`,
+          sub: `授权项目 ${ov.total_projects} · 待传输积压 ${fmtNum(ov.queued_files)} (${fmtBytes(ov.queued_bytes)})`,
+        }
+      : {
+          label: '在线节点 (分发 / 接收)',
+          value: `${ov.online_a_nodes}/${ov.total_a_nodes} · ${ov.online_b_nodes}/${ov.total_b_nodes}`,
+          sub: `项目 ${ov.total_projects} · 待传输积压 ${fmtNum(ov.queued_files)} (${fmtBytes(ov.queued_bytes)})`,
+        },
   ];
   document.getElementById('kpi-grid').innerHTML = kpis.map(k => `
     <div class="kpi-card${k.highlight ? ' highlight' : ''}">
@@ -684,8 +755,11 @@ function renderTrendChart(days) {
 function renderProjects(projects, winHours) {
   const el = document.getElementById('projects-grid');
   const winLbl = windowLabel(winHours);
+  const cust = isCustomer();
   if (!projects.length) {
-    el.innerHTML = '<div class="empty">还没有项目，点击右上角「新建项目」开始。</div>';
+    el.innerHTML = cust
+      ? '<div class="empty">当前账号暂无已授权的项目</div>'
+      : '<div class="empty">还没有项目，点击右上角「新建项目」开始。</div>';
     return;
   }
   el.innerHTML = projects.map(ps => {
@@ -706,6 +780,21 @@ function renderProjects(projects, winHours) {
     if (p.max_total_concurrent > 0) quotaParts.push(`总并发 ≤ ${p.max_total_concurrent}`);
     if (p.max_total_rate_mbps > 0) quotaParts.push(`总限速 ${p.max_total_rate_mbps} MB/s`);
     const quotaBadge = quotaParts.length ? `<span class="badge alarm">${esc(quotaParts.join(' · '))}</span>` : '';
+    const actionsHtml = cust ? '' : `
+          <div style="display:flex;gap:6px">
+            <button class="btn sm" data-action="edit-project" data-id="${esc(p.id)}">编辑策略</button>
+            <button class="btn sm danger" data-action="delete-project" data-id="${esc(p.id)}">删除</button>
+          </div>
+    `;
+    const nodeSummaryHtml = cust
+      ? `<div class="v">在线接收节点 ${ps.online_b_nodes}</div>`
+      : `<div class="v">分发节点 ${ps.online_a_nodes} · 接收节点 ${ps.online_b_nodes}</div>`;
+    const availSectionHtml = cust ? '' : `
+        <div>
+          <div class="muted" style="margin-bottom:4px">各分发节点待传输积压汇总：</div>
+          ${avail}
+        </div>
+    `;
     return `
       <div class="card">
         <div class="card-head">
@@ -713,10 +802,7 @@ function renderProjects(projects, winHours) {
             <h3>${esc(p.name)} <span class="mono muted">(${esc(p.id)})</span> ${autoBadge} ${affBadge} ${quotaBadge}</h3>
             <div class="muted">${esc(p.description || '无描述')} · 策略: ${esc(p.conflict_policy)} · 租约: ${p.lease_ttl_sec}s</div>
           </div>
-          <div style="display:flex;gap:6px">
-            <button class="btn sm" data-action="edit-project" data-id="${esc(p.id)}">编辑策略</button>
-            <button class="btn sm danger" data-action="delete-project" data-id="${esc(p.id)}">删除</button>
-          </div>
+          ${actionsHtml}
         </div>
         <div class="proj-stats-grid">
           <div class="proj-stat-box">
@@ -736,14 +822,11 @@ function renderProjects(projects, winHours) {
           </div>
           <div class="proj-stat-box">
             <div class="k">在线节点</div>
-            <div class="v">分发节点 ${ps.online_a_nodes} · 接收节点 ${ps.online_b_nodes}</div>
+            ${nodeSummaryHtml}
             <div class="muted">待传输 ${esc(fmtNum(ps.queued_files))} (${esc(fmtBytes(ps.queued_bytes))})</div>
           </div>
         </div>
-        <div>
-          <div class="muted" style="margin-bottom:4px">各分发节点待传输积压汇总：</div>
-          ${avail}
-        </div>
+        ${availSectionHtml}
       </div>
     `;
   }).join('');
@@ -1028,6 +1111,123 @@ function renderDeployTasks(tasks) {
       </div>
     `;
   }).join('');
+}
+
+function renderAccounts(list) {
+  const tbody = document.getElementById('accounts-tbody');
+  if (!tbody) return;
+  tbody.innerHTML = list.length ? list.map(a => {
+    const scopeHtml = (!a.projects || !a.projects.length)
+      ? '<span class="badge online">全部项目</span> <span class="muted">仅限接收节点</span>'
+      : `<span class="badge accent">指定项目 (${a.projects.length})</span><div class="mono muted" style="margin-top:3px">${esc(a.projects.join(', '))}</div>`;
+    const lastUsed = a.last_used_at ? fmtTimeShort(a.last_used_at, true) : '未使用';
+    const created = a.created_at ? fmtTimeShort(a.created_at, true) : '-';
+    return `
+      <tr>
+        <td><strong>${esc(a.name)}</strong><div class="mono muted">${esc(a.id)}</div></td>
+        <td><span class="badge ${a.enabled ? 'online' : 'offline'}">${a.enabled ? '启用' : '已停用'}</span></td>
+        <td>${scopeHtml}</td>
+        <td class="muted">${esc(lastUsed)}</td>
+        <td class="muted">${esc(created)}</td>
+        <td>
+          <div class="btn-row">
+            <button class="btn sm" data-action="edit-account" data-id="${esc(a.id)}">编辑</button>
+            <button class="btn sm primary" data-action="rotate-account" data-id="${esc(a.id)}">重置密钥</button>
+            <button class="btn sm danger" data-action="delete-account" data-id="${esc(a.id)}">删除</button>
+          </div>
+        </td>
+      </tr>
+    `;
+  }).join('') : '<tr><td colspan="6" class="empty">暂无客户账号，点击右上角「+ 新建客户账号」创建</td></tr>';
+}
+
+function syncAccountScopeUI() {
+  const form = document.getElementById('account-form');
+  if (!form) return;
+  const scope = form.elements.account_scope.value || 'all';
+  document.getElementById('account-projects-wrap').classList.toggle('hidden', scope !== 'selected');
+}
+
+function renderAccountProjectChecks(selectedList) {
+  const wrap = document.getElementById('account-project-checks');
+  if (!wrap) return;
+  const selSet = new Set(selectedList || []);
+  if (!cachedProjects.length) {
+    wrap.innerHTML = '<div class="muted">暂无已有项目，可在下方手动输入项目 ID</div>';
+    return;
+  }
+  wrap.innerHTML = cachedProjects.map(ps => {
+    const p = ps.project;
+    const chk = selSet.has(p.id) ? 'checked' : '';
+    return `
+      <label class="proj-check-item">
+        <input type="checkbox" class="account-proj-chk" value="${esc(p.id)}" ${chk} />
+        <span class="mono">${esc(p.id)}</span>
+      </label>
+    `;
+  }).join('');
+}
+
+function openAccountModal(accountId = '') {
+  const form = document.getElementById('account-form');
+  form.reset();
+  const existing = accountId ? cachedAccounts.find(a => a.id === accountId) : null;
+  form.elements.mode.value = existing ? 'edit' : 'create';
+  form.elements.id.readOnly = !!existing;
+  document.getElementById('account-modal-title').textContent = existing ? `编辑客户账号: ${existing.name || existing.id}` : '新建客户账号';
+  document.getElementById('account-enabled-wrap').classList.toggle('hidden', !existing);
+  if (existing) {
+    form.elements.id.value = existing.id;
+    form.elements.name.value = existing.name || existing.id;
+    form.elements.enabled.checked = existing.enabled !== false;
+    const projs = existing.projects || [];
+    form.elements.account_scope.value = projs.length ? 'selected' : 'all';
+    form.elements.projects.value = projs.join(',');
+    renderAccountProjectChecks(projs);
+  } else {
+    form.elements.account_scope.value = 'all';
+    form.elements.projects.value = '';
+    form.elements.enabled.checked = true;
+    renderAccountProjectChecks([]);
+  }
+  syncAccountScopeUI();
+  openModal('account-modal');
+}
+
+function showAccountTokenModal(account, rawToken, titleText) {
+  lastAccountToken = rawToken || '';
+  lastAccountLoginURL = `${window.location.origin}/#token=${encodeURIComponent(lastAccountToken)}`;
+  document.getElementById('account-token-title').textContent = titleText || `客户账号密钥: ${account.name || account.id}`;
+  document.getElementById('account-token-value').textContent = lastAccountToken;
+  document.getElementById('account-login-url').textContent = lastAccountLoginURL;
+  openModal('account-token-modal');
+}
+
+async function rotateAccountToken(id) {
+  const acc = cachedAccounts.find(a => a.id === id);
+  const lbl = acc ? `${acc.name} (${acc.id})` : id;
+  if (!confirm(`确认重置客户账号 ${lbl} 的密钥吗？\n旧 Token 将立即失效，需将新链接发给客户。`)) return;
+  try {
+    const res = await api(`/api/v1/admin/accounts/${encodeURIComponent(id)}/rotate`, { method: 'POST' });
+    showAccountTokenModal(res.account, res.token, `已重置客户密钥: ${res.account.name}`);
+    showToast(`客户账号 ${id} 密钥已重置`, 'success');
+    refreshAll();
+  } catch (e) {
+    if (e.message !== 'unauthorized') showToast(`重置密钥失败: ${e.message}`, 'error');
+  }
+}
+
+async function deleteAccount(id) {
+  const acc = cachedAccounts.find(a => a.id === id);
+  const lbl = acc ? `${acc.name} (${acc.id})` : id;
+  if (!confirm(`确认删除并永久吊销客户账号 ${lbl} 吗？`)) return;
+  try {
+    await api(`/api/v1/admin/accounts/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    showToast(`已吊销客户账号 ${id}`, 'success');
+    refreshAll();
+  } catch (e) {
+    if (e.message !== 'unauthorized') showToast(`删除客户账号失败: ${e.message}`, 'error');
+  }
 }
 
 async function deleteNode(id) {
@@ -1331,11 +1531,14 @@ function openEditNodeProjectsModal(nodeId) {
 
   const projs = node.projects || [];
   const defaultSingle = projs.length === 1 ? projs[0] : (cachedProjects[0]?.project?.id || '');
-  populateProjectSelect(document.getElementById('edit-single-project-select'), defaultSingle, true);
+  const scopedCust = isScopedCustomer();
+  const editAllOpt = document.getElementById('edit-node-mode-all-opt');
+  if (editAllOpt) editAllOpt.classList.toggle('hidden', scopedCust);
+  populateProjectSelect(document.getElementById('edit-single-project-select'), defaultSingle, !scopedCust);
 
   if (projs.length === 1) {
     form.elements.edit_project_mode.value = 'single';
-  } else if (projs.length > 1) {
+  } else if (projs.length > 1 || scopedCust) {
     form.elements.edit_project_mode.value = 'multi';
   } else {
     form.elements.edit_project_mode.value = 'all';
@@ -1418,6 +1621,9 @@ function setupEvents() {
       case 'view-deploy-task': viewDeployTaskLog(id); break;
       case 'open-b-script': openBScriptModal(id); break;
       case 'edit-node-projects': openEditNodeProjectsModal(id); break;
+      case 'edit-account': openAccountModal(id); break;
+      case 'rotate-account': rotateAccountToken(id); break;
+      case 'delete-account': deleteAccount(id); break;
     }
   });
 
@@ -1474,11 +1680,13 @@ function setupEvents() {
 
   document.getElementById('logout-btn').addEventListener('click', () => {
     saveStoredToken('');
+    authRole = 'admin';
+    authAccountID = '';
+    authAccountName = '';
+    authProjects = [];
     document.getElementById('login-token').value = '';
-    updateAuthControls();
-    if (!authTrustedIP) {
-      showLogin();
-    }
+    applyRoleUI();
+    refreshAll();
   });
 
   document.getElementById('refresh-now').addEventListener('click', refreshAll);
@@ -1573,7 +1781,10 @@ function setupEvents() {
     document.getElementById('node-modal-title').textContent = role === 'agent_a' ? '手动注册公网分发节点' : '注册内网接收节点';
     document.getElementById('node-public-addr-wrap').classList.toggle('hidden', role !== 'agent_a');
     document.getElementById('node-token-result').classList.add('hidden');
-    populateProjectSelect(document.getElementById('node-single-project-select'), cachedProjects[0]?.project?.id || '', true);
+    const scopedCust = isScopedCustomer();
+    const createAllOpt = document.getElementById('create-node-mode-all-opt');
+    if (createAllOpt) createAllOpt.classList.toggle('hidden', scopedCust);
+    populateProjectSelect(document.getElementById('node-single-project-select'), cachedProjects[0]?.project?.id || '', !scopedCust);
     form.elements.project_mode.value = 'single';
     syncCreateNodeProjectMode();
     openModal('node-modal');
@@ -1891,6 +2102,97 @@ function setupEvents() {
       showToast('剪贴板复制失败，请手动选中下方脚本复制', 'error');
     }
   });
+
+  // Customer Account management (Admin only)
+  const openAccBtn = document.getElementById('open-create-account');
+  if (openAccBtn) {
+    openAccBtn.addEventListener('click', () => openAccountModal(''));
+  }
+  document.querySelectorAll('input[name="account_scope"]').forEach(el => {
+    el.addEventListener('change', syncAccountScopeUI);
+  });
+  const accChecks = document.getElementById('account-project-checks');
+  if (accChecks) {
+    accChecks.addEventListener('change', (e) => {
+      const chk = e.target.closest('input.account-proj-chk');
+      if (!chk) return;
+      const form = document.getElementById('account-form');
+      const cur = String(form.elements.projects.value || '').split(',').map(s => s.trim()).filter(Boolean);
+      const val = chk.value;
+      const next = cur.filter(x => x !== val);
+      if (chk.checked) next.push(val);
+      form.elements.projects.value = next.join(',');
+    });
+  }
+  const accForm = document.getElementById('account-form');
+  if (accForm) {
+    accForm.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const fd = new FormData(e.target);
+      const mode = String(fd.get('mode') || 'create');
+      const id = String(fd.get('id') || '').trim();
+      const name = String(fd.get('name') || '').trim();
+      const scope = String(fd.get('account_scope') || 'all');
+      let projs = [];
+      if (scope === 'selected') {
+        projs = String(fd.get('projects') || '').split(',').map(s => s.trim()).filter(Boolean);
+        if (!projs.length) {
+          showToast('请至少选择一个授权项目，或切换为「全部项目」', 'error');
+          return;
+        }
+      }
+      try {
+        if (mode === 'edit') {
+          await api(`/api/v1/admin/accounts/${encodeURIComponent(id)}`, {
+            method: 'PUT',
+            body: JSON.stringify({
+              name,
+              projects: projs,
+              enabled: fd.get('enabled') === 'on',
+            }),
+          });
+          closeModal('account-modal');
+          showToast(`客户账号 ${name || id} 已更新`, 'success');
+          refreshAll();
+        } else {
+          const res = await api('/api/v1/admin/accounts', {
+            method: 'POST',
+            body: JSON.stringify({ id, name, projects: projs }),
+          });
+          closeModal('account-modal');
+          showAccountTokenModal(res.account, res.token, `客户账号已创建: ${res.account.name}`);
+          showToast(`客户账号 ${res.account.id} 创建成功`, 'success');
+          refreshAll();
+        }
+      } catch (err) {
+        if (err.message !== 'unauthorized') showToast(`保存客户账号失败: ${err.message}`, 'error');
+      }
+    });
+  }
+  const copyUrlBtn = document.getElementById('btn-copy-account-url');
+  if (copyUrlBtn) {
+    copyUrlBtn.addEventListener('click', async () => {
+      if (!lastAccountLoginURL) return;
+      try {
+        await navigator.clipboard.writeText(lastAccountLoginURL);
+        showToast('免输直达登录链接已复制到剪贴板', 'success');
+      } catch {
+        showToast('剪贴板复制失败，请手动复制', 'error');
+      }
+    });
+  }
+  const copyTokBtn = document.getElementById('btn-copy-account-token');
+  if (copyTokBtn) {
+    copyTokBtn.addEventListener('click', async () => {
+      if (!lastAccountToken) return;
+      try {
+        await navigator.clipboard.writeText(lastAccountToken);
+        showToast('客户 Token 已复制到剪贴板', 'success');
+      } catch {
+        showToast('剪贴板复制失败，请手动复制', 'error');
+      }
+    });
+  }
 }
 
 setupEvents();

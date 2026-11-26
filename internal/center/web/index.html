@@ -11,9 +11,9 @@
   <div id="login-overlay" class="overlay hidden">
     <div class="modal-card">
       <h2>Relay Center 登录</h2>
-      <p class="muted">请输入中心服务器配置的 Admin Token（校验通过后将自动缓存至本地浏览器，后续免输）</p>
+      <p class="muted">请输入管理员或客户访问令牌（校验通过后自动缓存至本地浏览器，后续免输）</p>
       <form id="login-form" class="form-stack">
-        <input id="login-token" type="password" placeholder="Admin Token" autocomplete="current-password" />
+        <input id="login-token" type="password" placeholder="管理员 Token 或客户 Token" autocomplete="current-password" />
         <div id="login-err" class="err-msg"></div>
         <button id="login-btn" type="submit" class="btn primary full">连接控制台</button>
       </form>
@@ -37,7 +37,7 @@
         <svg class="ico ico-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
         <span>项目视图</span>
       </button>
-      <button class="tab" data-tab="nodes-a">
+      <button class="tab" data-tab="nodes-a" data-admin-only="1">
         <svg class="ico ico-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v10"/><path d="m16 6-4-4-4 4"/><rect x="3" y="14" width="18" height="7" rx="2"/></svg>
         <span>分发节点 (公网)</span>
       </button>
@@ -45,9 +45,13 @@
         <svg class="ico ico-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="7" rx="2"/><rect x="3" y="14" width="18" height="7" rx="2"/><circle cx="7.5" cy="6.5" r="1"/><circle cx="7.5" cy="17.5" r="1"/></svg>
         <span>接收节点 (内网)</span>
       </button>
-      <button class="tab" data-tab="deploy">
+      <button class="tab" data-tab="deploy" data-admin-only="1">
         <svg class="ico ico-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><path d="m3.3 7 8.7 5 8.7-5"/><path d="M12 22V12"/></svg>
         <span>部署与版本</span>
+      </button>
+      <button class="tab" data-tab="accounts" data-admin-only="1">
+        <svg class="ico ico-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+        <span>客户账号</span>
       </button>
     </nav>
     <div class="actions">
@@ -63,6 +67,7 @@
         <svg class="ico ico-sm ico-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/></svg>
         <span>刷新统计</span>
       </button>
+      <span id="role-badge" class="badge accent hidden"></span>
       <span id="trusted-badge" class="badge online pulse hidden" title="当前主机已配置为受信任免密访问">免密主机</span>
       <button id="logout-btn" class="btn ghost hidden">退出</button>
     </div>
@@ -109,15 +114,15 @@
       <div class="section-bar">
         <div>
           <h2>项目隔离管理</h2>
-          <div class="muted" style="margin-top:3px">业务方 PUT 上传新项目时将自动发现并建档；也可手动提前创建并自定义同名冲突策略</div>
+          <div id="projects-section-desc" class="muted" style="margin-top:3px">业务方 PUT 上传新项目时将自动发现并建档；也可手动提前创建并自定义同名冲突策略</div>
         </div>
-        <button id="open-create-project" class="btn primary">+ 新建项目</button>
+        <button id="open-create-project" class="btn primary" data-admin-only="1">+ 新建项目</button>
       </div>
       <div id="projects-grid" class="card-grid"></div>
     </section>
 
     <!-- Dispatch (Source/Edge) Nodes Tab -->
-    <section id="tab-nodes-a" class="tab-panel">
+    <section id="tab-nodes-a" class="tab-panel" data-admin-only="1">
       <div class="section-bar">
         <h2>公网分发节点列表 (源端服务)</h2>
         <div class="btn-row">
@@ -182,7 +187,7 @@
     </section>
 
     <!-- Deploy & Releases Tab -->
-    <section id="tab-deploy" class="tab-panel">
+    <section id="tab-deploy" class="tab-panel" data-admin-only="1">
       <div class="section-bar">
         <h2>一键部署与版本发布管理</h2>
         <button id="open-deploy-a-modal" class="btn primary">+ 一键部署公网分发节点 (SSH)</button>
@@ -258,6 +263,32 @@
             </tr>
           </thead>
           <tbody id="releases-tbody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Customer Accounts Tab (Admin Only) -->
+    <section id="tab-accounts" class="tab-panel" data-admin-only="1">
+      <div class="section-bar">
+        <div>
+          <h2>客户账号权限管理</h2>
+          <div class="muted" style="margin-top:3px">客户账号仅可查看授权项目统计并运维接收节点，后端严格拦截分发节点、公网地址、SSH 部署与发布包操作</div>
+        </div>
+        <button id="open-create-account" class="btn primary">+ 新建客户账号</button>
+      </div>
+      <div class="card table-wrap">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>账号 ID / 名称</th>
+              <th>状态</th>
+              <th>授权范围</th>
+              <th>最近使用</th>
+              <th>创建时间</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="accounts-tbody"></tbody>
         </table>
       </div>
     </section>
@@ -354,7 +385,7 @@
               <input type="radio" name="project_mode" value="single" checked />
               <span>单项目专享</span>
             </label>
-            <label class="radio-opt">
+            <label id="create-node-mode-all-opt" class="radio-opt">
               <input type="radio" name="project_mode" value="all" />
               <span>全部项目 (自动发现)</span>
             </label>
@@ -423,7 +454,7 @@
               <input type="radio" name="edit_project_mode" value="multi" />
               <span>指定多个项目</span>
             </label>
-            <label class="radio-opt">
+            <label id="edit-node-mode-all-opt" class="radio-opt">
               <input type="radio" name="edit_project_mode" value="all" />
               <span>全部项目 (自动拉取新建项目)</span>
             </label>
@@ -639,6 +670,76 @@
         </div>
       </form>
       <div id="b-script-output" class="hidden" style="margin-top:14px"></div>
+    </div>
+  </div>
+
+  <!-- Create / Edit Customer Account Modal (Admin Only) -->
+  <div id="account-modal" class="overlay hidden">
+    <div class="modal-card">
+      <div class="modal-head">
+        <h3 id="account-modal-title">新建客户账号</h3>
+        <button class="btn ghost" type="button" data-close-modal="account-modal">关闭</button>
+      </div>
+      <form id="account-form" class="form-stack">
+        <input type="hidden" name="mode" value="create" />
+        <label>账号 ID (选填，留空自动生成)
+          <input name="id" placeholder="e.g. cust-shenfei" autocomplete="off" />
+        </label>
+        <label>客户名称 / 备注 *
+          <input name="name" required placeholder="例如：下游接收运维客户" autocomplete="off" />
+        </label>
+        <div class="config-section">
+          <div class="config-section-title">项目授权范围 (均禁止访问分发节点)</div>
+          <div class="radio-row">
+            <label class="radio-opt">
+              <input type="radio" name="account_scope" value="all" checked />
+              <span>全部项目 (可运维全部接收节点)</span>
+            </label>
+            <label class="radio-opt">
+              <input type="radio" name="account_scope" value="selected" />
+              <span>仅限指定项目</span>
+            </label>
+          </div>
+          <div id="account-projects-wrap" class="form-stack hidden">
+            <div id="account-project-checks" class="proj-check-grid"></div>
+            <label>授权项目 ID (逗号分隔)
+              <input name="projects" placeholder="proj-alpha,proj-beta" autocomplete="off" />
+            </label>
+          </div>
+        </div>
+        <label id="account-enabled-wrap" class="toggle hidden">
+          <input type="checkbox" name="enabled" checked />
+          <span>启用该客户账号 (取消勾选后该 Token 将立即失效)</span>
+        </label>
+        <button type="submit" class="btn primary full">保存客户账号</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- One-time Customer Token Modal -->
+  <div id="account-token-modal" class="overlay hidden">
+    <div class="modal-card wide">
+      <div class="modal-head">
+        <div>
+          <h3 id="account-token-title">客户账号密钥已生成</h3>
+          <p class="muted">密钥仅展示一次（服务端仅保存 SHA-256 哈希），请立即复制交付客户</p>
+        </div>
+        <button class="btn ghost" type="button" data-close-modal="account-token-modal">关闭</button>
+      </div>
+      <div class="form-stack">
+        <div class="token-box">
+          <strong>客户专属访问 Token：</strong>
+          <div id="account-token-value" class="mono" style="margin-top:6px;word-break:break-all"></div>
+        </div>
+        <div class="token-box">
+          <strong>免输直达登录链接（打开即自动缓存登录）：</strong>
+          <div id="account-login-url" class="mono" style="margin-top:6px;word-break:break-all"></div>
+        </div>
+        <div class="btn-row">
+          <button type="button" id="btn-copy-account-url" class="btn primary">复制直达登录链接</button>
+          <button type="button" id="btn-copy-account-token" class="btn">仅复制 Token</button>
+        </div>
+      </div>
     </div>
   </div>
 

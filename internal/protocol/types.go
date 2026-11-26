@@ -23,6 +23,21 @@ const (
 )
 
 const (
+	AccountRoleAdmin    = "admin"
+	AccountRoleCustomer = "customer"
+)
+
+type AccountRecord struct {
+	ID         string     `json:"id"`
+	Name       string     `json:"name"`
+	Role       string     `json:"role"`               // "customer"
+	Projects   []string   `json:"projects"`           // empty = all projects; non-empty = restricted allowlist
+	Enabled    bool       `json:"enabled"`
+	CreatedAt  time.Time  `json:"created_at"`
+	LastUsedAt *time.Time `json:"last_used_at,omitempty"`
+}
+
+const (
 	ConflictOverwrite  = "overwrite"
 	ConflictAutoRename = "auto_rename"
 	ConflictSkip       = "skip"
@@ -473,6 +488,10 @@ type LiveNodeView struct {
 type OverviewResp struct {
 	GeneratedAt        time.Time        `json:"generated_at"`
 	AuthTrustedIP      bool             `json:"auth_trusted_ip,omitempty"`
+	AuthRole           string           `json:"auth_role,omitempty"`
+	AuthAccountID      string           `json:"auth_account_id,omitempty"`
+	AuthAccountName    string           `json:"auth_account_name,omitempty"`
+	AuthProjects       []string         `json:"auth_projects,omitempty"`
 	WindowStart        time.Time        `json:"window_start"`
 	WindowEnd          time.Time        `json:"window_end"`
 	WindowHours        int              `json:"window_hours"`

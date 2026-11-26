@@ -28,18 +28,20 @@ type WindowSummary struct {
 }
 
 type IntervalQuery struct {
-	Now           time.Time
-	Start         time.Time
-	End           time.Time
-	Hours         int
-	BucketMinutes int
-	ProjectID     string
-	ANodeID       string
-	BNodeID       string
+	Now             time.Time
+	Start           time.Time
+	End             time.Time
+	Hours           int
+	BucketMinutes   int
+	ProjectID       string
+	AllowedProjects []string
+	ANodeID         string
+	BNodeID         string
 }
 
 var (
 	ErrNotFound = errors.New("not found")
+	ErrConflict = errors.New("already exists")
 )
 
 type Store struct {
@@ -169,6 +171,17 @@ CREATE TABLE IF NOT EXISTS node_upgrades (
 	status TEXT NOT NULL,
 	message TEXT NOT NULL DEFAULT '',
 	updated_at TIMESTAMP NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS accounts (
+	id TEXT PRIMARY KEY,
+	name TEXT NOT NULL,
+	role TEXT NOT NULL DEFAULT 'customer',
+	projects_json TEXT NOT NULL DEFAULT '[]',
+	enabled INTEGER NOT NULL DEFAULT 1,
+	token_hash TEXT NOT NULL UNIQUE,
+	created_at TIMESTAMP NOT NULL,
+	last_used_at TIMESTAMP
 );
 `
 	if _, err := db.Exec(schema); err != nil {
@@ -647,33 +660,49 @@ FROM stats_project_total
 	return out, rows.Err()
 }
 
+func sqlPlaceholders(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	return strings.Repeat("?,", n-1) + "?"
+}
+
 func (s *Store) GetDailyStats(ctx context.Context, projectID string, days int) ([]protocol.DailyStat, error) {
+	return s.GetDailyStatsScoped(ctx, projectID, nil, days)
+}
+
+func (s *Store) GetDailyStatsScoped(ctx context.Context, projectID string, allowedProjects []string, days int) ([]protocol.DailyStat, error) {
 	if days <= 0 {
 		days = 14
 	}
 	since := time.Now().UTC().AddDate(0, 0, -(days - 1)).Format("2006-01-02")
 
-	var (
-		rows *sql.Rows
-		err  error
-	)
+	where := []string{"date >= ?"}
+	args := []any{since}
+	selectProj := "''"
+	groupBy := "date"
 	if projectID != "" {
-		rows, err = s.db.QueryContext(ctx, `
-SELECT date, project_id, '', SUM(files_uploaded), SUM(files_completed), SUM(files_failed), SUM(bytes_transferred), SUM(total_duration_ms)
-FROM stats_daily
-WHERE date >= ? AND project_id = ?
-GROUP BY date, project_id
-ORDER BY date ASC
-`, since, projectID)
-	} else {
-		rows, err = s.db.QueryContext(ctx, `
-SELECT date, '', '', SUM(files_uploaded), SUM(files_completed), SUM(files_failed), SUM(bytes_transferred), SUM(total_duration_ms)
-FROM stats_daily
-WHERE date >= ?
-GROUP BY date
-ORDER BY date ASC
-`, since)
+		where = append(where, "project_id = ?")
+		args = append(args, projectID)
+		selectProj = "project_id"
+		groupBy = "date, project_id"
 	}
+	if len(allowedProjects) > 0 {
+		where = append(where, "project_id IN ("+sqlPlaceholders(len(allowedProjects))+")")
+		for _, pid := range allowedProjects {
+			args = append(args, pid)
+		}
+	}
+
+	query := fmt.Sprintf(`
+SELECT date, %s, '', SUM(files_uploaded), SUM(files_completed), SUM(files_failed), SUM(bytes_transferred), SUM(total_duration_ms)
+FROM stats_daily
+WHERE %s
+GROUP BY %s
+ORDER BY date ASC
+`, selectProj, strings.Join(where, " AND "), groupBy)
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -809,6 +838,12 @@ func (s *Store) QueryIntervalStats(ctx context.Context, q IntervalQuery) (*proto
 		where = append(where, "project_id = ?")
 		args = append(args, q.ProjectID)
 	}
+	if len(q.AllowedProjects) > 0 {
+		where = append(where, "project_id IN ("+sqlPlaceholders(len(q.AllowedProjects))+")")
+		for _, pid := range q.AllowedProjects {
+			args = append(args, pid)
+		}
+	}
 	if q.ANodeID != "" {
 		where = append(where, "a_node_id = ?")
 		args = append(args, q.ANodeID)
@@ -935,6 +970,15 @@ func (s *Store) GetWindowEntityStats(ctx context.Context, now time.Time, hours i
 	projStats map[string]WindowSummary,
 	err error,
 ) {
+	return s.GetWindowEntityStatsScoped(ctx, now, hours, nil)
+}
+
+func (s *Store) GetWindowEntityStatsScoped(ctx context.Context, now time.Time, hours int, allowedProjects []string) (
+	aStats map[string]WindowSummary,
+	bStats map[string]WindowSummary,
+	projStats map[string]WindowSummary,
+	err error,
+) {
 	if now.IsZero() {
 		now = time.Now().UTC()
 	}
@@ -948,13 +992,23 @@ func (s *Store) GetWindowEntityStats(ctx context.Context, now time.Time, hours i
 	nowUnix := now.Unix()
 	startSlot := ((nowUnix - windowSec) / BaseIntervalSec) * BaseIntervalSec
 
-	rows, err := s.db.QueryContext(ctx, `
+	where := []string{"bucket_ts >= ?"}
+	args := []any{startSlot}
+	if len(allowedProjects) > 0 {
+		where = append(where, "project_id IN ("+sqlPlaceholders(len(allowedProjects))+")")
+		for _, pid := range allowedProjects {
+			args = append(args, pid)
+		}
+	}
+	query := fmt.Sprintf(`
 SELECT bucket_ts, project_id, a_node_id, b_node_id,
        SUM(files_completed), SUM(files_failed), SUM(bytes_transferred)
 FROM stats_intervals
-WHERE bucket_ts >= ?
+WHERE %s
 GROUP BY bucket_ts, project_id, a_node_id, b_node_id
-`, startSlot)
+`, strings.Join(where, " AND "))
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -1179,4 +1233,171 @@ FROM node_upgrades
 func (s *Store) DeleteNodeUpgrade(ctx context.Context, nodeID string) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM node_upgrades WHERE node_id = ?`, nodeID)
 	return err
+}
+
+// --- Customer / Console Accounts ---
+
+func (s *Store) CreateAccount(ctx context.Context, a protocol.AccountRecord, rawToken string) error {
+	if a.CreatedAt.IsZero() {
+		a.CreatedAt = time.Now().UTC()
+	}
+	if a.Role == "" {
+		a.Role = protocol.AccountRoleCustomer
+	}
+	if a.Projects == nil {
+		a.Projects = []string{}
+	}
+	projJSON, err := json.Marshal(a.Projects)
+	if err != nil {
+		return err
+	}
+	enInt := 0
+	if a.Enabled {
+		enInt = 1
+	}
+	tokHash := auth.HashToken(rawToken)
+	_, err = s.db.ExecContext(ctx, `
+INSERT INTO accounts (id, name, role, projects_json, enabled, token_hash, created_at)
+VALUES (?, ?, ?, ?, ?, ?, ?)
+`, a.ID, a.Name, a.Role, string(projJSON), enInt, tokHash, a.CreatedAt)
+	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "unique") {
+			return ErrConflict
+		}
+		return err
+	}
+	return nil
+}
+
+func (s *Store) UpdateAccount(ctx context.Context, a protocol.AccountRecord) error {
+	if a.Projects == nil {
+		a.Projects = []string{}
+	}
+	projJSON, err := json.Marshal(a.Projects)
+	if err != nil {
+		return err
+	}
+	enInt := 0
+	if a.Enabled {
+		enInt = 1
+	}
+	res, err := s.db.ExecContext(ctx, `
+UPDATE accounts SET name = ?, projects_json = ?, enabled = ?
+WHERE id = ?
+`, a.Name, string(projJSON), enInt, a.ID)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *Store) RotateAccountToken(ctx context.Context, id, newRawToken string) (*protocol.AccountRecord, error) {
+	tokHash := auth.HashToken(newRawToken)
+	res, err := s.db.ExecContext(ctx, `UPDATE accounts SET token_hash = ? WHERE id = ?`, tokHash, id)
+	if err != nil {
+		return nil, err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return nil, ErrNotFound
+	}
+	return s.GetAccount(ctx, id)
+}
+
+func (s *Store) DeleteAccount(ctx context.Context, id string) error {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM accounts WHERE id = ?`, id)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func scanAccountRow(scanner interface{ Scan(dest ...any) error }) (*protocol.AccountRecord, string, error) {
+	var a protocol.AccountRecord
+	var projJSON, tokHash string
+	var enInt int
+	var lastUsed sql.NullTime
+	if err := scanner.Scan(&a.ID, &a.Name, &a.Role, &projJSON, &enInt, &tokHash, &a.CreatedAt, &lastUsed); err != nil {
+		return nil, "", err
+	}
+	_ = json.Unmarshal([]byte(projJSON), &a.Projects)
+	if a.Projects == nil {
+		a.Projects = []string{}
+	}
+	a.Enabled = enInt != 0
+	if lastUsed.Valid {
+		t := lastUsed.Time.UTC()
+		a.LastUsedAt = &t
+	}
+	return &a, tokHash, nil
+}
+
+func (s *Store) GetAccount(ctx context.Context, id string) (*protocol.AccountRecord, error) {
+	row := s.db.QueryRowContext(ctx, `
+SELECT id, name, role, projects_json, enabled, token_hash, created_at, last_used_at
+FROM accounts WHERE id = ?
+`, id)
+	a, _, err := scanAccountRow(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return a, nil
+}
+
+func (s *Store) ListAccounts(ctx context.Context) ([]protocol.AccountRecord, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT id, name, role, projects_json, enabled, token_hash, created_at, last_used_at
+FROM accounts ORDER BY created_at DESC, id ASC
+`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	list := make([]protocol.AccountRecord, 0)
+	for rows.Next() {
+		a, _, err := scanAccountRow(rows)
+		if err != nil {
+			return nil, err
+		}
+		list = append(list, *a)
+	}
+	return list, rows.Err()
+}
+
+func (s *Store) AuthenticateAccount(ctx context.Context, rawToken string) (*protocol.AccountRecord, error) {
+	if rawToken == "" {
+		return nil, ErrNotFound
+	}
+	hash := auth.HashToken(rawToken)
+	row := s.db.QueryRowContext(ctx, `
+SELECT id, name, role, projects_json, enabled, token_hash, created_at, last_used_at
+FROM accounts WHERE token_hash = ?
+`, hash)
+	a, dbHash, err := scanAccountRow(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if !auth.EqualConstantTime(hash, dbHash) || !a.Enabled {
+		return nil, ErrNotFound
+	}
+	now := time.Now().UTC()
+	if a.LastUsedAt == nil || now.Sub(*a.LastUsedAt) >= time.Minute {
+		_, _ = s.db.ExecContext(ctx, `UPDATE accounts SET last_used_at = ? WHERE id = ?`, now, a.ID)
+		a.LastUsedAt = &now
+	}
+	return a, nil
 }

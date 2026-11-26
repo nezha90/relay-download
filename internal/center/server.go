@@ -290,29 +290,38 @@ func (s *Server) routes() http.Handler {
 	// Shared node release download (Agent A or B pulls its own role's binary over TLS 1.3)
 	mux.HandleFunc("GET /api/v1/releases/{id}/download", s.requireNode("", s.handleNodeDownloadRelease))
 
-	// Admin & Web UI API (interval/stage summary only; no real-time per-file proxy endpoints)
-	mux.HandleFunc("GET /api/v1/admin/overview", s.requireAdmin(s.handleAdminOverview))
-	mux.HandleFunc("GET /api/v1/admin/projects", s.requireAdmin(s.handleAdminListProjects))
-	mux.HandleFunc("POST /api/v1/admin/projects", s.requireAdmin(s.handleAdminUpsertProject))
-	mux.HandleFunc("DELETE /api/v1/admin/projects/{id}", s.requireAdmin(s.handleAdminDeleteProject))
-	mux.HandleFunc("GET /api/v1/admin/nodes", s.requireAdmin(s.handleAdminListNodes))
-	mux.HandleFunc("POST /api/v1/admin/nodes", s.requireAdmin(s.handleAdminCreateNode))
-	mux.HandleFunc("PUT /api/v1/admin/nodes/{id}", s.requireAdmin(s.handleAdminUpdateNode))
-	mux.HandleFunc("DELETE /api/v1/admin/nodes/{id}", s.requireAdmin(s.handleAdminDeleteNode))
-	mux.HandleFunc("GET /api/v1/admin/stats/intervals", s.requireAdmin(s.handleAdminIntervalStats))
-	mux.HandleFunc("GET /api/v1/admin/stats/daily", s.requireAdmin(s.handleAdminDailyStats))
+	// Console & Admin Web UI API (interval/stage summary only; no real-time per-file proxy endpoints)
+	// requireConsole permits super-admin and customer accounts (with per-handler RBAC & scoping).
+	// requireSuperAdmin strictly forbids customer accounts (HTTP 403).
+	mux.HandleFunc("GET /api/v1/admin/overview", s.requireConsole(s.handleAdminOverview))
+	mux.HandleFunc("GET /api/v1/admin/projects", s.requireConsole(s.handleAdminListProjects))
+	mux.HandleFunc("POST /api/v1/admin/projects", s.requireSuperAdmin(s.handleAdminUpsertProject))
+	mux.HandleFunc("DELETE /api/v1/admin/projects/{id}", s.requireSuperAdmin(s.handleAdminDeleteProject))
+	mux.HandleFunc("GET /api/v1/admin/nodes", s.requireConsole(s.handleAdminListNodes))
+	mux.HandleFunc("POST /api/v1/admin/nodes", s.requireConsole(s.handleAdminCreateNode))
+	mux.HandleFunc("PUT /api/v1/admin/nodes/{id}", s.requireConsole(s.handleAdminUpdateNode))
+	mux.HandleFunc("DELETE /api/v1/admin/nodes/{id}", s.requireConsole(s.handleAdminDeleteNode))
+	mux.HandleFunc("GET /api/v1/admin/stats/intervals", s.requireConsole(s.handleAdminIntervalStats))
+	mux.HandleFunc("GET /api/v1/admin/stats/daily", s.requireConsole(s.handleAdminDailyStats))
 
 	// Releases, Batch Upgrades & One-Click Deployment API
-	mux.HandleFunc("GET /api/v1/admin/releases", s.requireAdmin(s.handleAdminListReleases))
-	mux.HandleFunc("POST /api/v1/admin/releases", s.requireAdmin(s.handleAdminUploadRelease))
-	mux.HandleFunc("DELETE /api/v1/admin/releases/{id}", s.requireAdmin(s.handleAdminDeleteRelease))
-	mux.HandleFunc("POST /api/v1/admin/upgrades", s.requireAdmin(s.handleAdminBatchUpgrade))
-	mux.HandleFunc("DELETE /api/v1/admin/upgrades/{id}", s.requireAdmin(s.handleAdminCancelUpgrade))
-	mux.HandleFunc("POST /api/v1/admin/deploy/precheck", s.requireAdmin(s.handleAdminDeployPrecheck))
-	mux.HandleFunc("POST /api/v1/admin/deploy/agent-a", s.requireAdmin(s.handleAdminDeployAgentA))
-	mux.HandleFunc("GET /api/v1/admin/deploy/tasks", s.requireAdmin(s.handleAdminListDeployTasks))
-	mux.HandleFunc("GET /api/v1/admin/deploy/tasks/{id}", s.requireAdmin(s.handleAdminGetDeployTask))
-	mux.HandleFunc("POST /api/v1/admin/deploy/agent-b-script", s.requireAdmin(s.handleAdminAgentBInstallScript))
+	mux.HandleFunc("GET /api/v1/admin/releases", s.requireConsole(s.handleAdminListReleases))
+	mux.HandleFunc("POST /api/v1/admin/releases", s.requireSuperAdmin(s.handleAdminUploadRelease))
+	mux.HandleFunc("DELETE /api/v1/admin/releases/{id}", s.requireSuperAdmin(s.handleAdminDeleteRelease))
+	mux.HandleFunc("POST /api/v1/admin/upgrades", s.requireConsole(s.handleAdminBatchUpgrade))
+	mux.HandleFunc("DELETE /api/v1/admin/upgrades/{id}", s.requireConsole(s.handleAdminCancelUpgrade))
+	mux.HandleFunc("POST /api/v1/admin/deploy/precheck", s.requireSuperAdmin(s.handleAdminDeployPrecheck))
+	mux.HandleFunc("POST /api/v1/admin/deploy/agent-a", s.requireSuperAdmin(s.handleAdminDeployAgentA))
+	mux.HandleFunc("GET /api/v1/admin/deploy/tasks", s.requireSuperAdmin(s.handleAdminListDeployTasks))
+	mux.HandleFunc("GET /api/v1/admin/deploy/tasks/{id}", s.requireSuperAdmin(s.handleAdminGetDeployTask))
+	mux.HandleFunc("POST /api/v1/admin/deploy/agent-b-script", s.requireConsole(s.handleAdminAgentBInstallScript))
+
+	// Customer Account Management API (Super-Admin only)
+	mux.HandleFunc("GET /api/v1/admin/accounts", s.requireSuperAdmin(s.handleAdminListAccounts))
+	mux.HandleFunc("POST /api/v1/admin/accounts", s.requireSuperAdmin(s.handleAdminCreateAccount))
+	mux.HandleFunc("PUT /api/v1/admin/accounts/{id}", s.requireSuperAdmin(s.handleAdminUpdateAccount))
+	mux.HandleFunc("POST /api/v1/admin/accounts/{id}/rotate", s.requireSuperAdmin(s.handleAdminRotateAccountToken))
+	mux.HandleFunc("DELETE /api/v1/admin/accounts/{id}", s.requireSuperAdmin(s.handleAdminDeleteAccount))
 
 	// Embedded Web UI
 	webSub, err := fs.Sub(embeddedWeb, "web")
@@ -360,28 +369,6 @@ func (s *Server) isTrustedAdminRequest(r *http.Request) bool {
 		}
 	}
 	return false
-}
-
-func (s *Server) requireAdmin(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if err := checkAdminCSRF(r); err != nil {
-			protocol.WriteError(w, http.StatusForbidden, err.Error())
-			return
-		}
-		if s.isTrustedAdminRequest(r) {
-			next(w, r)
-			return
-		}
-		tok := strings.TrimSpace(r.Header.Get(protocol.HeaderAdminToken))
-		if tok == "" {
-			tok = auth.ExtractBearer(r.Header.Get("Authorization"))
-		}
-		if !auth.EqualConstantTime(tok, s.cfg.AdminToken) {
-			protocol.WriteError(w, http.StatusUnauthorized, "invalid admin token")
-			return
-		}
-		next(w, r)
-	}
 }
 
 func (s *Server) handleAHeartbeat(w http.ResponseWriter, r *http.Request, node *StoredNode) {
@@ -711,12 +698,37 @@ func parseIntervalQuery(r *http.Request) IntervalQuery {
 
 func (s *Server) handleAdminOverview(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	principal := principalFromRequest(r)
 	iq := parseIntervalQuery(r)
+	if !principal.IsAdmin() {
+		if iq.ANodeID != "" {
+			protocol.WriteError(w, http.StatusForbidden, "customer accounts cannot filter by dispatch node")
+			return
+		}
+		if iq.ProjectID != "" && !principal.AllowsProject(iq.ProjectID) {
+			protocol.WriteError(w, http.StatusForbidden, "project not authorized for this account")
+			return
+		}
+		if iq.BNodeID != "" {
+			n, err := s.store.GetNode(ctx, iq.BNodeID)
+			if err != nil || !principal.CanAccessNode(*n) {
+				protocol.WriteError(w, http.StatusForbidden, "receiver node not authorized for this account")
+				return
+			}
+		}
+		iq.AllowedProjects = principal.Projects
+	}
 
-	projects, err := s.store.ListProjects(ctx)
+	allProjects, err := s.store.ListProjects(ctx)
 	if err != nil {
 		protocol.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	projects := make([]protocol.Project, 0, len(allProjects))
+	for _, p := range allProjects {
+		if principal.AllowsProject(p.ID) {
+			projects = append(projects, p)
+		}
 	}
 	nodes, err := s.store.ListNodes(ctx)
 	if err != nil {
@@ -728,7 +740,7 @@ func (s *Server) handleAdminOverview(w http.ResponseWriter, r *http.Request) {
 		protocol.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	dailyTrend, err := s.store.GetDailyStats(ctx, iq.ProjectID, 14)
+	dailyTrend, err := s.store.GetDailyStatsScoped(ctx, iq.ProjectID, iq.AllowedProjects, 14)
 	if err != nil {
 		protocol.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -738,7 +750,7 @@ func (s *Server) handleAdminOverview(w http.ResponseWriter, r *http.Request) {
 		protocol.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	_, _, projWindowMap, err := s.store.GetWindowEntityStats(ctx, iq.Now, intervalResp.WindowHours)
+	_, _, projWindowMap, err := s.store.GetWindowEntityStatsScoped(ctx, iq.Now, intervalResp.WindowHours, iq.AllowedProjects)
 	if err != nil {
 		protocol.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -747,7 +759,11 @@ func (s *Server) handleAdminOverview(w http.ResponseWriter, r *http.Request) {
 	aSnap, bSnap := s.hub.Snapshot()
 	overview := protocol.OverviewResp{
 		GeneratedAt:        intervalResp.GeneratedAt,
-		AuthTrustedIP:      s.isTrustedAdminRequest(r),
+		AuthTrustedIP:      principal.TrustedIP,
+		AuthRole:           principal.Role,
+		AuthAccountID:      principal.AccountID,
+		AuthAccountName:    principal.AccountName,
+		AuthProjects:       principal.Projects,
 		WindowStart:        intervalResp.WindowStart,
 		WindowEnd:          intervalResp.WindowEnd,
 		WindowHours:        intervalResp.WindowHours,
@@ -772,19 +788,29 @@ func (s *Server) handleAdminOverview(w http.ResponseWriter, r *http.Request) {
 			overview.TodayFailed += d.FilesFailed
 		}
 	}
-	for _, t := range totalsMap {
+	for pid, t := range totalsMap {
+		if !principal.AllowsProject(pid) {
+			continue
+		}
 		overview.AllTimeCompleted += t.TotalCompleted
 		overview.AllTimeBytes += t.TotalBytes
 		overview.AllTimeFailed += t.TotalFailed
 	}
 
+	accessibleB := make(map[string]protocol.NodeRecord, len(nodes))
 	for _, n := range nodes {
 		if n.Role == protocol.RoleAgentA {
-			overview.TotalANodes++
-			if st, ok := aSnap[n.ID]; ok && s.hub.IsOnline(st.LastSeen) {
-				overview.OnlineANodes++
+			if principal.IsAdmin() {
+				overview.TotalANodes++
+				if st, ok := aSnap[n.ID]; ok && s.hub.IsOnline(st.LastSeen) {
+					overview.OnlineANodes++
+				}
 			}
 		} else if n.Role == protocol.RoleAgentB {
+			if !principal.CanAccessNode(n) {
+				continue
+			}
+			accessibleB[n.ID] = n
 			overview.TotalBNodes++
 			if st, ok := bSnap[n.ID]; ok && s.hub.IsOnline(st.LastSeen) {
 				overview.OnlineBNodes++
@@ -813,28 +839,39 @@ func (s *Server) handleAdminOverview(w http.ResponseWriter, r *http.Request) {
 			if !s.hub.IsOnline(aSt.LastSeen) {
 				continue
 			}
-			if nodeAllowsProject(aSt.Projects, p.ID) {
+			if principal.IsAdmin() && nodeAllowsProject(aSt.Projects, p.ID) {
 				ps.OnlineANodes++
 			}
 			if av, ok := aSt.Availability[p.ID]; ok && (av.ReadyCount > 0 || av.ClaimedCount > 0) {
 				ps.QueuedFiles += av.ReadyCount + av.ClaimedCount
 				ps.QueuedBytes += av.ReadyBytes
-				ps.ANodeAvailability = append(ps.ANodeAvailability, protocol.ANodeAvailSummary{
-					ANodeID:      aSt.NodeID,
-					AName:        aSt.Name,
-					PublicAddr:   aSt.PublicAddr,
-					ReadyCount:   av.ReadyCount,
-					ClaimedCount: av.ClaimedCount,
-					ReadyBytes:   av.ReadyBytes,
-					DiskAlarm:    aSt.DiskAlarm,
-				})
+				// Never expose dispatch node IDs, names, or public IPs to customer accounts.
+				if principal.IsAdmin() {
+					ps.ANodeAvailability = append(ps.ANodeAvailability, protocol.ANodeAvailSummary{
+						ANodeID:      aSt.NodeID,
+						AName:        aSt.Name,
+						PublicAddr:   aSt.PublicAddr,
+						ReadyCount:   av.ReadyCount,
+						ClaimedCount: av.ClaimedCount,
+						ReadyBytes:   av.ReadyBytes,
+						DiskAlarm:    aSt.DiskAlarm,
+					})
+				}
 			}
 		}
 		sort.Slice(ps.ANodeAvailability, func(i, j int) bool {
 			return ps.ANodeAvailability[i].ANodeID < ps.ANodeAvailability[j].ANodeID
 		})
 		for _, bSt := range bSnap {
-			if s.hub.IsOnline(bSt.LastSeen) && nodeAllowsProject(bSt.Projects, p.ID) {
+			if !s.hub.IsOnline(bSt.LastSeen) {
+				continue
+			}
+			if !principal.IsAdmin() {
+				if _, ok := accessibleB[bSt.NodeID]; !ok {
+					continue
+				}
+			}
+			if nodeAllowsProject(bSt.Projects, p.ID) {
 				ps.OnlineBNodes++
 			}
 		}
@@ -848,10 +885,20 @@ func (s *Server) handleAdminOverview(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAdminListProjects(w http.ResponseWriter, r *http.Request) {
+	principal := principalFromRequest(r)
 	list, err := s.store.ListProjects(r.Context())
 	if err != nil {
 		protocol.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	if !principal.IsAdmin() {
+		filtered := make([]protocol.Project, 0, len(list))
+		for _, p := range list {
+			if principal.AllowsProject(p.ID) {
+				filtered = append(filtered, p)
+			}
+		}
+		list = filtered
 	}
 	protocol.WriteJSON(w, http.StatusOK, list)
 }
@@ -929,6 +976,7 @@ func (s *Server) handleAdminDeleteProject(w http.ResponseWriter, r *http.Request
 
 func (s *Server) handleAdminListNodes(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	principal := principalFromRequest(r)
 	hours := 24
 	if hStr := strings.TrimSpace(r.URL.Query().Get("hours")); hStr != "" {
 		if parsed, err := strconv.Atoi(hStr); err == nil && parsed > 0 && parsed <= 720 {
@@ -940,7 +988,7 @@ func (s *Server) handleAdminListNodes(w http.ResponseWriter, r *http.Request) {
 		protocol.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	aWinStats, bWinStats, _, err := s.store.GetWindowEntityStats(ctx, time.Now().UTC(), hours)
+	aWinStats, bWinStats, _, err := s.store.GetWindowEntityStatsScoped(ctx, time.Now().UTC(), hours, principal.Projects)
 	if err != nil {
 		protocol.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -949,6 +997,9 @@ func (s *Server) handleAdminListNodes(w http.ResponseWriter, r *http.Request) {
 	upgrades, _ := s.store.ListNodeUpgrades(ctx)
 	views := make([]protocol.LiveNodeView, 0, len(nodes))
 	for _, n := range nodes {
+		if !principal.CanAccessNode(n) {
+			continue
+		}
 		v := protocol.LiveNodeView{
 			ID:                    n.ID,
 			Name:                  n.Name,
@@ -1084,6 +1135,7 @@ func cleanProjectIDList(raw []string) ([]string, error) {
 }
 
 func (s *Server) handleAdminCreateNode(w http.ResponseWriter, r *http.Request) {
+	principal := principalFromRequest(r)
 	var req createNodeReq
 	if err := protocol.DecodeJSON(r.Body, &req); err != nil {
 		protocol.WriteError(w, http.StatusBadRequest, "invalid json")
@@ -1104,6 +1156,17 @@ func (s *Server) handleAdminCreateNode(w http.ResponseWriter, r *http.Request) {
 		protocol.WriteError(w, http.StatusBadRequest, "role must be agent_a or agent_b")
 		return
 	}
+	if !principal.IsAdmin() {
+		if req.Role != protocol.RoleAgentB {
+			protocol.WriteError(w, http.StatusForbidden, "customer accounts can only manage receiver nodes")
+			return
+		}
+		req.PublicAddr = ""
+		if existing, err := s.store.GetNode(r.Context(), req.ID); err == nil && !principal.CanAccessNode(*existing) {
+			protocol.WriteError(w, http.StatusForbidden, "cannot overwrite an inaccessible node")
+			return
+		}
+	}
 	if req.Role == protocol.RoleAgentA && req.PublicAddr != "" {
 		if err := validateHTTPSAddr(req.PublicAddr); err != nil {
 			protocol.WriteError(w, http.StatusBadRequest, err.Error())
@@ -1113,6 +1176,10 @@ func (s *Server) handleAdminCreateNode(w http.ResponseWriter, r *http.Request) {
 	cleanProjects, err := cleanProjectIDList(req.Projects)
 	if err != nil {
 		protocol.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if !principal.IsAdmin() && !principal.AllowsAllProjects(cleanProjects) {
+		protocol.WriteError(w, http.StatusForbidden, "receiver node projects must be within this account's allowed project list")
 		return
 	}
 	cleanDisks, err := cleanDiskPathList(req.DisabledDisks)
@@ -1189,6 +1256,7 @@ type updateNodeReq struct {
 }
 
 func (s *Server) handleAdminUpdateNode(w http.ResponseWriter, r *http.Request) {
+	principal := principalFromRequest(r)
 	nodeID := strings.TrimSpace(r.PathValue("id"))
 	existing, err := s.store.GetNode(r.Context(), nodeID)
 	if err != nil {
@@ -1197,6 +1265,10 @@ func (s *Server) handleAdminUpdateNode(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		protocol.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if !principal.CanAccessNode(*existing) {
+		protocol.WriteError(w, http.StatusForbidden, "account not authorized to modify this node")
 		return
 	}
 
@@ -1272,6 +1344,10 @@ func (s *Server) handleAdminUpdateNode(w http.ResponseWriter, r *http.Request) {
 			protocol.WriteError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		if !principal.IsAdmin() && !principal.AllowsAllProjects(cleanProjects) {
+			protocol.WriteError(w, http.StatusForbidden, "receiver node projects must be within this account's allowed project list")
+			return
+		}
 		rec.Projects = cleanProjects
 	}
 
@@ -1285,7 +1361,21 @@ func (s *Server) handleAdminUpdateNode(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAdminDeleteNode(w http.ResponseWriter, r *http.Request) {
-	nodeID := r.PathValue("id")
+	principal := principalFromRequest(r)
+	nodeID := strings.TrimSpace(r.PathValue("id"))
+	existing, err := s.store.GetNode(r.Context(), nodeID)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			protocol.WriteError(w, http.StatusNotFound, "node not found")
+			return
+		}
+		protocol.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if !principal.CanAccessNode(*existing) {
+		protocol.WriteError(w, http.StatusForbidden, "account not authorized to delete this node")
+		return
+	}
 	if err := s.store.DeleteNode(r.Context(), nodeID); err != nil {
 		if errors.Is(err, ErrNotFound) {
 			protocol.WriteError(w, http.StatusNotFound, "node not found")
@@ -1300,7 +1390,26 @@ func (s *Server) handleAdminDeleteNode(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAdminIntervalStats(w http.ResponseWriter, r *http.Request) {
+	principal := principalFromRequest(r)
 	iq := parseIntervalQuery(r)
+	if !principal.IsAdmin() {
+		if iq.ANodeID != "" {
+			protocol.WriteError(w, http.StatusForbidden, "customer accounts cannot filter by dispatch node")
+			return
+		}
+		if iq.ProjectID != "" && !principal.AllowsProject(iq.ProjectID) {
+			protocol.WriteError(w, http.StatusForbidden, "project not authorized for this account")
+			return
+		}
+		if iq.BNodeID != "" {
+			n, err := s.store.GetNode(r.Context(), iq.BNodeID)
+			if err != nil || !principal.CanAccessNode(*n) {
+				protocol.WriteError(w, http.StatusForbidden, "receiver node not authorized for this account")
+				return
+			}
+		}
+		iq.AllowedProjects = principal.Projects
+	}
 	resp, err := s.store.QueryIntervalStats(r.Context(), iq)
 	if err != nil {
 		protocol.WriteError(w, http.StatusInternalServerError, err.Error())
@@ -1310,14 +1419,19 @@ func (s *Server) handleAdminIntervalStats(w http.ResponseWriter, r *http.Request
 }
 
 func (s *Server) handleAdminDailyStats(w http.ResponseWriter, r *http.Request) {
+	principal := principalFromRequest(r)
 	projectID := strings.TrimSpace(r.URL.Query().Get("project"))
+	if !principal.IsAdmin() && projectID != "" && !principal.AllowsProject(projectID) {
+		protocol.WriteError(w, http.StatusForbidden, "project not authorized for this account")
+		return
+	}
 	days := 14
 	if dStr := r.URL.Query().Get("days"); dStr != "" {
 		if parsed, err := strconv.Atoi(dStr); err == nil && parsed > 0 && parsed <= 90 {
 			days = parsed
 		}
 	}
-	stats, err := s.store.GetDailyStats(r.Context(), projectID, days)
+	stats, err := s.store.GetDailyStatsScoped(r.Context(), projectID, principal.Projects, days)
 	if err != nil {
 		protocol.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
