@@ -841,6 +841,10 @@
 
         <button type="submit" id="edit-b-submit-btn" class="btn primary full">保存配置并立即下发</button>
       </form>
+      <div class="modal-footer-reinstall">
+        <span>需要换机迁移、重装系统或重置节点接入密钥？</span>
+        <button type="button" id="btn-open-b-reinstall-script" class="btn sm ghost">获取重装 / 迁移脚本</button>
+      </div>
     </div>
   </div>
 
@@ -886,6 +890,10 @@
         </div>
         <button type="submit" id="edit-a-submit-btn" class="btn primary full">保存数据盘配置并热生效</button>
       </form>
+      <div class="modal-footer-reinstall">
+        <span>需要换机迁移、重装系统或重置节点接入密钥？</span>
+        <button type="button" id="btn-open-a-reinstall-script" class="btn sm ghost">获取重装 / 迁移脚本</button>
+      </div>
     </div>
   </div>
 
@@ -970,137 +978,170 @@
     </div>
   </div>
 
-  <!-- Receiver Node Install Script Modal -->
+  <!-- Receiver Node Install / Reinstall Script Modal -->
   <div id="b-script-modal" class="overlay hidden">
     <div class="modal-card wide">
       <div class="modal-head">
         <div>
           <h3 id="b-script-title">内网接收节点一键安装脚本</h3>
-          <p class="muted">脚本内嵌 Root CA 证书，采用严格 TLS 1.3 从中心拉取二进制并自动配置 systemd</p>
+          <p class="muted">仅用于新机首次装机或换机重装；脚本自动下载程序、签发 CA 信任并配置 systemd 开机自启</p>
         </div>
         <button class="btn ghost" type="button" data-close-modal="b-script-modal">关闭</button>
+      </div>
+      <div id="b-script-running-warn" class="banner warn hidden" style="margin-bottom:12px">
+        <strong>提示：</strong>该接收节点当前已在线运行。日常改项目、增减硬盘、调水位或版本热升级直接在控制台操作即可，无需重跑安装脚本；仅在重装系统或迁移到新机器时才需要重新生成。
       </div>
       <form id="b-script-form" class="form-stack">
         <input type="hidden" name="node_id" />
         <input type="hidden" name="node_token" />
-        <div class="form-grid-3">
-          <label>安装目录
-            <input name="install_dir" value="/opt/relay-agent-b" autocomplete="off" />
-          </label>
-          <label>状态数据库目录
-            <input name="state_dir" value="/data/relay-b/state" autocomplete="off" />
-          </label>
-          <label>选择接收节点版本包
-            <select id="b-script-release-select" name="release_id">
-              <option value="">自动匹配最新接收节点发布包</option>
-            </select>
-          </label>
+
+        <div class="config-section">
+          <div class="config-section-title">1. 数据盘接入方式</div>
+          <div class="radio-row">
+            <label class="radio-opt">
+              <input type="radio" name="script_mode" value="await" checked />
+              <span>先激活上线，再在网页勾选物理盘（推荐 · 免填路径）</span>
+            </label>
+            <label class="radio-opt">
+              <input type="radio" name="script_mode" value="manual" />
+              <span>手动预设磁盘路径（高级）</span>
+            </label>
+          </div>
+          <div id="b-script-await-wrap" class="banner pass" style="margin:0">
+            <strong>推荐流程：</strong>在目标接收机运行脚本后节点 5 秒内上线并自动扫描本机全部物理盘，回到本网页点击「⚡ 选择数据盘并激活」勾选即可自动建目录开跑。
+          </div>
+          <div id="b-script-manual-wrap" class="form-stack hidden">
+            <label><span>预设模式</span>
+              <select name="manual_submode" id="b-script-manual-submode">
+                <option value="pool">多盘统一目录池（推荐：任意项目自动落盘至 &lt;盘目录&gt;/&lt;项目ID&gt;/）</option>
+                <option value="single">本地强锁单项目（仅允许下载指定单个项目）</option>
+                <option value="multi">手动多项目目录映射（为每个项目分别指定本地目录）</option>
+              </select>
+            </label>
+            <div id="b-script-pool-wrap" class="form-stack">
+              <label><span class="form-label-text">物理磁盘根目录列表（每行一个挂载目录，项目自动落盘至 <code>&lt;盘目录&gt;/&lt;项目ID&gt;/</code>）</span>
+                <textarea name="storage_dirs" rows="2" placeholder="/mnt/sda/relay-delivery&#10;/mnt/sdb/relay-delivery"></textarea>
+              </label>
+            </div>
+            <div id="b-script-single-wrap" class="form-stack hidden">
+              <label><span>绑定单个项目</span>
+                <select id="b-script-single-project" name="only_project"></select>
+              </label>
+              <label><span class="form-label-text">本地落盘目录（每行一个目录，填多个目录自动多盘并发落盘）</span>
+                <textarea name="single_dest_dirs" rows="2" placeholder="/mnt/sda/relay-delivery&#10;/mnt/sdb/relay-delivery"></textarea>
+              </label>
+            </div>
+            <div id="b-script-multi-wrap" class="form-stack hidden">
+              <label><span class="form-label-text">多项目目录映射（每行一条 <code>项目ID=/本地目录</code>，留空按节点绑定项目自动生成）</span>
+                <textarea name="projects_map" rows="3" placeholder="proj-alpha=/data/relay/proj-alpha"></textarea>
+              </label>
+            </div>
+          </div>
         </div>
-        <div class="radio-row">
-          <label class="radio-opt">
-            <input type="radio" name="script_mode" value="await" checked />
-            <span>先激活上线，再在网页勾选物理盘 (推荐 · 免填路径)</span>
-          </label>
-          <label class="radio-opt">
-            <input type="radio" name="script_mode" value="pool" />
-            <span>预设磁盘池路径 (storage_dirs)</span>
-          </label>
-          <label class="radio-opt">
-            <input type="radio" name="script_mode" value="single" />
-            <span>本地强锁单项目 (only_project)</span>
-          </label>
-          <label class="radio-opt">
-            <input type="radio" name="script_mode" value="multi" />
-            <span>手动多项目目录映射</span>
-          </label>
-        </div>
-        <div id="b-script-await-wrap" class="banner pass" style="margin:0">
-          <strong>推荐流程：</strong>脚本执行后节点先在线待命并自动扫描目标机所有物理盘（不会误写系统盘），随后在网页点显眼的「⚡ 选择数据盘并激活」勾选数据盘即可自动建目录开跑！
-        </div>
-        <div id="b-script-pool-wrap" class="form-stack hidden">
-          <label>物理磁盘根目录池 storage_dirs (每行一个挂载目录，任意项目自动落盘至 <code>&lt;盘目录&gt;/&lt;项目ID&gt;/</code>)
-            <textarea name="storage_dirs" rows="2" placeholder="/mnt/sda/relay-delivery&#10;/mnt/sdb/relay-delivery"></textarea>
-          </label>
-        </div>
-        <div id="b-script-single-wrap" class="form-stack hidden">
-          <label>绑定单个项目
-            <select id="b-script-single-project" name="only_project"></select>
-          </label>
-          <label>本地落盘目录 (每行一个目录，填多个目录自动多盘均衡落盘)
-            <textarea name="single_dest_dirs" rows="2" placeholder="/mnt/sda/relay-delivery&#10;/mnt/sdb/relay-delivery"></textarea>
-          </label>
-        </div>
-        <label id="b-script-multi-wrap" class="hidden">多项目落盘目录映射 (每行一条 `项目ID=/本地目录`，留空按节点绑定项目自动生成)
-          <textarea name="projects_map" rows="3" placeholder="proj-alpha=/data/relay/proj-alpha"></textarea>
-        </label>
-        <div class="btn-row">
+
+        <details class="advanced-fold" id="b-script-adv-details">
+          <summary>2. 高级安装参数（安装目录、状态目录、指定版本包 — 默认保持推荐值即可）</summary>
+          <div class="advanced-fold-body">
+            <div class="form-grid-3">
+              <label>安装目录
+                <input name="install_dir" value="/opt/relay-agent-b" autocomplete="off" />
+              </label>
+              <label>状态数据库目录
+                <input name="state_dir" value="/data/relay-b/state" autocomplete="off" />
+              </label>
+              <label>目标版本包
+                <select id="b-script-release-select" name="release_id">
+                  <option value="">自动匹配最新接收节点发布包</option>
+                </select>
+              </label>
+            </div>
+          </div>
+        </details>
+
+        <div class="script-action-bar">
           <label class="toggle">
             <input name="rotate_token" type="checkbox" />
-            <span>重新生成并直接内嵌新接入 Token (会断开该接收节点旧连接)</span>
+            <span>重新生成并内嵌新接入密钥（会断开该节点旧连接）</span>
           </label>
-          <button type="submit" class="btn primary">生成自动化安装脚本</button>
-          <button type="button" id="btn-copy-b-exec" class="btn success hidden">复制一键执行命令</button>
-          <button type="button" id="btn-copy-b-script" class="btn hidden">复制完整脚本</button>
-          <button type="button" id="btn-download-b-script" class="btn hidden">下载 .sh</button>
+          <div class="btn-row">
+            <button type="submit" class="btn primary">生成一键安装脚本</button>
+            <button type="button" id="btn-copy-b-exec" class="btn success hidden">复制一键执行命令</button>
+            <button type="button" id="btn-copy-b-script" class="btn hidden">复制完整脚本</button>
+            <button type="button" id="btn-download-b-script" class="btn hidden">下载 .sh</button>
+          </div>
         </div>
       </form>
       <div id="b-script-steps-tip" class="banner pass hidden" style="margin-top:12px;margin-bottom:0">
-        <strong>执行步骤：</strong> 1) SSH 登录你的内网接收机 → 2) 点击上方「复制一键执行命令」直接粘贴到终端回车（非 root 用户请先 <code>sudo -i</code>）→ 3) 等待 5 秒，本页面该节点自动变「在线」并开始拉取文件。
+        <strong>执行步骤：</strong> 1) SSH 登录你的内网接收机 → 2) 点击上方「复制一键执行命令」粘贴到终端回车（非 root 请先 <code>sudo -i</code>）→ 3) 等待 5 秒，本页面该节点变「在线」后即可在网页选盘激活。
       </div>
       <div id="b-script-output" class="hidden" style="margin-top:10px"></div>
     </div>
   </div>
 
-  <!-- Dispatch Node Automated Install Script Modal (Admin Only · Works without Center SSH / Behind NAT or FRP) -->
+  <!-- Dispatch Node Automated Install / Reinstall Script Modal (Admin Only) -->
   <div id="a-script-modal" class="overlay hidden">
     <div class="modal-card wide">
       <div class="modal-head">
         <div>
-          <h3 id="a-script-title">分发节点自动化安装脚本</h3>
-          <p class="muted">适用于无直连 SSH 或无公网 IP（经 NAT / FRP 映射）的分发机；自动签发 TLS 证书、下载校验二进制并配置 systemd</p>
+          <h3 id="a-script-title">分发节点一键安装脚本</h3>
+          <p class="muted">适用于无直连 SSH、经 NAT/FRP 映射首次装机或换机重装；自动签发 TLS 证书并配置 systemd</p>
         </div>
         <button class="btn ghost" type="button" data-close-modal="a-script-modal">关闭</button>
+      </div>
+      <div id="a-script-running-warn" class="banner warn hidden" style="margin-bottom:12px">
+        <strong>提示：</strong>该分发节点当前已在线运行。日常增减缓存盘、调水位、暂停或版本热升级直接在控制台操作即可，无需重跑安装脚本。
       </div>
       <form id="a-script-form" class="form-stack">
         <input type="hidden" name="node_id" />
         <input type="hidden" name="node_token" />
-        <div class="form-grid-2">
-          <label>公网 / 映射访问地址 * (接收节点将连接此地址)
+
+        <div class="config-section">
+          <div class="config-section-title">1. 访问地址与磁盘接入</div>
+          <label><span class="form-label-text">公网 / NAT·FRP 映射访问地址 *（内网接收节点将连接此地址拉取文件）</span>
             <input name="public_addr" required placeholder="https://公网IP或域名:8443" autocomplete="off" />
           </label>
-          <label>选择分发节点版本包
-            <select id="a-script-release-select" name="release_id">
-              <option value="">自动匹配最新分发节点发布包</option>
-            </select>
+          <label class="toggle">
+            <input name="await_disk_selection" type="checkbox" checked />
+            <span>先激活上线，再在网页勾选物理缓存盘（推荐：自动扫盘，勾选后建 <code>relay-cache</code> 目录并激活）</span>
           </label>
-        </div>
-        <div class="form-grid-4">
-          <label>本机监听端口 (TLS)
-            <input name="public_port" type="number" value="8443" min="1" max="65535" />
-          </label>
-          <label>本机上传端口 (127.0.0.1)
-            <input name="local_port" type="number" value="18081" min="1" max="65535" />
-          </label>
-          <label>安装目录
-            <input name="install_dir" value="/opt/relay-agent-a" autocomplete="off" />
-          </label>
-          <label id="a-script-datadir-wrap">预设缓存目录 (可选)
+          <label id="a-script-datadir-wrap" class="hidden"><span>手动预设缓存目录</span>
             <input name="data_dir" value="/data/relay-a" autocomplete="off" />
           </label>
         </div>
-        <label class="toggle">
-          <input name="await_disk_selection" type="checkbox" checked />
-          <span>先激活上线，再在网页勾选物理数据盘 (推荐：上线自动扫描物理盘，勾选后自动创建 <code>relay-cache</code> 目录并激活)</span>
-        </label>
-        <div class="btn-row">
+
+        <details class="advanced-fold" id="a-script-adv-details">
+          <summary>2. 高级安装参数（传输端口 8443、本机上传端口 18081、安装目录、指定版本包）</summary>
+          <div class="advanced-fold-body">
+            <div class="form-grid-4">
+              <label>本机传输端口 (TLS)
+                <input name="public_port" type="number" value="8443" min="1" max="65535" />
+              </label>
+              <label>本机上传端口 (127.0.0.1)
+                <input name="local_port" type="number" value="18081" min="1" max="65535" />
+              </label>
+              <label>安装目录
+                <input name="install_dir" value="/opt/relay-agent-a" autocomplete="off" />
+              </label>
+              <label>目标版本包
+                <select id="a-script-release-select" name="release_id">
+                  <option value="">自动匹配最新分发节点发布包</option>
+                </select>
+              </label>
+            </div>
+          </div>
+        </details>
+
+        <div class="script-action-bar">
           <label class="toggle">
             <input name="rotate_token" type="checkbox" checked />
-            <span>自动生成并内嵌接入 Token (如该节点尚未运行请保持勾选)</span>
+            <span>自动生成并内嵌新接入密钥（首次安装请保持勾选）</span>
           </label>
-          <button type="submit" class="btn primary">生成自动化安装脚本</button>
-          <button type="button" id="btn-copy-a-exec" class="btn success hidden">复制一键执行命令</button>
-          <button type="button" id="btn-copy-a-script" class="btn hidden">复制完整脚本</button>
-          <button type="button" id="btn-download-a-script" class="btn hidden">下载 .sh</button>
+          <div class="btn-row">
+            <button type="submit" class="btn primary">生成一键安装脚本</button>
+            <button type="button" id="btn-copy-a-exec" class="btn success hidden">复制一键执行命令</button>
+            <button type="button" id="btn-copy-a-script" class="btn hidden">复制完整脚本</button>
+            <button type="button" id="btn-download-a-script" class="btn hidden">下载 .sh</button>
+          </div>
         </div>
       </form>
       <div id="a-script-token-box" class="token-box hidden"></div>

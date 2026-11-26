@@ -1461,19 +1461,23 @@ function renderNodes(nodes, winHours) {
     const checked = selectedNodes.agent_a.has(n.id) ? 'checked' : '';
     const diskAlerts = analyzeNodeDiskAlerts(n);
     const rowCls = n.awaiting_disk ? 'row-awaiting-disk' : (diskAlerts.detached > 0 ? 'row-disk-alert' : '');
+    const neverConnected = !n.online && !n.last_seen_at;
     const diskBtn = n.awaiting_disk
       ? `<button class="btn sm activate" data-action="edit-a-disks" data-id="${esc(n.id)}">⚡ 选择数据盘并激活</button>`
-      : `<button class="btn sm primary" data-action="edit-a-disks" data-id="${esc(n.id)}">管理数据盘</button>`;
-    const pauseBtn = n.paused
+      : `<button class="btn sm ${neverConnected ? '' : 'primary'}" data-action="edit-a-disks" data-id="${esc(n.id)}">管理数据盘</button>`;
+    const pauseBtn = neverConnected ? '' : (n.paused
       ? `<button class="btn sm success" data-action="toggle-pause-node" data-id="${esc(n.id)}" data-paused="1">启动</button>`
-      : `<button class="btn sm warn" data-action="toggle-pause-node" data-id="${esc(n.id)}" data-paused="0">暂停</button>`;
+      : `<button class="btn sm warn" data-action="toggle-pause-node" data-id="${esc(n.id)}" data-paused="0">暂停</button>`);
+    const scriptBtn = neverConnected
+      ? `<button class="btn sm primary" data-action="open-a-script" data-id="${esc(n.id)}">获取安装脚本</button>`
+      : '';
     return `
       <tr class="${rowCls}">
         <td><input type="checkbox" class="node-chk" data-role="agent_a" data-id="${esc(n.id)}" ${checked} /></td>
         <td><strong>${esc(n.name)}</strong><div class="mono muted">${esc(n.id)}</div></td>
         <td>
           <div style="display:flex;gap:4px;flex-wrap:wrap;align-items:center">
-            <span class="badge ${n.online ? 'online pulse' : 'offline'}">${n.online ? '在线' : '离线'}</span>
+            <span class="badge ${n.online ? 'online pulse' : 'offline'}">${n.online ? '在线' : (neverConnected ? '待装机' : '离线')}</span>
             ${n.awaiting_disk ? '<span class="badge awaiting">待选盘 · 未激活</span>' : ''}
             ${n.paused ? '<span class="badge alarm">已暂停</span>' : ''}
             ${n.disk_alarm && diskAlerts.detached === 0 ? '<span class="badge alarm">水位告警</span>' : ''}
@@ -1494,9 +1498,9 @@ function renderNodes(nodes, winHours) {
         </td>
         <td>
           <div class="btn-row">
+            ${scriptBtn}
             ${diskBtn}
             ${pauseBtn}
-            <button class="btn sm" data-action="open-a-script" data-id="${esc(n.id)}">安装脚本</button>
             <button class="btn sm danger" data-action="delete-node" data-id="${esc(n.id)}">删除</button>
           </div>
         </td>
@@ -1509,19 +1513,23 @@ function renderNodes(nodes, winHours) {
     const checked = selectedNodes.agent_b.has(n.id) ? 'checked' : '';
     const diskAlerts = analyzeNodeDiskAlerts(n);
     const rowCls = n.awaiting_disk ? 'row-awaiting-disk' : (diskAlerts.detached > 0 ? 'row-disk-alert' : '');
+    const neverConnected = !n.online && !n.last_seen_at;
     const cfgBtn = n.awaiting_disk
       ? `<button class="btn sm activate" data-action="edit-node-projects" data-id="${esc(n.id)}">⚡ 选择数据盘并激活</button>`
-      : `<button class="btn sm primary" data-action="edit-node-projects" data-id="${esc(n.id)}">配置项目与磁盘</button>`;
-    const pauseBtn = n.paused
+      : `<button class="btn sm ${neverConnected ? '' : 'primary'}" data-action="edit-node-projects" data-id="${esc(n.id)}">配置项目与磁盘</button>`;
+    const pauseBtn = neverConnected ? '' : (n.paused
       ? `<button class="btn sm success" data-action="toggle-pause-node" data-id="${esc(n.id)}" data-paused="1">启动</button>`
-      : `<button class="btn sm warn" data-action="toggle-pause-node" data-id="${esc(n.id)}" data-paused="0">暂停</button>`;
+      : `<button class="btn sm warn" data-action="toggle-pause-node" data-id="${esc(n.id)}" data-paused="0">暂停</button>`);
+    const scriptBtn = neverConnected
+      ? `<button class="btn sm primary" data-action="open-b-script" data-id="${esc(n.id)}">获取安装脚本</button>`
+      : '';
     return `
       <tr class="${rowCls}">
         <td><input type="checkbox" class="node-chk" data-role="agent_b" data-id="${esc(n.id)}" ${checked} /></td>
         <td><strong>${esc(n.name)}</strong><div class="mono muted">${esc(n.id)}</div></td>
         <td>
           <div style="display:flex;gap:4px;flex-wrap:wrap;align-items:center">
-            <span class="badge ${n.online ? 'online pulse' : 'offline'}">${n.online ? '在线' : '离线'}</span>
+            <span class="badge ${n.online ? 'online pulse' : 'offline'}">${n.online ? '在线' : (neverConnected ? '待装机' : '离线')}</span>
             ${n.awaiting_disk ? '<span class="badge awaiting">待选盘 · 未激活</span>' : ''}
             ${n.paused ? '<span class="badge alarm">已暂停</span>' : ''}
             ${renderNodeDiskAlertBadges(n)}
@@ -1541,9 +1549,9 @@ function renderNodes(nodes, winHours) {
         </td>
         <td>
           <div class="btn-row">
+            ${scriptBtn}
             ${cfgBtn}
             ${pauseBtn}
-            <button class="btn sm" data-action="open-b-script" data-id="${esc(n.id)}">安装脚本</button>
             <button class="btn sm danger" data-action="delete-node" data-id="${esc(n.id)}">删除</button>
           </div>
         </td>
@@ -2419,11 +2427,17 @@ function openEditNodeProjectsModal(nodeId) {
 
 function syncBScriptMode() {
   const form = document.getElementById('b-script-form');
+  if (!form) return;
   const mode = form.elements.script_mode.value || 'await';
-  document.getElementById('b-script-await-wrap')?.classList.toggle('hidden', mode !== 'await');
-  document.getElementById('b-script-pool-wrap').classList.toggle('hidden', mode !== 'pool');
-  document.getElementById('b-script-single-wrap').classList.toggle('hidden', mode !== 'single');
-  document.getElementById('b-script-multi-wrap').classList.toggle('hidden', mode !== 'multi');
+  const isManual = mode === 'manual';
+  document.getElementById('b-script-await-wrap')?.classList.toggle('hidden', isManual);
+  document.getElementById('b-script-manual-wrap')?.classList.toggle('hidden', !isManual);
+  if (isManual) {
+    const sub = form.elements.manual_submode?.value || 'pool';
+    document.getElementById('b-script-pool-wrap')?.classList.toggle('hidden', sub !== 'pool');
+    document.getElementById('b-script-single-wrap')?.classList.toggle('hidden', sub !== 'single');
+    document.getElementById('b-script-multi-wrap')?.classList.toggle('hidden', sub !== 'multi');
+  }
 }
 
 function openBScriptModal(nodeId, presetToken = '') {
@@ -2435,7 +2449,13 @@ function openBScriptModal(nodeId, presetToken = '') {
   if (!presetToken && node && !node.online) {
     form.elements.rotate_token.checked = true;
   }
-  document.getElementById('b-script-title').textContent = `内网接收节点一键激活脚本: ${nodeId}`;
+  const isReinstall = !!(node && (node.online || node.last_seen_at));
+  document.getElementById('b-script-title').textContent = isReinstall
+    ? `内网接收节点重装 / 迁移脚本: ${node.name || nodeId}`
+    : `内网接收节点一键安装脚本: ${(node && node.name) || nodeId}`;
+  document.getElementById('b-script-running-warn')?.classList.toggle('hidden', !(node && node.online));
+  const advDet = document.getElementById('b-script-adv-details');
+  if (advDet) advDet.open = false;
   document.getElementById('b-script-output').classList.add('hidden');
   document.getElementById('b-script-steps-tip').classList.add('hidden');
   document.getElementById('btn-copy-b-exec').classList.add('hidden');
@@ -2446,7 +2466,8 @@ function openBScriptModal(nodeId, presetToken = '') {
   const nodeProjs = (node && node.projects) || [];
   const defaultProj = nodeProjs.length === 1 ? nodeProjs[0] : (cachedProjects[0]?.project?.id || '');
   populateProjectSelect(document.getElementById('b-script-single-project'), defaultProj, false);
-  form.elements.script_mode.value = (node && node.storage_dirs && node.storage_dirs.length) ? 'pool' : 'await';
+  form.elements.script_mode.value = 'await';
+  if (form.elements.manual_submode) form.elements.manual_submode.value = 'pool';
   form.elements.storage_dirs.value = (node && node.storage_dirs && node.storage_dirs.length)
     ? node.storage_dirs.join('\n')
     : '/mnt/sda/relay-delivery\n/mnt/sdb/relay-delivery';
@@ -2468,7 +2489,13 @@ function openAScriptModal(nodeId, presetToken = '') {
   form.elements.rotate_token.checked = !presetToken && !(node && node.online);
   form.elements.await_disk_selection.checked = true;
   document.getElementById('a-script-datadir-wrap')?.classList.add('hidden');
-  document.getElementById('a-script-title').textContent = `分发节点一键激活脚本: ${nodeId}`;
+  const isReinstall = !!(node && (node.online || node.last_seen_at));
+  document.getElementById('a-script-title').textContent = isReinstall
+    ? `分发节点重装 / 迁移脚本: ${node.name || nodeId}`
+    : `分发节点一键安装脚本: ${(node && node.name) || nodeId}`;
+  document.getElementById('a-script-running-warn')?.classList.toggle('hidden', !(node && node.online));
+  const advDet = document.getElementById('a-script-adv-details');
+  if (advDet) advDet.open = false;
   document.getElementById('a-script-output').classList.add('hidden');
   document.getElementById('a-script-token-box').classList.add('hidden');
   document.getElementById('btn-copy-a-exec').classList.add('hidden');
@@ -3201,13 +3228,28 @@ function setupEvents() {
     }
   });
 
+  document.getElementById('b-script-manual-submode')?.addEventListener('change', syncBScriptMode);
+  document.getElementById('btn-open-b-reinstall-script')?.addEventListener('click', () => {
+    const nodeId = document.getElementById('edit-node-form')?.elements?.node_id?.value;
+    if (!nodeId) return;
+    closeModal('edit-node-modal');
+    openBScriptModal(nodeId);
+  });
+  document.getElementById('btn-open-a-reinstall-script')?.addEventListener('click', () => {
+    const nodeId = document.getElementById('edit-a-disks-form')?.elements?.node_id?.value;
+    if (!nodeId) return;
+    closeModal('edit-a-disks-modal');
+    openAScriptModal(nodeId);
+  });
+
   // Receiver Install Script generator
   let lastBScript = '';
   let lastBScriptNodeId = '';
   document.getElementById('b-script-form').addEventListener('submit', async (e) => {
     e.preventDefault();
     const fd = new FormData(e.target);
-    const scriptMode = String(fd.get('script_mode') || 'await');
+    const topMode = String(fd.get('script_mode') || 'await');
+    const scriptMode = topMode === 'manual' ? String(fd.get('manual_submode') || 'pool') : 'await';
     const body = {
       node_id: fd.get('node_id'),
       node_token: fd.get('node_token'),
@@ -3224,7 +3266,7 @@ function setupEvents() {
         .map(s => s.trim())
         .filter(Boolean);
       if (!storageDirs.length) {
-        showToast('请至少填写一个物理磁盘根目录 (storage_dirs)', 'error');
+        showToast('请至少填写一个物理磁盘根目录', 'error');
         return;
       }
       body.storage_dirs = storageDirs;
