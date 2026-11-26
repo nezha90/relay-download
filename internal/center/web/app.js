@@ -806,7 +806,148 @@ function renderTrendChart(days) {
   `;
 }
 
+function syncProjectGuideSelect(projects) {
+  const sel = document.getElementById('guide-p-project-select');
+  const inp = document.getElementById('guide-p-project-input');
+  if (!sel || !inp) return;
+  const ids = (projects || []).map(ps => ps.project?.id).filter(Boolean);
+  const prev = sel.value;
+  const opts = ids.map(id => `<option value="${esc(id)}">${esc(id)}</option>`);
+  opts.push('<option value="__custom__">自定义新项目 ID...</option>');
+  sel.innerHTML = opts.join('');
+  if (prev && (ids.includes(prev) || prev === '__custom__')) {
+    sel.value = prev;
+  } else if (ids.length > 0) {
+    sel.value = ids[0];
+    if (!inp.dataset.userEdited) {
+      inp.value = ids[0];
+    }
+  } else {
+    sel.value = '__custom__';
+  }
+  renderProjectGuideSnippets();
+}
+
+function renderProjectGuideSnippets() {
+  const inp = document.getElementById('guide-p-project-input');
+  const portEl = document.getElementById('guide-p-port');
+  const tokEl = document.getElementById('guide-p-token');
+  if (!inp || !portEl || !tokEl) return;
+
+  const proj = (inp.value || 'my-project').trim().replace(/[^A-Za-z0-9._-]/g, '') || 'my-project';
+  const port = Math.max(1, Math.min(65535, Number(portEl.value || 18081) || 18081));
+  const tok = (tokEl.value || '').trim() || '<你的_X_LOCAL_TOKEN>';
+  const base = `http://127.0.0.1:${port}`;
+
+  const setText = (id, text) => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = text;
+  };
+
+  setText('code-p-put',
+`# 单文件流式 PUT（支持任意相对子目录，新项目自动建档）
+curl -fsS -X PUT \\
+  -H "X-Local-Token: ${tok}" \\
+  --data-binary @./sample.mp4 \\
+  "${base}/local/v1/files/${proj}/videos/sample.mp4"`);
+
+  setText('code-p-put-sha',
+`# 先算 SHA256 再上传，服务端落盘前强校验
+SHA=$(sha256sum ./sample.mp4 | awk '{print $1}')
+curl -fsS -X PUT \\
+  -H "X-Local-Token: ${tok}" \\
+  -H "X-Expected-SHA256: $SHA" \\
+  --data-binary @./sample.mp4 \\
+  "${base}/local/v1/files/${proj}/videos/sample.mp4"`);
+
+  setText('code-p-multipart',
+`# Multipart 表单上传（兼容传统上传表单）
+curl -fsS -X POST \\
+  -H "X-Local-Token: ${tok}" \\
+  -F "project=${proj}" \\
+  -F "filename=videos/sample.mp4" \\
+  -F "file=@./sample.mp4" \\
+  "${base}/local/v1/upload"`);
+
+  setText('code-p-reg',
+`# 文件已在本机磁盘时零拷贝入队（mode: move=原子移入 | hardlink=保留源文件）
+curl -fsS -X POST \\
+  -H "X-Local-Token: ${tok}" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "project_id": "${proj}",
+    "local_path": "/data/incoming/001.opus",
+    "filename": "2026/001.opus",
+    "mode": "move"
+  }' \\
+  "${base}/local/v1/register"`);
+
+  setText('code-p-reg-batch',
+`# 批量零拷贝注册入队（单次最多 256 个文件，适合亿级海量文件）
+curl -fsS -X POST \\
+  -H "X-Local-Token: ${tok}" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "items": [
+      {"project_id": "${proj}", "local_path": "/data/in/v1.m4a", "filename": "v1.m4a", "mode": "move"},
+      {"project_id": "${proj}", "local_path": "/data/in/v1.info.json", "filename": "v1.info.json", "mode": "move"}
+    ]
+  }' \\
+  "${base}/local/v1/register-batch"`);
+
+  setText('code-p-python',
+`import time, hashlib, pathlib, requests
+
+BASE = "${base}"
+TOKEN = "${tok}"
+PROJECT = "${proj}"
+
+def push_file(local_path: str, rel_name: str):
+    p = pathlib.Path(local_path)
+    sha = hashlib.sha256(p.read_bytes()).hexdigest()
+    url = f"{BASE}/local/v1/files/{PROJECT}/{rel_name.lstrip('/')}"
+    headers = {"X-Local-Token": TOKEN, "X-Expected-SHA256": sha}
+    for attempt in range(10):
+        with p.open("rb") as f:
+            r = requests.put(url, headers=headers, data=f, timeout=600)
+        if r.status_code == 200:
+            return r.json()  # {"file_id": ..., "status": "ready"}
+        if r.status_code in (503, 507):  # 待选盘激活 或 触发 85% 强制水位保护
+            time.sleep(min(30, 2 ** attempt))
+            continue
+        r.raise_for_status()
+    raise RuntimeError("upload retry exhausted")
+
+print(push_file("./sample.mp4", "videos/sample.mp4"))`);
+
+  setText('code-p-status',
+`# 查询本机分发节点当前排队数与磁盘水位（summary=1 轻量模式）
+curl -fsS \\
+  -H "X-Local-Token: ${tok}" \\
+  "${base}/local/v1/status?project=${proj}&summary=1"`);
+}
+
+function openProjectQuickGuide(projectId) {
+  const body = document.getElementById('guide-p-body');
+  const card = document.getElementById('guide-p-card');
+  const btn = card?.querySelector('button[data-toggle-guide="guide-p-body"]');
+  if (body) body.classList.remove('hidden');
+  if (btn) btn.textContent = '收起指南';
+  const sel = document.getElementById('guide-p-project-select');
+  const inp = document.getElementById('guide-p-project-input');
+  if (projectId && inp) {
+    inp.value = projectId;
+    inp.dataset.userEdited = '1';
+    if (sel) {
+      sel.value = Array.from(sel.options).some(o => o.value === projectId) ? projectId : '__custom__';
+    }
+    renderProjectGuideSnippets();
+  }
+  card?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
 function renderProjects(projects, winHours) {
+  syncProjectGuideSelect(projects);
   const el = document.getElementById('projects-grid');
   const winLbl = windowLabel(winHours);
   const cust = isCustomer();
@@ -836,6 +977,7 @@ function renderProjects(projects, winHours) {
     const quotaBadge = quotaParts.length ? `<span class="badge alarm">${esc(quotaParts.join(' · '))}</span>` : '';
     const actionsHtml = cust ? '' : `
           <div style="display:flex;gap:6px">
+            <button class="btn sm" data-action="quick-integrate-project" data-id="${esc(p.id)}">HTTP 接入</button>
             <button class="btn sm" data-action="edit-project" data-id="${esc(p.id)}">编辑策略</button>
             <button class="btn sm danger" data-action="delete-project" data-id="${esc(p.id)}">删除</button>
           </div>
@@ -2112,13 +2254,33 @@ function setupEvents() {
       closeModal(closeBtn.dataset.closeModal);
       return;
     }
-    const guideToggle = e.target.closest('button[data-toggle-guide]');
+    const guideToggle = e.target.closest('[data-toggle-guide]');
     if (guideToggle) {
-      const bodyEl = document.getElementById(guideToggle.dataset.toggleGuide);
+      const targetId = guideToggle.dataset.toggleGuide;
+      const bodyEl = document.getElementById(targetId);
+      const cardEl = guideToggle.closest('.guide-card');
+      const btnEl = cardEl ? cardEl.querySelector(`button[data-toggle-guide="${targetId}"]`) : guideToggle;
       if (bodyEl) {
         const nowHidden = bodyEl.classList.toggle('hidden');
-        guideToggle.textContent = nowHidden ? '展开指南' : '收起指南';
+        if (btnEl) btnEl.textContent = nowHidden ? '展开指南' : '收起指南';
       }
+      return;
+    }
+    const guidePBtn = e.target.closest('button[data-guide-p-mode]');
+    if (guidePBtn) {
+      const mode = guidePBtn.dataset.guidePMode;
+      document.querySelectorAll('button[data-guide-p-mode]').forEach(b => {
+        b.classList.toggle('active', b.dataset.guidePMode === mode);
+      });
+      ['http', 'register', 'python', 'status'].forEach(k => {
+        document.getElementById(`guide-p-pane-${k}`)?.classList.toggle('hidden', k !== mode);
+      });
+      return;
+    }
+    const copyElBtn = e.target.closest('button[data-copy-el]');
+    if (copyElBtn) {
+      const srcEl = document.getElementById(copyElBtn.dataset.copyEl);
+      if (srcEl) copyText(srcEl.textContent || '', '接入代码已复制到剪贴板');
       return;
     }
     const guideModeBtn = e.target.closest('button[data-guide-a-mode]');
@@ -2151,6 +2313,7 @@ function setupEvents() {
     if (!btn) return;
     const id = btn.dataset.id || '';
     switch (btn.dataset.action) {
+      case 'quick-integrate-project': openProjectQuickGuide(id); break;
       case 'edit-project': openProjectModal(id); break;
       case 'delete-project': deleteProject(id); break;
       case 'toggle-pause-node': togglePauseNode(id, btn.dataset.paused === '1'); break;
@@ -2174,6 +2337,23 @@ function setupEvents() {
   document.getElementById('btn-copy-b-check-cmd')?.addEventListener('click', () => {
     copyText(checkCmd, '连通性探测命令已复制到剪贴板');
   });
+
+  // Project HTTP quick integration live snippet inputs
+  document.getElementById('guide-p-project-select')?.addEventListener('change', (e) => {
+    const inp = document.getElementById('guide-p-project-input');
+    if (inp && e.target.value && e.target.value !== '__custom__') {
+      inp.value = e.target.value;
+      inp.dataset.userEdited = '1';
+    }
+    renderProjectGuideSnippets();
+  });
+  document.getElementById('guide-p-project-input')?.addEventListener('input', (e) => {
+    e.target.dataset.userEdited = '1';
+    renderProjectGuideSnippets();
+  });
+  document.getElementById('guide-p-port')?.addEventListener('input', renderProjectGuideSnippets);
+  document.getElementById('guide-p-token')?.addEventListener('input', renderProjectGuideSnippets);
+  renderProjectGuideSnippets();
 
   document.addEventListener('change', (e) => {
     const chk = e.target.closest('input.node-chk');

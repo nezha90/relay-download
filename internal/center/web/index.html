@@ -118,6 +118,147 @@
         </div>
         <button id="open-create-project" class="btn primary" data-admin-only="1">+ 新建项目</button>
       </div>
+
+      <!-- Project HTTP Quick Integration Guide (Admin Only, Collapsed by Default) -->
+      <div class="card guide-card" id="guide-p-card" data-admin-only="1">
+        <div class="guide-head" data-toggle-guide="guide-p-body">
+          <div class="guide-head-left">
+            <span class="badge accent">HTTP 快速接入</span>
+            <h3>业务方如何向项目推送文件？（PUT 流式直传 / 表单上传 / 零拷贝批量注册 / Python 示例）</h3>
+          </div>
+          <button type="button" class="btn sm ghost" data-toggle-guide="guide-p-body">展开指南</button>
+        </div>
+        <div id="guide-p-body" class="guide-body hidden">
+          <div class="concept-box">
+            <strong>接口接入说明：</strong> 业务方在<strong>分发节点本机</strong>调用 <code>http://127.0.0.1:&lt;本机上传端口&gt;</code>（默认 <code>18081</code>），在请求头携带 <code>X-Local-Token</code> 密钥即可安全推送文件（密钥可在分发机 <code>/opt/relay-agent-a/config.json</code> 的 <code>local_token</code> 字段查看）。<strong>新项目无需提前建档</strong>，首次上传自动创建项目隔离目录；如需自定义冲突覆盖/全局限速，先点右上角「+ 新建项目」即可。
+          </div>
+
+          <div class="api-var-bar">
+            <label class="api-var-item">
+              <span>选择/填写项目 ID</span>
+              <div style="display:flex;gap:6px">
+                <select id="guide-p-project-select" class="window-select"></select>
+                <input id="guide-p-project-input" type="text" placeholder="my-project" value="my-project" autocomplete="off" />
+              </div>
+            </label>
+            <label class="api-var-item" style="max-width:130px">
+              <span>本机上传端口</span>
+              <input id="guide-p-port" type="number" value="18081" min="1" max="65535" />
+            </label>
+            <label class="api-var-item" style="flex:1.2">
+              <span>X-Local-Token（可选，填入后下方命令直接可用）</span>
+              <input id="guide-p-token" type="text" placeholder="<替换为分发节点的 X-Local-Token>" autocomplete="off" />
+            </label>
+          </div>
+
+          <div class="guide-subtabs" role="tablist">
+            <button type="button" class="guide-subtab active" data-guide-p-mode="http">1. HTTP PUT / POST 上传（推荐）</button>
+            <button type="button" class="guide-subtab" data-guide-p-mode="register">2. 本机零拷贝注册（亿级批量）</button>
+            <button type="button" class="guide-subtab" data-guide-p-mode="python">3. Python 接入示例（含水位重试）</button>
+            <button type="button" class="guide-subtab" data-guide-p-mode="status">4. 状态查询与错误码规范</button>
+          </div>
+
+          <div id="guide-p-pane-http" class="api-pane">
+            <div class="api-snippet-grid">
+              <div class="api-snippet-card">
+                <div class="api-snippet-head">
+                  <div>
+                    <span class="badge online">推荐 · 流式大文件</span>
+                    <strong>PUT 原始流直传（支持多级子目录）</strong>
+                  </div>
+                  <button type="button" class="btn sm" data-copy-el="code-p-put">一键复制</button>
+                </div>
+                <div class="muted">路径格式：<code>PUT /local/v1/files/{项目ID}/{相对路径文件名}</code>，流式落盘零内存爆涨。</div>
+                <pre id="code-p-put" class="code-block"></pre>
+              </div>
+              <div class="api-snippet-card">
+                <div class="api-snippet-head">
+                  <div>
+                    <span class="badge accent">强校验</span>
+                    <strong>PUT 带 SHA256 端到端校验</strong>
+                  </div>
+                  <button type="button" class="btn sm" data-copy-el="code-p-put-sha">一键复制</button>
+                </div>
+                <div class="muted">附加 <code>X-Expected-SHA256</code> 头，不匹配直接返回 <code>400</code> 拒收，杜绝源端损坏。</div>
+                <pre id="code-p-put-sha" class="code-block"></pre>
+              </div>
+            </div>
+            <div class="api-snippet-card" style="margin-top:10px">
+              <div class="api-snippet-head">
+                <div>
+                  <span class="badge">兼容表单</span>
+                  <strong>POST Multipart 表单上传（<code>/local/v1/upload</code>）</strong>
+                </div>
+                <button type="button" class="btn sm" data-copy-el="code-p-multipart">一键复制</button>
+              </div>
+              <div class="muted">适合已有 Web/SDK 表单上传逻辑；也支持直接 POST 二进制流并附带 Header <code>X-Project</code> 与 <code>X-Filename</code>。</div>
+              <pre id="code-p-multipart" class="code-block"></pre>
+            </div>
+          </div>
+
+          <div id="guide-p-pane-register" class="api-pane hidden">
+            <div class="api-snippet-grid">
+              <div class="api-snippet-card">
+                <div class="api-snippet-head">
+                  <div>
+                    <span class="badge online">零拷贝 · 极速</span>
+                    <strong>单文件本地注册（<code>POST /local/v1/register</code>）</strong>
+                  </div>
+                  <button type="button" class="btn sm" data-copy-el="code-p-reg">一键复制</button>
+                </div>
+                <div class="muted">文件已在分发机磁盘上时，同盘 <code>move</code> 原子改名或 <code>hardlink</code> 硬链接（不删源文件），免 HTTP 重复拷贝。</div>
+                <pre id="code-p-reg" class="code-block"></pre>
+              </div>
+              <div class="api-snippet-card">
+                <div class="api-snippet-head">
+                  <div>
+                    <span class="badge accent">单次最多 256 个</span>
+                    <strong>批量注册入队（<code>POST /local/v1/register-batch</code>）</strong>
+                  </div>
+                  <button type="button" class="btn sm" data-copy-el="code-p-reg-batch">一键复制</button>
+                </div>
+                <div class="muted">亿级小文件 / 采集落盘场景首选，单事务批量写入队列，吞吐提升 10x+。</div>
+                <pre id="code-p-reg-batch" class="code-block"></pre>
+              </div>
+            </div>
+          </div>
+
+          <div id="guide-p-pane-python" class="api-pane hidden">
+            <div class="api-snippet-card">
+              <div class="api-snippet-head">
+                <div>
+                  <span class="badge online">Python 3 标准示例</span>
+                  <strong>流式上传 + 自动处理 507 水位退避重试</strong>
+                </div>
+                <button type="button" class="btn sm" data-copy-el="code-p-python">一键复制</button>
+              </div>
+              <div class="muted">依赖 <code>requests</code>（或换成标准库 <code>urllib</code>）；遇到 <code>503</code>（待选盘）或 <code>507</code>（磁盘水位满）自动退避等待，确保业务零丢包。</div>
+              <pre id="code-p-python" class="code-block"></pre>
+            </div>
+          </div>
+
+          <div id="guide-p-pane-status" class="api-pane hidden">
+            <div class="api-snippet-card" style="margin-bottom:10px">
+              <div class="api-snippet-head">
+                <div>
+                  <span class="badge accent">健康与积压探针</span>
+                  <strong>查询项目排队与磁盘水位（<code>GET /local/v1/status</code>）</strong>
+                </div>
+                <button type="button" class="btn sm" data-copy-el="code-p-status">一键复制</button>
+              </div>
+              <pre id="code-p-status" class="code-block"></pre>
+            </div>
+            <div class="api-codes-grid">
+              <div class="api-code-item"><span class="badge online">200 OK</span><span>入队成功，返回 <code>{"file_id","project_id","filename","size","sha256","status":"ready"}</code></span></div>
+              <div class="api-code-item"><span class="badge offline">400</span><span>项目 ID 非法（仅允许 <code>A-Za-z0-9._-</code> 1~64 位）、文件名非法或 SHA256 不一致</span></div>
+              <div class="api-code-item"><span class="badge offline">401 / 403</span><span><code>X-Local-Token</code> 无效，或该分发节点已限制只允许特定项目</span></div>
+              <div class="api-code-item"><span class="badge awaiting">503</span><span>分发节点尚未在控制台勾选激活数据盘，请前往「分发节点」选盘激活</span></div>
+              <div class="api-code-item"><span class="badge alarm">507</span><span>触发强制安全水位（≥85% 或剩余 ≤10GB），上游退避几秒重试即可，绝不写爆磁盘</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <div id="projects-grid" class="card-grid"></div>
     </section>
 
@@ -131,16 +272,16 @@
         </div>
       </div>
 
-      <!-- Dispatch Node Step-by-Step Guide -->
+      <!-- Dispatch Node Step-by-Step Guide (Collapsed by Default) -->
       <div class="card guide-card" id="guide-a-card">
-        <div class="guide-head">
+        <div class="guide-head" data-toggle-guide="guide-a-body">
           <div class="guide-head-left">
             <span class="badge accent">操作指南</span>
             <h3>什么是分发节点？如何 4 步新增部署（支持 SSH 全自动 / 无公网 NAT·FRP 脚本）</h3>
           </div>
-          <button type="button" class="btn sm ghost" data-toggle-guide="guide-a-body">收起指南</button>
+          <button type="button" class="btn sm ghost" data-toggle-guide="guide-a-body">展开指南</button>
         </div>
-        <div id="guide-a-body" class="guide-body">
+        <div id="guide-a-body" class="guide-body hidden">
           <div class="concept-box">
             <strong>什么是「分发节点」？</strong> 分发节点是部署在源端/中转机上的服务程序（<code>relay-agent-a</code>）：它在本机 <code>127.0.0.1:18081</code> 接收业务方或采集器推送的文件，并通过 TLS 1.3 加密端口（默认 <code>8443</code>）高速分发给所有内网接收节点；文件确认安全落盘后自动清理中转缓存。
           </div>
@@ -237,16 +378,16 @@
         <button id="open-create-node-b" class="btn primary">+ 注册接收节点</button>
       </div>
 
-      <!-- Receiver Node Step-by-Step Guide (Visible to BOTH Admin & Customer) -->
+      <!-- Receiver Node Step-by-Step Guide (Visible to BOTH Admin & Customer, Collapsed by Default) -->
       <div class="card guide-card" id="guide-b-card">
-        <div class="guide-head">
+        <div class="guide-head" data-toggle-guide="guide-b-body">
           <div class="guide-head-left">
             <span class="badge online">新手必看 · 无需公网 IP</span>
             <h3>什么是接收节点？如何 4 步接入一台新的内网落盘机器</h3>
           </div>
-          <button type="button" class="btn sm ghost" data-toggle-guide="guide-b-body">收起指南</button>
+          <button type="button" class="btn sm ghost" data-toggle-guide="guide-b-body">展开指南</button>
         </div>
-        <div id="guide-b-body" class="guide-body">
+        <div id="guide-b-body" class="guide-body hidden">
           <div class="concept-box">
             <strong>什么是「接收节点」？</strong> 接收节点就是你<strong>本地机房 / NAS / 用来最终存文件的 Linux 硬盘服务器</strong>（上面运行 <code>relay-agent-b</code> 客户端）。它<strong>完全不需要公网 IP，也不需要路由器端口映射或开放任何入站防火墙</strong>——只要机器能正常访问外网 HTTPS，就会主动向中心拉取任务并高速写盘，落盘校验完成后自动通知上游释放空间。
           </div>
