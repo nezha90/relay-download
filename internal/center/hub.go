@@ -232,6 +232,18 @@ func (h *Hub) RemoveNode(nodeID string) {
 	h.DisconnectSSE(nodeID)
 }
 
+// MarkAgentAOffline immediately marks a gracefully shutting-down dispatch node offline so
+// receivers stop discovering or claiming from it without waiting for node_offline_sec.
+func (h *Hub) MarkAgentAOffline(nodeID string) {
+	h.mu.Lock()
+	if st, ok := h.aNodes[nodeID]; ok {
+		st.LastSeen = time.Time{}
+		st.Availability = make(map[string]protocol.ProjectAvailability)
+		st.ActiveStreams = 0
+	}
+	h.mu.Unlock()
+}
+
 // UpdateNodeProjects updates in-memory project restrictions for a node and disconnects its SSE
 // streams so updated single-project / multi-project subscriptions take effect immediately.
 func (h *Hub) UpdateNodeProjects(nodeID string, projects []string) {

@@ -15,6 +15,7 @@ import (
 	"io"
 	"log/slog"
 	"math/rand/v2"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -31,6 +32,13 @@ import (
 	"relay-download/internal/updater"
 	"relay-download/internal/version"
 )
+
+var errPeerDraining = errors.New("dispatch node is shutting down")
+
+type ackBackoffState struct {
+	failures  int
+	nextRetry time.Time
+}
 
 type cachedDiscover struct {
 	resp      *protocol.DiscoverResp
@@ -61,6 +69,10 @@ type Agent struct {
 
 	discMu    sync.Mutex
 	discCache map[string]cachedDiscover
+
+	peerMu         sync.Mutex
+	peerCooldown   map[string]time.Time
+	ackPeerBackoff map[string]ackBackoffState
 
 	dirMu           sync.RWMutex
 	directiveMode   string              // "" | "all" | "selected"
@@ -162,10 +174,15 @@ func New(cfg *Config, logger *slog.Logger) (*Agent, error) {
 			apiIdleTimeout = 5 * time.Second
 		}
 	}
+	fastDialer := &net.Dialer{
+		Timeout:   5 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
 	makeAPIClient := func() *http.Client {
 		return &http.Client{
 			Timeout: 15 * time.Second,
 			Transport: &http.Transport{
+				DialContext:           fastDialer.DialContext,
 				TLSClientConfig:       clientTLS.Clone(),
 				ForceAttemptHTTP2:     true,
 				MaxIdleConns:          32,
@@ -181,6 +198,7 @@ func New(cfg *Config, logger *slog.Logger) (*Agent, error) {
 		return &http.Client{
 			// No overall Timeout on streaming/SSE client; bounded by ctx cancellation.
 			Transport: &http.Transport{
+				DialContext:           fastDialer.DialContext,
 				TLSClientConfig:       clientTLS.Clone(),
 				ForceAttemptHTTP2:     true,
 				MaxIdleConns:          8,
@@ -247,6 +265,7 @@ func New(cfg *Config, logger *slog.Logger) (*Agent, error) {
 			h1TLS.NextProtos = []string{"http/1.1"}
 			return &http.Client{
 				Transport: &http.Transport{
+					DialContext:           fastDialer.DialContext,
 					TLSClientConfig:       h1TLS,
 					ForceAttemptHTTP2:     false,
 					TLSNextProto:          make(map[string]func(authority string, c *tls.Conn) http.RoundTripper),
@@ -294,6 +313,8 @@ func New(cfg *Config, logger *slog.Logger) (*Agent, error) {
 		ackWakeCh:       make(chan struct{}, 1),
 		hbWakeCh:        make(chan struct{}, 1),
 		discCache:       make(map[string]cachedDiscover),
+		peerCooldown:    make(map[string]time.Time),
+		ackPeerBackoff:  make(map[string]ackBackoffState),
 		projectSchedule:  cfg.ProjectSchedule,
 		diskPolicy:       cfg.DiskPolicy,
 		diskAffinity:     cfg.DiskAffinityEnabled(),
@@ -1596,6 +1617,41 @@ func (a *Agent) availableDiskForProject(projectID string) uint64 {
 	return best
 }
 
+func (a *Agent) markPeerDead(nodeID string, dur time.Duration) {
+	if nodeID == "" {
+		return
+	}
+	a.peerMu.Lock()
+	if a.peerCooldown == nil {
+		a.peerCooldown = make(map[string]time.Time)
+	}
+	a.peerCooldown[nodeID] = time.Now().Add(dur)
+	a.peerMu.Unlock()
+}
+
+func (a *Agent) clearPeerDead(nodeID string) {
+	if nodeID == "" {
+		return
+	}
+	a.peerMu.Lock()
+	delete(a.peerCooldown, nodeID)
+	a.peerMu.Unlock()
+}
+
+func (a *Agent) isPeerDead(nodeID string) bool {
+	if nodeID == "" {
+		return false
+	}
+	a.peerMu.Lock()
+	until, ok := a.peerCooldown[nodeID]
+	if ok && time.Now().After(until) {
+		delete(a.peerCooldown, nodeID)
+		ok = false
+	}
+	a.peerMu.Unlock()
+	return ok
+}
+
 func (a *Agent) scanProject(ctx context.Context, projectID string) {
 	a.scanProjectWithLimit(ctx, projectID, 0)
 }
@@ -1622,7 +1678,10 @@ func (a *Agent) scanProjectWithLimit(ctx context.Context, projectID string, maxS
 	}
 
 	totalClaimed := 0
-	for _, cand := range disc.Candidates {
+	for idx, cand := range disc.Candidates {
+		if a.isPeerDead(cand.ANodeID) {
+			continue
+		}
 		for {
 			if ctx.Err() != nil {
 				return totalClaimed
@@ -1661,20 +1720,30 @@ func (a *Agent) scanProjectWithLimit(ctx context.Context, projectID string, maxS
 			claimed, status, err := a.claimBatchFromA(ctx, cand, projectID, availDisk, disc.LeaseTTLSec, reserved)
 			if err != nil {
 				releaseSlots(reserved)
-				a.adaptive.RecordError()
+				a.markPeerDead(cand.ANodeID, 15*time.Second)
 				a.invalidateDiscover(projectID)
-				a.logger.Warn("claim from agent-a failed", "a_node", cand.ANodeID, "err", err)
-				// Brief backoff after a transport/timeout failure prevents hammering claim-batch
-				// into an unreachable or slow link and locking out A's entire ready queue.
-				timer := time.NewTimer(1 * time.Second)
-				select {
-				case <-ctx.Done():
-					timer.Stop()
-					return totalClaimed
-				case <-timer.C:
+				a.logger.Warn("claim from dispatch node failed, isolating unreachable peer", "a_node", cand.ANodeID, "err", err)
+				// Only apply backoff/adaptive error if no other healthy candidates remain in this scan.
+				hasHealthyOther := false
+				for _, other := range disc.Candidates[idx+1:] {
+					if !a.isPeerDead(other.ANodeID) {
+						hasHealthyOther = true
+						break
+					}
+				}
+				if !hasHealthyOther {
+					a.adaptive.RecordError()
+					timer := time.NewTimer(1 * time.Second)
+					select {
+					case <-ctx.Done():
+						timer.Stop()
+						return totalClaimed
+					case <-timer.C:
+					}
 				}
 				break
 			}
+			a.clearPeerDead(cand.ANodeID)
 			if status == http.StatusNoContent || len(claimed) == 0 {
 				releaseSlots(reserved)
 				break // No more ready files on this A node; try next candidate.
@@ -1937,6 +2006,15 @@ func (a *Agent) runDownload(ctx context.Context, dl ActiveDownload) {
 				// Preserve .part and .part.bitmap so restart resumes only unfinished chunks!
 				return
 			}
+			if errors.Is(chunkErr, errPeerDraining) {
+				a.logger.Warn("dispatch node shutting down during chunked download, releasing slot cleanly", "file_id", dl.FileID, "a_node", dl.ANodeID)
+				a.markPeerDead(dl.ANodeID, 20*time.Second)
+				a.invalidateDiscover(dl.ProjectID)
+				_ = os.Remove(dl.PartPath)
+				_ = os.Remove(bitmapPath)
+				_ = a.store.DeleteActive(dl.FileID)
+				return
+			}
 			if statusCode == http.StatusConflict || statusCode == http.StatusNotFound || statusCode == http.StatusGone {
 				a.logger.Warn("lease expired or file gone on A during chunked download, abandoning", "file_id", dl.FileID, "status", statusCode)
 				_ = os.Remove(dl.PartPath)
@@ -1951,6 +2029,15 @@ func (a *Agent) runDownload(ctx context.Context, dl ActiveDownload) {
 				_ = a.sendNack(ctx, dl, "receiver disk detached/io fault")
 				return
 			}
+			if !dl.LeaseExpiresAt.IsZero() && time.Now().After(dl.LeaseExpiresAt) {
+				a.logger.Warn("chunked download failed past lease expiry, releasing slot", "file_id", dl.FileID, "a_node", dl.ANodeID, "err", chunkErr)
+				a.markPeerDead(dl.ANodeID, 15*time.Second)
+				a.invalidateDiscover(dl.ProjectID)
+				_ = os.Remove(dl.PartPath)
+				_ = os.Remove(bitmapPath)
+				_ = a.store.DeleteActive(dl.FileID)
+				return
+			}
 			a.logger.Warn("chunked download failed, falling back to resumable single-stream", "file_id", dl.FileID, "err", chunkErr)
 			_ = os.Remove(dl.PartPath)
 			_ = os.Remove(bitmapPath)
@@ -1963,6 +2050,8 @@ func (a *Agent) runDownload(ctx context.Context, dl ActiveDownload) {
 		}
 	}
 
+	const maxConsecutiveNoProgress = 5
+	consecutiveNoProgress := 0
 	for !useChunked {
 		if ctx.Err() != nil {
 			// Keep .part and BoltDB record intact so next startup can resume!
@@ -1998,6 +2087,15 @@ func (a *Agent) runDownload(ctx context.Context, dl ActiveDownload) {
 			}
 		}
 
+		// Graceful shutdown on dispatch node: release slot immediately without hurting adaptive concurrency.
+		if errors.Is(streamErr, errPeerDraining) {
+			a.logger.Warn("dispatch node shutting down, releasing worker slot cleanly", "file_id", dl.FileID, "a_node", dl.ANodeID)
+			a.markPeerDead(dl.ANodeID, 20*time.Second)
+			a.invalidateDiscover(dl.ProjectID)
+			_ = os.Remove(dl.PartPath)
+			_ = a.store.DeleteActive(dl.FileID)
+			return
+		}
 		// Lease expired or file already gone on A: abandon cleanly & remove stale .part.
 		if statusCode == http.StatusConflict || statusCode == http.StatusNotFound || statusCode == http.StatusGone {
 			a.logger.Warn("lease expired or file gone on A, abandoning", "file_id", dl.FileID, "status", statusCode)
@@ -2015,12 +2113,25 @@ func (a *Agent) runDownload(ctx context.Context, dl ActiveDownload) {
 
 		if writtenNow > 0 {
 			// Progress made before network drop -> reset backoff and record resume.
+			consecutiveNoProgress = 0
 			backoff = 250 * time.Millisecond
 			resumed = true
 			a.ResumeCount.Add(1)
 			a.logger.Warn("stream interrupted mid-transfer, will resume", "file_id", dl.FileID, "offset", offset+writtenNow, "total", dl.Size, "err", streamErr)
 		} else {
-			a.logger.Warn("stream error, retrying with backoff", "file_id", dl.FileID, "backoff", backoff, "err", streamErr)
+			consecutiveNoProgress++
+			// If the dispatch server powered off or became unreachable, bound retries so worker slots
+			// are freed promptly for healthy dispatch nodes (un-ACKed file stays safe on dispatch disk).
+			if consecutiveNoProgress >= maxConsecutiveNoProgress || (!dl.LeaseExpiresAt.IsZero() && time.Now().After(dl.LeaseExpiresAt)) {
+				a.logger.Warn("dispatch node unreachable after retries, releasing worker slot to protect other downloads",
+					"file_id", dl.FileID, "a_node", dl.ANodeID, "attempts", consecutiveNoProgress, "err", streamErr)
+				a.markPeerDead(dl.ANodeID, 15*time.Second)
+				a.invalidateDiscover(dl.ProjectID)
+				_ = os.Remove(dl.PartPath)
+				_ = a.store.DeleteActive(dl.FileID)
+				return
+			}
+			a.logger.Warn("stream error, retrying with backoff", "file_id", dl.FileID, "attempt", consecutiveNoProgress, "backoff", backoff, "err", streamErr)
 		}
 
 		timer := time.NewTimer(backoff)
@@ -2527,6 +2638,9 @@ func (a *Agent) fetchRangeWithRetry(ctx context.Context, dl ActiveDownload, f *o
 		if streamErr == nil && cur > end {
 			return http.StatusPartialContent, nil
 		}
+		if errors.Is(streamErr, errPeerDraining) {
+			return status, errPeerDraining
+		}
 		if status == http.StatusServiceUnavailable {
 			a.adaptive.RecordBackpressure()
 		} else if streamErr != nil && ctx.Err() == nil && status != http.StatusConflict && status != http.StatusNotFound && status != http.StatusGone {
@@ -2571,6 +2685,9 @@ func (a *Agent) streamRangeOnce(ctx context.Context, streamURL, leaseToken strin
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusPartialContent && !(start == 0 && resp.StatusCode == http.StatusOK) {
+		if resp.Header.Get(protocol.HeaderDraining) == "1" {
+			return 0, resp.StatusCode, errPeerDraining
+		}
 		return 0, resp.StatusCode, fmt.Errorf("range stream returned HTTP %d", resp.StatusCode)
 	}
 
@@ -2685,6 +2802,9 @@ func (a *Agent) streamOnce(ctx context.Context, dl ActiveDownload, offset int64)
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+		if resp.Header.Get(protocol.HeaderDraining) == "1" {
+			return 0, "", resp.StatusCode, errPeerDraining
+		}
 		if resp.StatusCode == http.StatusServiceUnavailable {
 			a.adaptive.RecordBackpressure()
 		} else if resp.StatusCode >= 500 {
@@ -2934,10 +3054,70 @@ func (a *Agent) sendBatchAck(ctx context.Context, publicAddr string, acks []Pend
 	return doneIDs, false, nil
 }
 
+func (a *Agent) shouldRetryAckPeer(pubAddr string, now time.Time) bool {
+	a.peerMu.Lock()
+	defer a.peerMu.Unlock()
+	if a.ackPeerBackoff == nil {
+		return true
+	}
+	st, ok := a.ackPeerBackoff[pubAddr]
+	return !ok || !now.Before(st.nextRetry)
+}
+
+func (a *Agent) recordAckPeerResult(pubAddr string, ok bool) {
+	a.peerMu.Lock()
+	defer a.peerMu.Unlock()
+	if a.ackPeerBackoff == nil {
+		a.ackPeerBackoff = make(map[string]ackBackoffState)
+	}
+	if ok {
+		delete(a.ackPeerBackoff, pubAddr)
+		return
+	}
+	st := a.ackPeerBackoff[pubAddr]
+	st.failures++
+	delay := 10 * time.Second
+	switch {
+	case st.failures == 2:
+		delay = 30 * time.Second
+	case st.failures == 3:
+		delay = 2 * time.Minute
+	case st.failures >= 4:
+		delay = 5 * time.Minute
+	}
+	st.nextRetry = time.Now().Add(delay)
+	a.ackPeerBackoff[pubAddr] = st
+}
+
 func (a *Agent) flushPendingAcks(ctx context.Context) {
 	acks, err := a.store.ListPendingAcks()
 	if err != nil || len(acks) == 0 {
 		a.pendingAckCount.Store(0)
+		return
+	}
+
+	const maxPendingAckAge = 72 * time.Hour
+	now := time.Now()
+	var (
+		expiredIDs []string
+		dueAcks    = make([]PendingAck, 0, len(acks))
+	)
+	for _, ak := range acks {
+		if !ak.CreatedAt.IsZero() && now.Sub(ak.CreatedAt) > maxPendingAckAge {
+			expiredIDs = append(expiredIDs, ak.FileID)
+			continue
+		}
+		if !a.shouldRetryAckPeer(ak.PublicAddr, now) {
+			continue
+		}
+		dueAcks = append(dueAcks, ak)
+	}
+	if len(expiredIDs) > 0 {
+		a.logger.Warn("pruning expired pending ACKs for permanently decommissioned dispatch node(s)", "count", len(expiredIDs))
+		_ = a.store.DeletePendingAcks(expiredIDs)
+	}
+	if len(dueAcks) == 0 {
+		a.pendingAckCount.Store(int64(a.store.PendingAckCount()))
 		return
 	}
 
@@ -2946,7 +3126,7 @@ func (a *Agent) flushPendingAcks(ctx context.Context) {
 	// on each mount in one barrier) BEFORE confirming batch-ack to Agent A ("没落盘的不准删").
 	uniqueDirs := make([]string, 0, 4)
 	seenDirs := make(map[string]struct{}, 4)
-	for _, ak := range acks {
+	for _, ak := range dueAcks {
 		if ak.DestDir == "" {
 			continue
 		}
@@ -2977,46 +3157,76 @@ func (a *Agent) flushPendingAcks(ctx context.Context) {
 		syncWG.Wait()
 	}
 
-	// Group durable ACKs by Agent A address.
+	// Group durable ACKs by dispatch node address and flush ALL peers in parallel so one
+	// powered-off or unreachable dispatch server NEVER blocks ACKs to healthy dispatch servers.
 	byAddr := make(map[string][]PendingAck)
-	for _, ak := range acks {
+	for _, ak := range dueAcks {
 		if ak.DestDir != "" && failedDirs[ak.DestDir] {
 			continue
 		}
 		byAddr[ak.PublicAddr] = append(byAddr[ak.PublicAddr], ak)
 	}
 
-	var allDone []string
+	var (
+		allDoneMu sync.Mutex
+		allDone   []string
+		peerWG    sync.WaitGroup
+	)
 	const maxChunk = 128
 	for pubAddr, group := range byAddr {
-		for start := 0; start < len(group); start += maxChunk {
-			if ctx.Err() != nil {
-				break
-			}
-			end := start + maxChunk
-			if end > len(group) {
-				end = len(group)
-			}
-			chunk := group[start:end]
-			doneIDs, fallback, err := a.sendBatchAck(ctx, pubAddr, chunk)
-			if err != nil {
-				a.logger.Warn("batch-ack failed, will retry", "public_addr", pubAddr, "count", len(chunk), "err", err)
-				continue
-			}
-			if fallback {
-				for _, ak := range chunk {
-					if ctx.Err() != nil {
+		peerWG.Add(1)
+		go func(addr string, items []PendingAck) {
+			defer peerWG.Done()
+			peerFailed := false
+			var peerDone []string
+			for start := 0; start < len(items); start += maxChunk {
+				if ctx.Err() != nil {
+					break
+				}
+				end := start + maxChunk
+				if end > len(items) {
+					end = len(items)
+				}
+				chunk := items[start:end]
+				reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+				doneIDs, fallback, err := a.sendBatchAck(reqCtx, addr, chunk)
+				cancel()
+				if err != nil {
+					peerFailed = true
+					a.logger.Warn("batch-ack failed, backing off unreachable dispatch peer", "public_addr", addr, "count", len(chunk), "err", err)
+					break // stop hammering remaining chunks on this unreachable peer
+				}
+				if fallback {
+					for _, ak := range chunk {
+						if ctx.Err() != nil {
+							break
+						}
+						sCtx, sCancel := context.WithTimeout(ctx, 10*time.Second)
+						sErr := a.sendAck(sCtx, ak)
+						sCancel()
+						if sErr == nil {
+							peerDone = append(peerDone, ak.FileID)
+						} else {
+							peerFailed = true
+							break
+						}
+					}
+					if peerFailed {
 						break
 					}
-					if err := a.sendAck(ctx, ak); err == nil {
-						allDone = append(allDone, ak.FileID)
-					}
+					continue
 				}
-				continue
+				peerDone = append(peerDone, doneIDs...)
 			}
-			allDone = append(allDone, doneIDs...)
-		}
+			a.recordAckPeerResult(addr, !peerFailed)
+			if len(peerDone) > 0 {
+				allDoneMu.Lock()
+				allDone = append(allDone, peerDone...)
+				allDoneMu.Unlock()
+			}
+		}(pubAddr, group)
 	}
+	peerWG.Wait()
 
 	if len(allDone) > 0 {
 		_ = a.store.DeletePendingAcks(allDone)

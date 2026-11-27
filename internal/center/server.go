@@ -310,6 +310,7 @@ func (s *Server) routes() http.Handler {
 	// Agent A endpoints
 	mux.HandleFunc("POST /api/v1/a/heartbeat", s.requireNode(protocol.RoleAgentA, s.handleAHeartbeat))
 	mux.HandleFunc("POST /api/v1/a/events", s.requireNode(protocol.RoleAgentA, s.handleAEvents))
+	mux.HandleFunc("POST /api/v1/a/offline", s.requireNode(protocol.RoleAgentA, s.handleAOffline))
 
 	// Agent B endpoints
 	mux.HandleFunc("POST /api/v1/b/heartbeat", s.requireNode(protocol.RoleAgentB, s.handleBHeartbeat))
@@ -588,6 +589,12 @@ func (s *Server) handleAEvents(w http.ResponseWriter, r *http.Request, node *Sto
 		return
 	}
 	protocol.WriteJSON(w, http.StatusOK, map[string]int{"applied": applied})
+}
+
+func (s *Server) handleAOffline(w http.ResponseWriter, r *http.Request, node *StoredNode) {
+	s.hub.MarkAgentAOffline(node.ID)
+	s.logger.Info("dispatch node notified graceful offline", "node_id", node.ID)
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) handleBHeartbeat(w http.ResponseWriter, r *http.Request, node *StoredNode) {

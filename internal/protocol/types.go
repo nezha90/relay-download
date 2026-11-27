@@ -17,6 +17,7 @@ const (
 	HeaderExpectedSHA256 = "X-Expected-SHA256"
 	HeaderCustomer       = "X-Customer"
 	HeaderProjectName    = "X-Project-Name"
+	HeaderDraining       = "X-Relay-Draining"
 )
 
 const (

@@ -687,4 +687,20 @@ func TestOverviewProjectsSortedByActivity(t *testing.T) {
 	if ov.Projects[1].LastActivityAt == nil || ov.Projects[1].RecentBytes != 0 {
 		t.Fatalf("expected window-only activity on proj-mid-window, got %+v", ov.Projects[1])
 	}
+
+	// Verify POST /api/v1/a/offline immediately marks a-sort-1 offline without waiting for node_offline_sec.
+	if cands := srv.hub.DiscoverCandidates("proj-live-now"); len(cands) != 1 {
+		t.Fatalf("expected 1 discover candidate before offline notify, got %d", len(cands))
+	}
+	offReq := httptest.NewRequest(http.MethodPost, "/api/v1/a/offline", nil)
+	offReq.Header.Set(protocol.HeaderNodeID, "a-sort-1")
+	offReq.Header.Set(protocol.HeaderNodeToken, "tok-sort-a")
+	offRec := httptest.NewRecorder()
+	handler.ServeHTTP(offRec, offReq)
+	if offRec.Code != http.StatusNoContent {
+		t.Fatalf("POST /api/v1/a/offline expected 204, got %d %s", offRec.Code, offRec.Body.String())
+	}
+	if cands := srv.hub.DiscoverCandidates("proj-live-now"); len(cands) != 0 {
+		t.Fatalf("expected 0 discover candidates immediately after graceful offline, got %d", len(cands))
+	}
 }

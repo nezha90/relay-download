@@ -110,6 +110,7 @@ func TestStorageDirsPoolDirectiveAndDiskPolicies(t *testing.T) {
 		wakeupCh:        make(chan string, 16),
 		projectSchedule: cfg.ProjectSchedule,
 		diskPolicy:      cfg.DiskPolicy,
+		maxDiskUsagePct: 99.0,
 		diskHealth:      transfer.NewDiskHealthTracker(),
 	}
 
@@ -119,6 +120,7 @@ func TestStorageDirsPoolDirectiveAndDiskPolicies(t *testing.T) {
 		KnownProjects:   []string{"proj-1", "proj-2", "proj-3"},
 		ProjectSchedule: protocol.ScheduleFIFO,
 		DiskPolicy:      protocol.DiskPolicyRoundRobin,
+		MaxDiskUsagePct: 99.0,
 	}, nil)
 	if !slices.Equal(ag.activeProjectIDs(), []string{"proj-1", "proj-2", "proj-3"}) {
 		t.Fatalf("expected FIFO order [proj-1 proj-2 proj-3], got %v", ag.activeProjectIDs())
@@ -195,6 +197,11 @@ func TestRollingWindowSlidingDiskSelection(t *testing.T) {
 		activeDiskWindow: cfg.ActiveDiskWindow,
 		diskHealth:       transfer.NewDiskHealthTracker(),
 	}
+	// Verify default receiver watermark is 85% before raising to 99% so tests pass even on full dev laptops.
+	if got := ag.effectiveMaxDiskUsagePct(); got != 85.0 {
+		t.Fatalf("expected default receiver watermark 85%%, got %.1f", got)
+	}
+	ag.maxDiskUsagePct = 99.0
 
 	// 1. With active_disk_window=3 across 12 disks, ALL writes must stay strictly within disks 1..3
 	//    and paired media+metadata with the same stem must land on the exact same disk.
@@ -226,6 +233,7 @@ func TestRollingWindowSlidingDiskSelection(t *testing.T) {
 		StorageDirs:      roots,
 		DisabledDisks:    []string{roots[0]},
 		DiskGen:          1,
+		MaxDiskUsagePct:  99.0,
 	}, nil)
 
 	seenPhase2 := make(map[string]int)
@@ -246,8 +254,16 @@ func TestRollingWindowSlidingDiskSelection(t *testing.T) {
 	}
 
 	// 3. Hot-updating MaxDiskUsagePct via ReceiverDirective (1..99%, default 85%) works without restart.
+	ag.applyDirective(&protocol.ReceiverDirective{
+		ProjectMode:      "selected",
+		AllowedProjects:  []string{"proj-tw"},
+		DiskPolicy:       protocol.DiskPolicyRollingWindow,
+		ActiveDiskWindow: 3,
+		StorageDirs:      roots,
+		MaxDiskUsagePct:  85.0,
+	}, nil)
 	if got := ag.effectiveMaxDiskUsagePct(); got != 85.0 {
-		t.Fatalf("expected default receiver watermark 85%%, got %.1f", got)
+		t.Fatalf("expected hot-updated receiver watermark 85%%, got %.1f", got)
 	}
 	ag.applyDirective(&protocol.ReceiverDirective{
 		ProjectMode:      "selected",

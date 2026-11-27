@@ -61,6 +61,7 @@ type Agent struct {
 	streamSem     chan struct{}
 	activeStreams atomic.Int32
 	paused        atomic.Bool
+	draining      atomic.Bool
 
 	hbWakeCh     chan struct{}
 	eventWakeCh  chan struct{}
@@ -315,25 +316,73 @@ func (a *Agent) PublicListenAddr() string {
 	return a.cfg.PublicListen
 }
 
+func (a *Agent) notifyCenterOffline(ctx context.Context) {
+	u := strings.TrimRight(a.cfg.CenterURL, "/") + "/api/v1/a/offline"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, nil)
+	if err != nil {
+		return
+	}
+	req.Header.Set(protocol.HeaderNodeID, a.cfg.NodeID)
+	req.Header.Set(protocol.HeaderNodeToken, a.cfg.CenterToken)
+	resp, err := a.httpClient.Do(req)
+	if err != nil {
+		a.logger.Warn("graceful offline notify to center failed", "err", err)
+		return
+	}
+	_ = resp.Body.Close()
+}
+
 func (a *Agent) Shutdown(ctx context.Context) error {
 	var shutdownErr error
 	a.closeOnce.Do(func() {
+		// 1. Immediately stop accepting new claims, streams, and local uploads.
+		a.draining.Store(true)
+		a.logger.Info("dispatch node shutting down cleanly")
+
+		// 2. Immediately notify Center so receivers stop discovering this node in <100ms
+		//    instead of waiting for node_offline_sec.
+		offCtx, cancelOff := context.WithTimeout(ctx, 1500*time.Millisecond)
+		a.notifyCenterOffline(offCtx)
+		cancelOff()
+
+		// 3. Gracefully drain HTTP servers in parallel with a tight 5s cap so host poweroff
+		//    or systemctl stop never hangs; any huge in-flight stream is safely interrupted
+		//    and preserved on disk for future re-delivery ("没落盘的不准删").
+		shCtx, cancelSh := context.WithTimeout(ctx, 5*time.Second)
+		var srvWG sync.WaitGroup
+		shutdownSrv := func(srv *http.Server) {
+			if srv == nil {
+				return
+			}
+			srvWG.Add(1)
+			go func() {
+				defer srvWG.Done()
+				if err := srv.Shutdown(shCtx); err != nil {
+					_ = srv.Close()
+				}
+			}()
+		}
+		shutdownSrv(a.localSrv)
+		shutdownSrv(a.publicSrv)
+		srvWG.Wait()
+		cancelSh()
+
+		// 4. Stop background loops cleanly.
 		a.runMu.Lock()
 		cancel := a.runCancel
 		a.runMu.Unlock()
 		if cancel != nil {
 			cancel()
 		}
-		shCtx, cancelSh := context.WithTimeout(ctx, 10*time.Second)
-		defer cancelSh()
-		if a.localSrv != nil {
-			_ = a.localSrv.Shutdown(shCtx)
-		}
-		if a.publicSrv != nil {
-			_ = a.publicSrv.Shutdown(shCtx)
-		}
 		a.bgWG.Wait()
+
+		// 5. Final best-effort flush of pending summary events & ACK-verified spool deletions
+		//    before closing SQLite cleanly.
 		if a.store != nil {
+			evCtx, cancelEv := context.WithTimeout(ctx, 2*time.Second)
+			a.flushPendingEvents(evCtx)
+			cancelEv()
+			a.flushDeleteQueue()
 			shutdownErr = a.store.Close()
 		}
 	})
@@ -979,6 +1028,11 @@ func (a *Agent) handleLocalPutFile(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *Agent) ingestRawBody(w http.ResponseWriter, r *http.Request, projectID, filename, expectedSHA256, projName string, customers []string) {
+	if a.draining.Load() {
+		w.Header().Set(protocol.HeaderDraining, "1")
+		protocol.WriteError(w, http.StatusServiceUnavailable, "dispatch node is shutting down")
+		return
+	}
 	var extraBytes uint64
 	if r.ContentLength > 0 {
 		extraBytes = uint64(r.ContentLength)
@@ -1094,6 +1148,11 @@ func (a *Agent) ingestRawBody(w http.ResponseWriter, r *http.Request, projectID,
 }
 
 func (a *Agent) handleLocalUpload(w http.ResponseWriter, r *http.Request) {
+	if a.draining.Load() {
+		w.Header().Set(protocol.HeaderDraining, "1")
+		protocol.WriteError(w, http.StatusServiceUnavailable, "dispatch node is shutting down")
+		return
+	}
 	var extraBytes uint64
 	if r.ContentLength > 0 {
 		extraBytes = uint64(r.ContentLength)
@@ -1331,6 +1390,11 @@ func (a *Agent) handleLocalUpload(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *Agent) handleLocalRegister(w http.ResponseWriter, r *http.Request) {
+	if a.draining.Load() {
+		w.Header().Set(protocol.HeaderDraining, "1")
+		protocol.WriteError(w, http.StatusServiceUnavailable, "dispatch node is shutting down")
+		return
+	}
 	var req protocol.LocalRegisterReq
 	if err := protocol.DecodeJSON(r.Body, &req); err != nil {
 		protocol.WriteError(w, http.StatusBadRequest, "invalid json: "+err.Error())
@@ -1492,6 +1556,11 @@ func (a *Agent) crossDeviceMove(ctx context.Context, srcPath, dstPath, expectedS
 }
 
 func (a *Agent) handleLocalRegisterBatch(w http.ResponseWriter, r *http.Request) {
+	if a.draining.Load() {
+		w.Header().Set(protocol.HeaderDraining, "1")
+		protocol.WriteError(w, http.StatusServiceUnavailable, "dispatch node is shutting down")
+		return
+	}
 	var req protocol.LocalRegisterBatchReq
 	if err := protocol.DecodeJSON(r.Body, &req); err != nil {
 		protocol.WriteError(w, http.StatusBadRequest, "invalid json: "+err.Error())
@@ -1736,7 +1805,7 @@ func (a *Agent) handleClaim(w http.ResponseWriter, r *http.Request) {
 		protocol.WriteError(w, http.StatusForbidden, "token claims mismatch")
 		return
 	}
-	if a.paused.Load() {
+	if a.paused.Load() || a.draining.Load() {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
@@ -1788,7 +1857,7 @@ func (a *Agent) handleClaimBatch(w http.ResponseWriter, r *http.Request) {
 		protocol.WriteError(w, http.StatusForbidden, "token claims mismatch")
 		return
 	}
-	if a.paused.Load() {
+	if a.paused.Load() || a.draining.Load() {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
@@ -1834,6 +1903,12 @@ func (a *Agent) handleClaimBatch(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *Agent) handleStream(w http.ResponseWriter, r *http.Request) {
+	if a.draining.Load() {
+		w.Header().Set(protocol.HeaderDraining, "1")
+		w.Header().Set("Retry-After", "5")
+		protocol.WriteError(w, http.StatusServiceUnavailable, "dispatch node is shutting down")
+		return
+	}
 	fileID := r.PathValue("id")
 	leaseToken := r.Header.Get(protocol.HeaderLeaseToken)
 	if leaseToken == "" {
