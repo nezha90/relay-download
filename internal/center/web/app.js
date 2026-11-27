@@ -295,6 +295,10 @@ function updateAuthControls() {
 function applyRoleUI() {
   const cust = isCustomer();
   document.querySelectorAll('[data-admin-only="1"]').forEach(el => {
+    if (el.classList.contains('overlay')) {
+      if (cust) el.classList.add('hidden');
+      return;
+    }
     el.classList.toggle('hidden', cust);
     if (el.tagName === 'OPTION') {
       el.disabled = cust;
