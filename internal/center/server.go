@@ -929,10 +929,17 @@ func (s *Server) handleAdminOverview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var projWindowMap map[string]WindowSummary
+	var projLastAct map[string]time.Time
 	if emptyCustomerScope {
 		projWindowMap = map[string]WindowSummary{}
+		projLastAct = map[string]time.Time{}
 	} else {
 		_, _, projWindowMap, err = s.store.GetWindowEntityStatsScoped(ctx, iq.Now, intervalResp.WindowHours, iq.AllowedProjects)
+		if err != nil {
+			protocol.WriteError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		projLastAct, err = s.store.GetProjectLastActivity(ctx, iq.Now)
 		if err != nil {
 			protocol.WriteError(w, http.StatusInternalServerError, err.Error())
 			return
@@ -1002,9 +1009,18 @@ func (s *Server) handleAdminOverview(w http.ResponseWriter, r *http.Request) {
 	}
 
 	projSummaries := make([]protocol.ProjectSummary, 0, len(projects))
+	nowUTC := iq.Now.UTC()
 	for _, p := range projects {
 		t := totalsMap[p.ID]
 		pw := projWindowMap[p.ID]
+		var lastAct *time.Time
+		if pw.LastActivityAt != nil {
+			cp := *pw.LastActivityAt
+			lastAct = &cp
+		} else if lt, ok := projLastAct[p.ID]; ok {
+			cp := lt
+			lastAct = &cp
+		}
 		ps := protocol.ProjectSummary{
 			Project:           p,
 			TotalUploaded:     t.TotalUploaded,
@@ -1016,6 +1032,9 @@ func (s *Server) handleAdminOverview(w http.ResponseWriter, r *http.Request) {
 			WindowBytes:       pw.Bytes,
 			WindowAvgSpeedBps: pw.WindowAvgSpeedBps,
 			ActiveAvgSpeedBps: pw.ActiveAvgSpeedBps,
+			RecentBytes:       pw.RecentBytes,
+			RecentSpeedBps:    pw.RecentSpeedBps,
+			LastActivityAt:    lastAct,
 			ANodeAvailability: make([]protocol.ANodeAvailSummary, 0),
 		}
 		for _, aSt := range aSnap {
@@ -1042,6 +1061,10 @@ func (s *Server) handleAdminOverview(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
+		if ps.QueuedFiles > 0 {
+			liveNow := nowUTC
+			ps.LastActivityAt = &liveNow
+		}
 		sort.Slice(ps.ANodeAvailability, func(i, j int) bool {
 			return ps.ANodeAvailability[i].ANodeID < ps.ANodeAvailability[j].ANodeID
 		})
@@ -1062,6 +1085,54 @@ func (s *Server) handleAdminOverview(w http.ResponseWriter, r *http.Request) {
 		overview.QueuedBytes += ps.QueuedBytes
 		projSummaries = append(projSummaries, ps)
 	}
+	// Sort overview projects by live activity descending:
+	// Tier 3: actively transferring or queued right now
+	// Tier 2: active within the selected time window
+	// Tier 1: idle / historical (newest activity or creation first)
+	projActivityTier := func(ps protocol.ProjectSummary) int {
+		if ps.QueuedFiles > 0 || ps.RecentBytes > 0 {
+			return 3
+		}
+		if ps.WindowBytes > 0 || ps.WindowCompleted > 0 || ps.WindowFailed > 0 {
+			return 2
+		}
+		return 1
+	}
+	projActivityUnix := func(ps protocol.ProjectSummary) int64 {
+		if ps.LastActivityAt != nil {
+			return ps.LastActivityAt.Unix()
+		}
+		return ps.Project.CreatedAt.Unix()
+	}
+	sort.Slice(projSummaries, func(i, j int) bool {
+		a, b := projSummaries[i], projSummaries[j]
+		ta, tb := projActivityTier(a), projActivityTier(b)
+		if ta != tb {
+			return ta > tb
+		}
+		if ta == 3 {
+			if a.RecentSpeedBps != b.RecentSpeedBps {
+				return a.RecentSpeedBps > b.RecentSpeedBps
+			}
+			if a.QueuedBytes != b.QueuedBytes {
+				return a.QueuedBytes > b.QueuedBytes
+			}
+			if a.QueuedFiles != b.QueuedFiles {
+				return a.QueuedFiles > b.QueuedFiles
+			}
+		}
+		la, lb := projActivityUnix(a), projActivityUnix(b)
+		if la != lb {
+			return la > lb
+		}
+		if a.WindowBytes != b.WindowBytes {
+			return a.WindowBytes > b.WindowBytes
+		}
+		if a.TotalBytes != b.TotalBytes {
+			return a.TotalBytes > b.TotalBytes
+		}
+		return a.Project.ID < b.Project.ID
+	})
 	overview.Projects = projSummaries
 
 	protocol.WriteJSON(w, http.StatusOK, overview)

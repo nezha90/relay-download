@@ -54,7 +54,17 @@ let lastAccountLoginURL = '';
 let lastPrecheck = null;
 let activeDeployTaskId = '';
 let activeLogModalTaskId = '';
+let activeProjectDetailId = '';
+let lastProjectsWinHours = 24;
 let selectedProjectFilter = '';
+const projectViewState = {
+  search: '',
+  filter: 'all',      // 'all' | 'live' | 'recent' | 'attention' | 'idle'
+  groupBy: 'status',  // 'status' | 'customer' | 'none'
+  sortBy: 'activity', // 'activity' | 'queued' | 'bytes' | 'recent' | 'created' | 'name'
+  collapsedGroups: new Set(),
+  userToggledGroups: new Set(),
+};
 const selectedNodes = { agent_a: new Set(), agent_b: new Set() };
 
 function getWindowSpec() {
@@ -286,12 +296,21 @@ function applyRoleUI() {
   const cust = isCustomer();
   document.querySelectorAll('[data-admin-only="1"]').forEach(el => {
     el.classList.toggle('hidden', cust);
+    if (el.tagName === 'OPTION') {
+      el.disabled = cust;
+      el.hidden = cust;
+    }
   });
+  if (cust && projectViewState.groupBy === 'customer') {
+    projectViewState.groupBy = 'status';
+    const grpSel = document.getElementById('projects-group-by');
+    if (grpSel) grpSel.value = 'status';
+  }
   const projDesc = document.getElementById('projects-section-desc');
   if (projDesc) {
     projDesc.textContent = cust
-      ? '只读查看已授权项目的阶段传输速率、完成总量与待传输积压'
-      : '业务方 PUT 上传新项目时将自动发现并建档；也可手动提前创建并自定义同名冲突策略';
+      ? '默认按活跃度分组置顶；点击任意项目行按需查看传输详情、节点状态与速度曲线'
+      : '默认按活跃度分组置顶；点击任意项目行按需查看详情、节点积压与策略配置';
   }
   if (cust) {
     const activeTab = document.querySelector('.tab.active');
@@ -317,7 +336,10 @@ function hideLogin() {
 }
 
 function openModal(id) { document.getElementById(id).classList.remove('hidden'); }
-function closeModal(id) { document.getElementById(id).classList.add('hidden'); }
+function closeModal(id) {
+  document.getElementById(id)?.classList.add('hidden');
+  if (id === 'project-detail-modal') activeProjectDetailId = '';
+}
 
 function showToast(msg, type = 'info', durationMs = 3200) {
   const stack = document.getElementById('toast-stack');
@@ -401,10 +423,14 @@ async function refreshAll() {
     cachedNodes = nodes || [];
     cachedReleases = releases || [];
     cachedAccounts = accounts || [];
+    lastProjectsWinHours = overview.window_hours || hours;
     syncProjectFilterOptions(cachedProjects);
     renderDashboard(overview);
-    renderProjects(cachedProjects, overview.window_hours || hours);
-    renderNodes(cachedNodes, overview.window_hours || hours);
+    renderProjects(cachedProjects, lastProjectsWinHours);
+    if (activeProjectDetailId && !document.getElementById('project-detail-modal')?.classList.contains('hidden')) {
+      renderProjectDetailModal(activeProjectDetailId, lastProjectsWinHours);
+    }
+    renderNodes(cachedNodes, lastProjectsWinHours);
     renderReleases(cachedReleases);
     if (!isCustomer()) {
       renderDeployTasks(tasks || []);
@@ -1005,11 +1031,6 @@ curl -fsS "${base}/local/v1/status?project=${proj}&summary=1"`);
 }
 
 function openProjectQuickGuide(projectId) {
-  const body = document.getElementById('guide-p-body');
-  const card = document.getElementById('guide-p-card');
-  const btn = card?.querySelector('button[data-toggle-guide="guide-p-body"]');
-  if (body) body.classList.remove('hidden');
-  if (btn) btn.textContent = '收起指南';
   const sel = document.getElementById('guide-p-project-select');
   const inp = document.getElementById('guide-p-project-input');
   if (projectId && inp) {
@@ -1018,107 +1039,577 @@ function openProjectQuickGuide(projectId) {
     if (sel) {
       sel.value = Array.from(sel.options).some(o => o.value === projectId) ? projectId : '__custom__';
     }
-    renderProjectGuideSnippets();
   }
-  card?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  syncProjectGuideSelect(cachedProjects);
+  syncProjectGuideCustomerOptions(cachedAccounts);
+  renderProjectGuideSnippets();
+  openModal('project-guide-modal');
+}
+
+function fmtRelativeTime(iso) {
+  if (!iso) return '无记录';
+  const ts = new Date(iso).getTime();
+  if (Number.isNaN(ts)) return '无记录';
+  const diffSec = Math.max(0, Math.floor((Date.now() - ts) / 1000));
+  if (diffSec < 90) return '刚刚';
+  if (diffSec < 3600) return `${Math.floor(diffSec / 60)} 分钟前`;
+  if (diffSec < 86400) return `${Math.floor(diffSec / 3600)} 小时前`;
+  const days = Math.floor(diffSec / 86400);
+  if (days < 30) return `${days} 天前`;
+  return fmtTimeShort(iso, true);
+}
+
+function getProjectActivityTier(ps) {
+  if (!ps) return 1;
+  if ((ps.queued_files || 0) > 0 || (ps.recent_bytes || 0) > 0) return 3; // live
+  if ((ps.window_bytes || 0) > 0 || (ps.window_completed || 0) > 0 || (ps.window_failed || 0) > 0) return 2; // recent
+  return 1; // idle
+}
+
+function getProjectActivityEpoch(ps) {
+  if (ps?.last_activity_at) {
+    const t = new Date(ps.last_activity_at).getTime();
+    if (!Number.isNaN(t)) return t;
+  }
+  if (ps?.project?.created_at) {
+    const t = new Date(ps.project.created_at).getTime();
+    if (!Number.isNaN(t)) return t;
+  }
+  return 0;
+}
+
+function getProjectAssignedAccounts(projectId) {
+  if (isCustomer()) return [];
+  return (cachedAccounts || []).filter(a => Array.isArray(a.projects) && a.projects.includes(projectId));
+}
+
+function projectNeedsAttention(ps, cust) {
+  const hasFail = (ps.window_failed || 0) > 0 || (ps.total_failed || 0) > 0;
+  const hasDiskAlarm = !cust && (ps.a_node_availability || []).some(a => a.disk_alarm);
+  const unassigned = !cust && getProjectAssignedAccounts(ps.project.id).length === 0;
+  return hasFail || hasDiskAlarm || unassigned;
+}
+
+function sortProjectSummaries(list, sortBy) {
+  const arr = [...list];
+  arr.sort((a, b) => {
+    switch (sortBy) {
+      case 'queued':
+        if ((b.queued_bytes || 0) !== (a.queued_bytes || 0)) return (b.queued_bytes || 0) - (a.queued_bytes || 0);
+        if ((b.queued_files || 0) !== (a.queued_files || 0)) return (b.queued_files || 0) - (a.queued_files || 0);
+        break;
+      case 'bytes':
+        if ((b.total_bytes || 0) !== (a.total_bytes || 0)) return (b.total_bytes || 0) - (a.total_bytes || 0);
+        if ((b.total_completed || 0) !== (a.total_completed || 0)) return (b.total_completed || 0) - (a.total_completed || 0);
+        break;
+      case 'recent': {
+        const diff = getProjectActivityEpoch(b) - getProjectActivityEpoch(a);
+        if (diff !== 0) return diff;
+        break;
+      }
+      case 'created': {
+        const ta = new Date(a.project.created_at || 0).getTime() || 0;
+        const tb = new Date(b.project.created_at || 0).getTime() || 0;
+        if (tb !== ta) return tb - ta;
+        break;
+      }
+      case 'name': {
+        const na = (a.project.name || a.project.id || '').toLowerCase();
+        const nb = (b.project.name || b.project.id || '').toLowerCase();
+        if (na !== nb) return na.localeCompare(nb, 'zh-CN');
+        break;
+      }
+      case 'activity':
+      default: {
+        const ta = getProjectActivityTier(a);
+        const tb = getProjectActivityTier(b);
+        if (tb !== ta) return tb - ta;
+        if (ta === 3) {
+          if ((b.recent_speed_bps || 0) !== (a.recent_speed_bps || 0)) return (b.recent_speed_bps || 0) - (a.recent_speed_bps || 0);
+          if ((b.queued_bytes || 0) !== (a.queued_bytes || 0)) return (b.queued_bytes || 0) - (a.queued_bytes || 0);
+          if ((b.queued_files || 0) !== (a.queued_files || 0)) return (b.queued_files || 0) - (a.queued_files || 0);
+        }
+        const diff = getProjectActivityEpoch(b) - getProjectActivityEpoch(a);
+        if (diff !== 0) return diff;
+        if ((b.window_bytes || 0) !== (a.window_bytes || 0)) return (b.window_bytes || 0) - (a.window_bytes || 0);
+        if ((b.total_bytes || 0) !== (a.total_bytes || 0)) return (b.total_bytes || 0) - (a.total_bytes || 0);
+        break;
+      }
+    }
+    return (a.project.id || '').localeCompare(b.project.id || '');
+  });
+  return arr;
+}
+
+function renderProjectCompactRow(ps, winHours, cust) {
+  const p = ps.project;
+  const tier = getProjectActivityTier(ps);
+  const assignedAccs = getProjectAssignedAccounts(p.id);
+  const hasDiskAlarm = !cust && (ps.a_node_availability || []).some(a => a.disk_alarm);
+  const hasFail = (ps.window_failed || 0) > 0 || (ps.total_failed || 0) > 0;
+
+  const dotCls = tier === 3 ? 'live' : (tier === 2 ? 'recent' : 'idle');
+  const dotTitle = tier === 3 ? '传输中 / 实时活跃' : (tier === 2 ? `${windowLabel(winHours)}内有传输` : '静止 / 历史项目');
+
+  const miniPills = [];
+  if (p.max_total_concurrent > 0 || p.max_total_rate_mbps > 0) {
+    const qp = [];
+    if (p.max_total_concurrent > 0) qp.push(`并发≤${p.max_total_concurrent}`);
+    if (p.max_total_rate_mbps > 0) qp.push(`${p.max_total_rate_mbps}MB/s`);
+    miniPills.push(`<span class="badge accent proj-mini-pill">${esc(qp.join(' · '))}</span>`);
+  }
+  if (hasDiskAlarm) {
+    miniPills.push('<span class="badge alarm proj-mini-pill">盘水位告警</span>');
+  }
+  if (hasFail) {
+    miniPills.push(`<span class="badge offline proj-mini-pill">失败 ${fmtNum(ps.total_failed || ps.window_failed)}</span>`);
+  }
+
+  // Customer column (admin only)
+  let custCellHtml = '';
+  if (!cust) {
+    if (!assignedAccs.length) {
+      custCellHtml = '<td><span class="badge alarm">未分配</span></td>';
+    } else {
+      const shown = assignedAccs.slice(0, 2).map(a => `<span class="badge online" title="${esc(a.id)}">${esc(a.name || a.id)}</span>`).join('');
+      const extra = assignedAccs.length > 2 ? `<span class="badge" title="${esc(assignedAccs.slice(2).map(a => a.name || a.id).join(', '))}">+${assignedAccs.length - 2}</span>` : '';
+      custCellHtml = `<td><div class="proj-cust-pills">${shown}${extra}</div></td>`;
+    }
+  }
+
+  // Queue / live status column
+  let queueHtml = '';
+  if ((ps.queued_files || 0) > 0) {
+    queueHtml = `
+      <div class="proj-cell-main" style="color:var(--cyan)">积压 ${esc(fmtNum(ps.queued_files))} 文件</div>
+      <div class="proj-cell-sub">${esc(fmtBytes(ps.queued_bytes))} · 接收机 ${ps.online_b_nodes}</div>
+    `;
+  } else if (tier === 3) {
+    queueHtml = `
+      <div class="proj-cell-main" style="color:var(--green-soft)">实时传输中</div>
+      <div class="proj-cell-sub">近 10 分 ${esc(fmtBytes(ps.recent_bytes))}</div>
+    `;
+  } else {
+    const lastTxt = ps.last_activity_at ? fmtRelativeTime(ps.last_activity_at) : `创建于 ${fmtTimeShort(p.created_at, true)}`;
+    queueHtml = `
+      <div class="proj-cell-main muted">空闲</div>
+      <div class="proj-cell-sub">${esc(lastTxt)}</div>
+    `;
+  }
+
+  // Speed column
+  let speedHtml = '';
+  if ((ps.recent_speed_bps || 0) > 0) {
+    speedHtml = `
+      <div class="proj-cell-main" style="color:var(--green-soft)">${esc(fmtSpeed(ps.recent_speed_bps))}</div>
+      <div class="proj-cell-sub">实时 · 窗均 ${esc(fmtSpeed(ps.active_avg_speed_bps))}</div>
+    `;
+  } else if ((ps.active_avg_speed_bps || 0) > 0) {
+    speedHtml = `
+      <div class="proj-cell-main">${esc(fmtSpeed(ps.active_avg_speed_bps))}</div>
+      <div class="proj-cell-sub">${esc(windowLabel(winHours))}活跃均速</div>
+    `;
+  } else {
+    speedHtml = '<div class="proj-cell-main muted">—</div>';
+  }
+
+  // Delivered volume column
+  const winSub = (ps.window_completed || 0) > 0
+    ? `${windowLabel(winHours)} +${fmtNum(ps.window_completed)} (${fmtBytes(ps.window_bytes)})`
+    : (ps.total_completed > 0 ? '历史已完成' : '暂无传输记录');
+  const totalHtml = `
+    <div class="proj-cell-main">${esc(fmtNum(ps.total_completed))} 文件 · ${esc(fmtBytes(ps.total_bytes))}</div>
+    <div class="proj-cell-sub">${esc(winSub)}</div>
+  `;
+
+  // Compact actions column (keep dangerous Delete inside Detail modal!)
+  let actionsHtml = `<button type="button" class="btn sm" data-action="view-project-detail" data-id="${esc(p.id)}">详情</button>`;
+  if (!cust) {
+    const assignCls = assignedAccs.length === 0 ? 'btn sm primary' : 'btn sm ghost';
+    const assignTxt = assignedAccs.length === 0 ? '分配客户' : '客户';
+    actionsHtml = `
+      <button type="button" class="${assignCls}" data-action="assign-project-accounts" data-id="${esc(p.id)}">${assignTxt}</button>
+      <button type="button" class="btn sm" data-action="view-project-detail" data-id="${esc(p.id)}">详情</button>
+    `;
+  }
+
+  return `
+    <tr class="proj-row ${tier === 3 ? 'is-live' : ''}" data-open-project-detail="${esc(p.id)}">
+      <td>
+        <div class="proj-name-line">
+          <span class="proj-status-dot ${dotCls}" title="${esc(dotTitle)}"></span>
+          <strong class="proj-name-text" title="${esc(p.name || p.id)}">${esc(p.name || p.id)}</strong>
+          ${miniPills.join('')}
+        </div>
+        <div class="proj-id-line">
+          <button type="button" class="proj-short-id mono" data-copy-text="${esc(p.id)}" title="点击复制完整项目 ID: ${esc(p.id)}">${esc(shortId(p.id))}</button>
+          ${p.description && p.description !== '上传自动发现创建' ? `<span class="proj-desc-inline" title="${esc(p.description)}">${esc(p.description)}</span>` : ''}
+        </div>
+      </td>
+      ${custCellHtml}
+      <td>${queueHtml}</td>
+      <td>${speedHtml}</td>
+      <td>${totalHtml}</td>
+      <td>
+        <div class="proj-row-actions">${actionsHtml}</div>
+      </td>
+    </tr>
+  `;
+}
+
+function buildProjectGroups(items, groupBy, cust) {
+  if (groupBy === 'none') {
+    return [{
+      key: 'all',
+      title: '全部项目',
+      badgeCls: 'accent',
+      items,
+      collapsible: false,
+    }];
+  }
+  if (groupBy === 'customer' && !cust) {
+    const map = new Map();
+    const unassigned = [];
+    for (const ps of items) {
+      const accs = getProjectAssignedAccounts(ps.project.id);
+      if (!accs.length) {
+        unassigned.push(ps);
+        continue;
+      }
+      for (const a of accs) {
+        const k = `cust:${a.id}`;
+        if (!map.has(k)) {
+          map.set(k, {
+            key: k,
+            title: a.name ? `${a.name} (${a.id})` : a.id,
+            badgeCls: a.enabled === false ? 'offline' : 'online',
+            items: [],
+            collapsible: true,
+          });
+        }
+        map.get(k).items.push(ps);
+      }
+    }
+    const groups = Array.from(map.values()).sort((a, b) => {
+      const aLive = a.items.filter(x => getProjectActivityTier(x) === 3).length;
+      const bLive = b.items.filter(x => getProjectActivityTier(x) === 3).length;
+      if (bLive !== aLive) return bLive - aLive;
+      return b.items.length - a.items.length;
+    });
+    if (unassigned.length) {
+      groups.push({
+        key: 'cust:__unassigned__',
+        title: '未分配客户（仅管理员可见）',
+        badgeCls: 'alarm',
+        items: unassigned,
+        collapsible: true,
+      });
+    }
+    return groups;
+  }
+
+  // Default: group by live activity status
+  const live = [];
+  const recent = [];
+  const idle = [];
+  for (const ps of items) {
+    const t = getProjectActivityTier(ps);
+    if (t === 3) live.push(ps);
+    else if (t === 2) recent.push(ps);
+    else idle.push(ps);
+  }
+  const groups = [];
+  if (live.length) {
+    groups.push({ key: 'status:live', title: '传输中 · 实时活跃', badgeCls: 'online', items: live, collapsible: true });
+  }
+  if (recent.length) {
+    groups.push({ key: 'status:recent', title: '近期活跃', badgeCls: 'accent', items: recent, collapsible: true });
+  }
+  if (idle.length) {
+    // Auto-collapse idle group only when there are active projects AND many idle projects, unless user manually toggled it.
+    if (!projectViewState.userToggledGroups.has('status:idle')) {
+      if ((live.length + recent.length) > 0 && idle.length > 8) {
+        projectViewState.collapsedGroups.add('status:idle');
+      } else {
+        projectViewState.collapsedGroups.delete('status:idle');
+      }
+    }
+    groups.push({ key: 'status:idle', title: '静止 · 历史项目', badgeCls: '', items: idle, collapsible: true });
+  }
+  return groups;
 }
 
 function renderProjects(projects, winHours) {
   syncProjectGuideSelect(projects);
   const el = document.getElementById('projects-grid');
-  const winLbl = windowLabel(winHours);
+  if (!el) return;
   const cust = isCustomer();
-  if (!projects.length) {
+  const all = projects || [];
+
+  // Update status filter chip counters dynamically
+  const counts = {
+    all: all.length,
+    live: all.filter(ps => getProjectActivityTier(ps) === 3).length,
+    recent: all.filter(ps => getProjectActivityTier(ps) === 2).length,
+    attention: all.filter(ps => projectNeedsAttention(ps, cust)).length,
+    idle: all.filter(ps => getProjectActivityTier(ps) === 1).length,
+  };
+  const chipLabels = {
+    all: `全部 (${counts.all})`,
+    live: `传输中 (${counts.live})`,
+    recent: `近期活跃 (${counts.recent})`,
+    attention: cust ? `异常 (${counts.attention})` : `待分配 / 异常 (${counts.attention})`,
+    idle: `静止 (${counts.idle})`,
+  };
+  document.querySelectorAll('#projects-status-chips .disk-chip').forEach(chip => {
+    const key = chip.dataset.projFilter;
+    if (chipLabels[key]) chip.textContent = chipLabels[key];
+    chip.classList.toggle('active', key === projectViewState.filter);
+  });
+
+  if (!all.length) {
+    const sumEl = document.getElementById('projects-summary-counter');
+    if (sumEl) sumEl.textContent = '';
     el.innerHTML = cust
       ? '<div class="empty">当前账号暂未分配可见项目（默认全不可见），请联系管理员在控制台为您分配项目后即可查看数据并接入接收节点。</div>'
       : '<div class="empty">还没有项目，点击右上角「+ 新建项目」或通过 HTTP PUT 推送自动发现创建。</div>';
     return;
   }
-  el.innerHTML = projects.map(ps => {
+
+  // Apply status filter + search
+  const q = (projectViewState.search || '').trim().toLowerCase();
+  const filtered = all.filter(ps => {
     const p = ps.project;
-    const avail = (ps.a_node_availability || []).map(a => `
-      <span class="avail-chip">
-        <span>${esc(a.a_node_id)}</span>
-        <span class="badge online">积压 ${fmtNum(a.ready_count + a.claimed_count)}</span>
-        <span class="muted">${fmtBytes(a.ready_bytes)}</span>
-      </span>
-    `).join('') || '<span class="muted">当前无待传输积压</span>';
+    if (projectViewState.filter === 'live' && getProjectActivityTier(ps) !== 3) return false;
+    if (projectViewState.filter === 'recent' && getProjectActivityTier(ps) !== 2) return false;
+    if (projectViewState.filter === 'idle' && getProjectActivityTier(ps) !== 1) return false;
+    if (projectViewState.filter === 'attention' && !projectNeedsAttention(ps, cust)) return false;
+    if (!q) return true;
+    const accNames = getProjectAssignedAccounts(p.id).map(a => `${a.id} ${a.name || ''}`).join(' ');
+    const hay = `${p.id} ${p.name || ''} ${p.description || ''} ${accNames}`.toLowerCase();
+    return hay.includes(q);
+  });
 
-    const autoBadge = p.description === '上传自动发现创建' ? '<span class="badge">自动发现</span>' : '';
-    const affBadge = p.group_affinity === false
-      ? '<span class="badge">自由抢占</span>'
-      : '<span class="badge accent">同源亲和</span>';
-    const quotaParts = [];
-    if (p.max_total_concurrent > 0) quotaParts.push(`总并发 ≤ ${p.max_total_concurrent}`);
-    if (p.max_total_rate_mbps > 0) quotaParts.push(`总限速 ${p.max_total_rate_mbps} MB/s`);
-    const quotaBadge = quotaParts.length ? `<span class="badge alarm">${esc(quotaParts.join(' · '))}</span>` : '';
+  const sorted = sortProjectSummaries(filtered, projectViewState.sortBy);
+  const sumEl = document.getElementById('projects-summary-counter');
+  if (sumEl) {
+    sumEl.textContent = filtered.length === all.length
+      ? `共 ${all.length} 个项目 · 传输中 ${counts.live}`
+      : `筛选命中 ${filtered.length} / 共 ${all.length} 个项目`;
+  }
 
-    const assignedAccs = cust ? [] : (cachedAccounts || []).filter(a => Array.isArray(a.projects) && a.projects.includes(p.id));
-    const ownerRowHtml = cust ? '' : `
-      <div style="margin-top:6px;display:flex;gap:5px;flex-wrap:wrap;align-items:center">
-        <span class="muted" style="font-size:12px">可见客户:</span>
-        ${assignedAccs.length
-          ? assignedAccs.map(a => `<span class="badge online" title="${esc(a.id)}">${esc(a.name || a.id)}</span>`).join('')
-          : '<span class="badge alarm">未分配客户（仅管理员可见）</span>'}
+  if (!sorted.length) {
+    el.innerHTML = '<div class="empty">没有匹配当前搜索或筛选条件的项目。</div>';
+    return;
+  }
+
+  const effectiveGroupBy = (cust && projectViewState.groupBy === 'customer') ? 'status' : projectViewState.groupBy;
+  const groups = buildProjectGroups(sorted, effectiveGroupBy, cust);
+  const theadHtml = `
+    <thead>
+      <tr>
+        <th style="min-width:240px">项目 / 状态</th>
+        ${cust ? '' : '<th style="min-width:130px">可见客户</th>'}
+        <th style="min-width:140px">当前状态 / 积压</th>
+        <th style="min-width:135px">吞吐速率</th>
+        <th style="min-width:180px">累计交付</th>
+        <th style="width:126px;text-align:right">操作</th>
+      </tr>
+    </thead>
+  `;
+
+  el.innerHTML = groups.map(grp => {
+    const collapsed = grp.collapsible && projectViewState.collapsedGroups.has(grp.key);
+    const grpQueuedFiles = grp.items.reduce((s, x) => s + (x.queued_files || 0), 0);
+    const grpQueuedBytes = grp.items.reduce((s, x) => s + (x.queued_bytes || 0), 0);
+    const grpTotalBytes = grp.items.reduce((s, x) => s + (x.total_bytes || 0), 0);
+    const grpMetaParts = [];
+    if (grpQueuedFiles > 0) grpMetaParts.push(`待传 ${fmtNum(grpQueuedFiles)} (${fmtBytes(grpQueuedBytes)})`);
+    grpMetaParts.push(`累计 ${fmtBytes(grpTotalBytes)}`);
+    const rowsHtml = grp.items.map(ps => renderProjectCompactRow(ps, winHours, cust)).join('');
+
+    const headHtml = grp.collapsible ? `
+      <div class="proj-group-head" data-toggle-proj-group="${esc(grp.key)}">
+        <div class="proj-group-head-left">
+          <span class="proj-group-caret">${collapsed ? '▸' : '▾'}</span>
+          <span class="badge ${grp.badgeCls}">${esc(grp.title)}</span>
+          <span class="proj-group-count">${grp.items.length} 个项目</span>
+        </div>
+        <div class="proj-group-meta muted">${esc(grpMetaParts.join(' · '))}</div>
       </div>
-    `;
-    const actionsHtml = cust ? '' : `
-          <div style="display:flex;gap:6px;flex-wrap:wrap">
-            <button class="btn sm primary" data-action="assign-project-accounts" data-id="${esc(p.id)}">分配客户</button>
-            <button class="btn sm" data-action="quick-integrate-project" data-id="${esc(p.id)}">HTTP 接入</button>
-            <button class="btn sm" data-action="edit-project" data-id="${esc(p.id)}">编辑策略</button>
-            <button class="btn sm danger" data-action="delete-project" data-id="${esc(p.id)}">删除</button>
-          </div>
-    `;
-    const nodeSummaryHtml = cust
-      ? `<div class="v">在线接收节点 ${ps.online_b_nodes}</div>`
-      : `<div class="v">分发节点 ${ps.online_a_nodes} · 接收节点 ${ps.online_b_nodes}</div>`;
-    const availSectionHtml = cust ? '' : `
-        <div>
-          <div class="muted" style="margin-bottom:4px">各分发节点待传输积压汇总：</div>
-          ${avail}
-        </div>
-    `;
+    ` : '';
+
     return `
-      <div class="card">
-        <div class="card-head">
-          <div>
-            <h3>${esc(p.name || p.id)} ${autoBadge} ${affBadge} ${quotaBadge}</h3>
-            <div class="muted" style="margin-top:2px">
-              ${esc(p.description || '无备注')} · 内部 ID: <span class="mono" title="${esc(p.id)}">${esc(p.id)}</span>
-              <button type="button" class="btn sm ghost" style="padding:1px 6px;font-size:11px" data-copy-text="${esc(p.id)}">复制ID</button>
-            </div>
-            <div class="muted" style="margin-top:2px">冲突策略: ${esc(p.conflict_policy)} · 租约: ${p.lease_ttl_sec}s</div>
-            ${ownerRowHtml}
-          </div>
-          ${actionsHtml}
+      <div class="card proj-group-card">
+        ${headHtml}
+        <div class="table-wrap proj-group-body ${collapsed ? 'hidden' : ''}">
+          <table class="data-table proj-table">
+            ${theadHtml}
+            <tbody>${rowsHtml}</tbody>
+          </table>
         </div>
-        <div class="proj-stats-grid">
-          <div class="proj-stat-box">
-            <div class="k">${esc(winLbl)}平均速率</div>
-            <div class="v">${esc(fmtSpeed(ps.window_avg_speed_bps))} <span class="muted">(${esc(fmtMbps(ps.window_avg_speed_bps))})</span></div>
-            <div class="muted">活跃均速 ${esc(fmtSpeed(ps.active_avg_speed_bps))}</div>
-          </div>
-          <div class="proj-stat-box">
-            <div class="k">${esc(winLbl)}完成汇总</div>
-            <div class="v">${esc(fmtNum(ps.window_completed))} 文件 · ${esc(fmtBytes(ps.window_bytes))}</div>
-            <div class="muted">失败 ${esc(fmtNum(ps.window_failed))}</div>
-          </div>
-          <div class="proj-stat-box">
-            <div class="k">累计完成总量</div>
-            <div class="v">${esc(fmtNum(ps.total_completed))} 文件 · ${esc(fmtBytes(ps.total_bytes))}</div>
-            <div class="muted">累计失败 ${esc(fmtNum(ps.total_failed))}</div>
-          </div>
-          <div class="proj-stat-box">
-            <div class="k">在线节点</div>
-            ${nodeSummaryHtml}
-            <div class="muted">待传输 ${esc(fmtNum(ps.queued_files))} (${esc(fmtBytes(ps.queued_bytes))})</div>
-          </div>
-        </div>
-        ${availSectionHtml}
       </div>
     `;
   }).join('');
+}
+
+function openProjectDetailModal(projectId) {
+  activeProjectDetailId = projectId;
+  renderProjectDetailModal(projectId, lastProjectsWinHours);
+  openModal('project-detail-modal');
+}
+
+function jumpToProjectCurve(projectId) {
+  closeModal('project-detail-modal');
+  selectedProjectFilter = projectId || '';
+  const sel = document.getElementById('curve-project-filter');
+  if (sel) sel.value = selectedProjectFilter;
+  document.querySelectorAll('.tab').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+  document.querySelector('.tab[data-tab="dashboard"]')?.classList.add('active');
+  document.getElementById('tab-dashboard')?.classList.add('active');
+  refreshCurveOnly();
+  document.getElementById('speed-curve-wrap')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+
+function renderProjectDetailModal(projectId, winHours) {
+  const ps = (cachedProjects || []).find(x => x.project.id === projectId);
+  const titleEl = document.getElementById('proj-detail-title');
+  const badgesEl = document.getElementById('proj-detail-badges');
+  const subEl = document.getElementById('proj-detail-sub');
+  const bodyEl = document.getElementById('proj-detail-body');
+  if (!bodyEl) return;
+  if (!ps) {
+    titleEl.textContent = '项目不存在或已删除';
+    badgesEl.innerHTML = '';
+    subEl.textContent = '';
+    bodyEl.innerHTML = '<div class="empty">该项目已不在当前列表中。</div>';
+    return;
+  }
+
+  const p = ps.project;
+  const cust = isCustomer();
+  const winLbl = windowLabel(winHours);
+  const tier = getProjectActivityTier(ps);
+  const statusBadge = tier === 3
+    ? '<span class="badge online pulse">传输中</span>'
+    : (tier === 2 ? '<span class="badge accent">近期活跃</span>' : '<span class="badge">静止</span>');
+  const autoBadge = p.description === '上传自动发现创建' ? '<span class="badge">自动发现</span>' : '';
+  const affBadge = p.group_affinity === false
+    ? '<span class="badge">自由抢占</span>'
+    : '<span class="badge accent">同源亲和</span>';
+  const quotaParts = [];
+  if (p.max_total_concurrent > 0) quotaParts.push(`总并发 ≤ ${p.max_total_concurrent}`);
+  if (p.max_total_rate_mbps > 0) quotaParts.push(`总限速 ${p.max_total_rate_mbps} MB/s`);
+  const quotaBadge = quotaParts.length ? `<span class="badge alarm">${esc(quotaParts.join(' · '))}</span>` : '';
+
+  titleEl.textContent = p.name || p.id;
+  badgesEl.innerHTML = `${statusBadge}${autoBadge}${affBadge}${quotaBadge}`;
+  const lastActTxt = ps.last_activity_at ? `${fmtTimeShort(ps.last_activity_at, true)} (${fmtRelativeTime(ps.last_activity_at)})` : '暂无活动记录';
+  subEl.innerHTML = `
+    内部 ID: <span class="mono">${esc(p.id)}</span>
+    <button type="button" class="btn sm ghost" style="padding:1px 7px;font-size:11px;margin-left:4px" data-copy-text="${esc(p.id)}">复制 ID</button>
+    · 创建于 ${esc(fmtTimeShort(p.created_at, true) || '-')} · 最近活跃 ${esc(lastActTxt)}
+  `;
+
+  const assignedAccs = getProjectAssignedAccounts(p.id);
+  const conflictMap = { overwrite: '项目内覆盖 (overwrite)', auto_rename: '自动重命名 (auto_rename)', skip: '跳过已有 (skip)' };
+  const conflictLbl = conflictMap[p.conflict_policy] || p.conflict_policy;
+
+  const availHtml = (ps.a_node_availability || []).length
+    ? (ps.a_node_availability || []).map(a => `
+        <div class="proj-avail-row">
+          <div>
+            <strong>${esc(a.a_name || a.a_node_id)}</strong>
+            <span class="muted mono" style="margin-left:6px">${esc(a.a_node_id)}</span>
+            ${a.disk_alarm ? '<span class="badge alarm" style="margin-left:6px">磁盘水位告警</span>' : ''}
+          </div>
+          <div style="display:flex;gap:8px;align-items:center">
+            <span class="badge online">待拉 ${esc(fmtNum(a.ready_count))}</span>
+            ${a.claimed_count > 0 ? `<span class="badge accent">传输中 ${esc(fmtNum(a.claimed_count))}</span>` : ''}
+            <span class="mono muted">${esc(fmtBytes(a.ready_bytes))}</span>
+          </div>
+        </div>
+      `).join('')
+    : '<div class="muted" style="padding:6px 0">当前所有分发节点均无待传输积压</div>';
+
+  const quickBarHtml = `
+    <div class="proj-detail-actions">
+      <button type="button" class="btn sm primary" data-action="jump-project-curve" data-id="${esc(p.id)}">查看速度曲线</button>
+      ${cust ? '' : `
+        <button type="button" class="btn sm" data-action="assign-project-accounts" data-id="${esc(p.id)}">分配客户</button>
+        <button type="button" class="btn sm" data-action="quick-integrate-project" data-id="${esc(p.id)}">HTTP 接入代码</button>
+        <button type="button" class="btn sm" data-action="edit-project" data-id="${esc(p.id)}">编辑策略</button>
+      `}
+    </div>
+  `;
+
+  const ownerSectionHtml = cust ? '' : `
+    <div class="config-section">
+      <div class="config-section-title">可见客户账号</div>
+      <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+        ${assignedAccs.length
+          ? assignedAccs.map(a => `<span class="badge online">${esc(a.name || a.id)} <span class="mono" style="opacity:0.75">(${esc(a.id)})</span></span>`).join('')
+          : '<span class="badge alarm">未分配客户（当前仅管理员可见）</span>'}
+      </div>
+    </div>
+  `;
+
+  const availSectionHtml = cust ? '' : `
+    <div class="config-section">
+      <div class="config-section-title">各分发节点实时积压明细（共 ${esc(fmtNum(ps.queued_files))} 文件 · ${esc(fmtBytes(ps.queued_bytes))}）</div>
+      <div class="proj-avail-list">${availHtml}</div>
+    </div>
+  `;
+
+  const dangerFooterHtml = cust ? '' : `
+    <div class="modal-footer-reinstall" style="margin-top:14px">
+      <span>高危操作：删除项目仅移除中心记录与统计，不会删除接收节点已落盘文件。</span>
+      <button type="button" class="btn sm danger" data-action="delete-project" data-id="${esc(p.id)}">删除此项目</button>
+    </div>
+  `;
+
+  bodyEl.innerHTML = `
+    ${quickBarHtml}
+    <div class="proj-stats-grid" style="margin-bottom:14px">
+      <div class="proj-stat-box">
+        <div class="k">实时 / 近 10 分钟速率</div>
+        <div class="v">${ps.recent_speed_bps > 0 ? `${esc(fmtSpeed(ps.recent_speed_bps))} <span class="muted">(${esc(fmtMbps(ps.recent_speed_bps))})</span>` : '<span class="muted">当前空闲</span>'}</div>
+        <div class="muted">近 10 分流量 ${esc(fmtBytes(ps.recent_bytes || 0))}</div>
+      </div>
+      <div class="proj-stat-box">
+        <div class="k">${esc(winLbl)}平均速率</div>
+        <div class="v">${esc(fmtSpeed(ps.window_avg_speed_bps))} <span class="muted">(${esc(fmtMbps(ps.window_avg_speed_bps))})</span></div>
+        <div class="muted">活跃均速 ${esc(fmtSpeed(ps.active_avg_speed_bps))}</div>
+      </div>
+      <div class="proj-stat-box">
+        <div class="k">${esc(winLbl)}完成汇总</div>
+        <div class="v">${esc(fmtNum(ps.window_completed))} 文件 · ${esc(fmtBytes(ps.window_bytes))}</div>
+        <div class="muted">窗口失败 ${esc(fmtNum(ps.window_failed))}</div>
+      </div>
+      <div class="proj-stat-box">
+        <div class="k">累计完成总量</div>
+        <div class="v">${esc(fmtNum(ps.total_completed))} 文件 · ${esc(fmtBytes(ps.total_bytes))}</div>
+        <div class="muted">累计上传 ${esc(fmtNum(ps.total_uploaded))} · 累计失败 ${esc(fmtNum(ps.total_failed))}</div>
+      </div>
+    </div>
+
+    <div class="config-section" style="margin-bottom:12px">
+      <div class="config-section-title">隔离策略与运行环境</div>
+      <div class="proj-meta-grid">
+        <div><span class="muted">备注说明：</span>${esc(p.description || '无备注')}</div>
+        <div><span class="muted">同名冲突策略：</span>${esc(conflictLbl)}</div>
+        <div><span class="muted">抢占租约超时：</span>${p.lease_ttl_sec} 秒</div>
+        <div><span class="muted">多机资产亲和：</span>${p.group_affinity === false ? '已关闭（自由抢占）' : '已开启（同素材组落同机）'}</div>
+        <div><span class="muted">全局并发 / 限速：</span>${p.max_total_concurrent > 0 ? `≤ ${p.max_total_concurrent}` : '不限并发'} · ${p.max_total_rate_mbps > 0 ? `${p.max_total_rate_mbps} MB/s` : '不限速'}</div>
+        <div><span class="muted">在线节点覆盖：</span>${cust ? `接收节点 ${ps.online_b_nodes}` : `分发节点 ${ps.online_a_nodes} · 接收节点 ${ps.online_b_nodes}`}</div>
+      </div>
+    </div>
+
+    ${ownerSectionHtml}
+    ${availSectionHtml}
+    ${dangerFooterHtml}
+  `;
 }
 
 function renderUpgradeBadge(n) {
@@ -1800,6 +2291,8 @@ function openAccountModal(accountId = '') {
     form.elements.enabled.checked = true;
     renderAccountProjectChecks([]);
   }
+  const accSearch = document.getElementById('account-project-search');
+  if (accSearch) accSearch.value = '';
   openModal('account-modal');
 }
 
@@ -1904,6 +2397,10 @@ async function deleteProject(id) {
   if (!confirm(`确认删除项目 ${id} 吗？`)) return;
   try {
     await api(`/api/v1/admin/projects/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    if (activeProjectDetailId === id) {
+      activeProjectDetailId = '';
+      closeModal('project-detail-modal');
+    }
     showToast(`已删除项目 ${id}`, 'success');
     refreshAll();
   } catch (e) {
@@ -2638,6 +3135,8 @@ function openEditNodeProjectsModal(nodeId) {
     form.elements.edit_project_mode.value = 'all';
   }
   form.elements.projects.value = projs.join(',');
+  const projSearch = document.getElementById('edit-project-search');
+  if (projSearch) projSearch.value = '';
   renderEditProjectChecks(projs);
   renderEditDisksList(node);
   updateNodeDiskModalBanners(node, 'agent_b');
@@ -2796,7 +3295,10 @@ function setupEvents() {
     }
     const copyBtn = e.target.closest('button[data-copy-text]');
     if (copyBtn) {
-      copyText(copyBtn.dataset.copyText, '命令已复制到剪贴板');
+      const msg = copyBtn.classList.contains('proj-short-id') || copyBtn.textContent?.includes('ID')
+        ? '项目 ID 已复制到剪贴板'
+        : '命令已复制到剪贴板';
+      copyText(copyBtn.dataset.copyText, msg);
       return;
     }
     const swTabBtn = e.target.closest('button[data-switch-tab]');
@@ -2852,27 +3354,82 @@ function setupEvents() {
       }
       return;
     }
-    const btn = e.target.closest('button[data-action]');
-    if (!btn) return;
-    const id = btn.dataset.id || '';
-    switch (btn.dataset.action) {
-      case 'assign-project-accounts': openAssignProjectModal(id); break;
-      case 'quick-integrate-project': openProjectQuickGuide(id); break;
-      case 'edit-project': openProjectModal(id); break;
-      case 'delete-project': deleteProject(id); break;
-      case 'toggle-pause-node': togglePauseNode(id, btn.dataset.paused === '1'); break;
-      case 'delete-node': deleteNode(id); break;
-      case 'delete-release': deleteRelease(id); break;
-      case 'view-deploy-task': viewDeployTaskLog(id); break;
-      case 'open-a-script': openAScriptModal(id); break;
-      case 'open-b-script': openBScriptModal(id); break;
-      case 'edit-a-disks': openEditADisksModal(id); break;
-      case 'edit-node-projects': openEditNodeProjectsModal(id); break;
-      case 'view-node-disks': openNodeDisksViewModal(id); break;
-      case 'edit-account': openAccountModal(id); break;
-      case 'rotate-account': rotateAccountToken(id); break;
-      case 'delete-account': deleteAccount(id); break;
+    const toggleGrp = e.target.closest('[data-toggle-proj-group]');
+    if (toggleGrp) {
+      const k = toggleGrp.dataset.toggleProjGroup;
+      if (k) {
+        projectViewState.userToggledGroups.add(k);
+        if (projectViewState.collapsedGroups.has(k)) projectViewState.collapsedGroups.delete(k);
+        else projectViewState.collapsedGroups.add(k);
+        renderProjects(cachedProjects, lastProjectsWinHours);
+      }
+      return;
     }
+    const projFilterBtn = e.target.closest('#projects-status-chips button[data-proj-filter]');
+    if (projFilterBtn) {
+      projectViewState.filter = projFilterBtn.dataset.projFilter || 'all';
+      renderProjects(cachedProjects, lastProjectsWinHours);
+      return;
+    }
+    const btn = e.target.closest('button[data-action]');
+    if (btn) {
+      const id = btn.dataset.id || '';
+      switch (btn.dataset.action) {
+        case 'view-project-detail': openProjectDetailModal(id); break;
+        case 'jump-project-curve': jumpToProjectCurve(id); break;
+        case 'assign-project-accounts': openAssignProjectModal(id); break;
+        case 'quick-integrate-project': openProjectQuickGuide(id); break;
+        case 'edit-project': openProjectModal(id); break;
+        case 'delete-project': deleteProject(id); break;
+        case 'toggle-pause-node': togglePauseNode(id, btn.dataset.paused === '1'); break;
+        case 'delete-node': deleteNode(id); break;
+        case 'delete-release': deleteRelease(id); break;
+        case 'view-deploy-task': viewDeployTaskLog(id); break;
+        case 'open-a-script': openAScriptModal(id); break;
+        case 'open-b-script': openBScriptModal(id); break;
+        case 'edit-a-disks': openEditADisksModal(id); break;
+        case 'edit-node-projects': openEditNodeProjectsModal(id); break;
+        case 'view-node-disks': openNodeDisksViewModal(id); break;
+        case 'edit-account': openAccountModal(id); break;
+        case 'rotate-account': rotateAccountToken(id); break;
+        case 'delete-account': deleteAccount(id); break;
+      }
+      return;
+    }
+    const projRow = e.target.closest('tr[data-open-project-detail]');
+    if (projRow && !e.target.closest('button, a, input, select')) {
+      openProjectDetailModal(projRow.dataset.openProjectDetail);
+      return;
+    }
+  });
+
+  // Compact Projects Toolbar controls & HTTP Guide modal trigger
+  document.getElementById('open-project-guide-btn')?.addEventListener('click', () => {
+    openProjectQuickGuide('');
+  });
+  document.getElementById('projects-search')?.addEventListener('input', (e) => {
+    projectViewState.search = e.target.value || '';
+    renderProjects(cachedProjects, lastProjectsWinHours);
+  });
+  document.getElementById('projects-group-by')?.addEventListener('change', (e) => {
+    projectViewState.groupBy = e.target.value || 'status';
+    renderProjects(cachedProjects, lastProjectsWinHours);
+  });
+  document.getElementById('projects-sort-by')?.addEventListener('change', (e) => {
+    projectViewState.sortBy = e.target.value || 'activity';
+    renderProjects(cachedProjects, lastProjectsWinHours);
+  });
+  document.addEventListener('input', (e) => {
+    const inp = e.target.closest('input[data-proj-picker-filter]');
+    if (!inp) return;
+    const targetId = inp.dataset.projPickerFilter;
+    const grid = document.getElementById(targetId);
+    if (!grid) return;
+    const kw = (inp.value || '').trim().toLowerCase();
+    grid.querySelectorAll('.proj-check-card').forEach(card => {
+      const txt = `${card.textContent || ''} ${card.title || ''}`.toLowerCase();
+      card.classList.toggle('hidden', kw !== '' && !txt.includes(kw));
+    });
   });
 
   // Dynamic center healthz probe command in receiver onboarding guide

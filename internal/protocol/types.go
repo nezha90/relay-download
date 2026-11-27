@@ -499,6 +499,9 @@ type ProjectSummary struct {
 	WindowBytes       int64               `json:"window_bytes"`
 	WindowAvgSpeedBps int64               `json:"window_avg_speed_bps"`
 	ActiveAvgSpeedBps int64               `json:"active_avg_speed_bps"`
+	RecentBytes       int64               `json:"recent_bytes,omitempty"`
+	RecentSpeedBps    int64               `json:"recent_speed_bps,omitempty"`
+	LastActivityAt    *time.Time          `json:"last_activity_at,omitempty"`
 	QueuedFiles       int                 `json:"queued_files"`
 	QueuedBytes       int64               `json:"queued_bytes"`
 	OnlineANodes      int                 `json:"online_a_nodes"`

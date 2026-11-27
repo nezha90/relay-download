@@ -155,169 +155,55 @@
       <div class="section-bar">
         <div>
           <h2>项目隔离管理</h2>
-          <div id="projects-section-desc" class="muted" style="margin-top:3px">业务方 PUT 上传新项目时将自动发现并建档；也可手动提前创建并自定义同名冲突策略
+          <div id="projects-section-desc" class="muted" style="margin-top:3px">默认按活跃度分组置顶；点击任意项目行按需查看详情、节点积压与策略配置
           </div>
         </div>
-        <button id="open-create-project" class="btn primary" data-admin-only="1">+ 新建项目</button>
+        <div class="btn-row">
+          <button id="open-project-guide-btn" type="button" class="btn" data-admin-only="1">HTTP 接入指南</button>
+          <button id="open-create-project" type="button" class="btn primary" data-admin-only="1">+ 新建项目</button>
+        </div>
       </div>
 
-      <!-- Project HTTP Quick Integration Guide (Admin Only, Collapsed by Default) -->
-      <div class="card guide-card" id="guide-p-card" data-admin-only="1">
-        <div class="guide-head" data-toggle-guide="guide-p-body">
-          <div class="guide-head-left">
-            <span class="badge accent">HTTP 快速接入</span>
-            <h3>业务方如何向项目推送文件？（PUT 流式直传 / 表单上传 / 零拷贝批量注册 / Python 示例）</h3>
-          </div>
-          <button type="button" class="btn sm ghost" data-toggle-guide="guide-p-body">展开指南</button>
-        </div>
-        <div id="guide-p-body" class="guide-body hidden">
-          <div class="concept-box">
-            <strong>接口接入说明：</strong> 业务方在<strong>分发节点本机</strong>直接调用 <code>http://127.0.0.1:&lt;本机上传端口&gt;</code>（默认
-            <code>18081</code>），<strong>仅限本机回环访问、免鉴权直传</strong>（无需配置任何
-            Token）。<strong>新项目无需提前建档</strong>，首次上传自动创建项目隔离目录：携带 <code>X-Customer</code> 请求头可直接自动分配给指定客户（同时支持可选 <code>X-Project-Name</code> 设置备注名），不带则默认仅管理员可见；已存在项目不会覆盖后台已调权限。
-          </div>
-
-          <div class="api-var-bar">
-            <label class="api-var-item">
-              <span>选择/填写项目 ID</span>
-              <div style="display:flex;gap:6px">
-                <select id="guide-p-project-select" class="window-select"></select>
-                <input id="guide-p-project-input" type="text" placeholder="my-project" value="my-project"
-                  autocomplete="off" />
-              </div>
-            </label>
-            <label class="api-var-item" style="min-width:210px">
-              <span>首次建档自动分配给客户（可选）</span>
-              <select id="guide-p-customer-select" class="window-select">
-                <option value="">不指定（默认仅管理员可见）</option>
+      <!-- Compact Ops Filter / Group / Sort Toolbar -->
+      <div id="projects-toolbar" class="proj-toolbar card">
+        <div class="proj-toolbar-top">
+          <input type="text" id="projects-search" class="disk-search-input proj-search-input"
+            placeholder="搜索项目名、UUID、备注或客户..." autocomplete="off" />
+          <div class="proj-toolbar-selects">
+            <label class="proj-ctrl-label">
+              <span>分组</span>
+              <select id="projects-group-by" class="window-select">
+                <option value="status" selected>按活跃状态</option>
+                <option value="customer" data-admin-only="1">按客户归属</option>
+                <option value="none">不分组</option>
               </select>
             </label>
-            <label class="api-var-item" style="max-width:130px">
-              <span>本机上传端口</span>
-              <input id="guide-p-port" type="number" value="18081" min="1" max="65535" />
+            <label class="proj-ctrl-label">
+              <span>排序</span>
+              <select id="projects-sort-by" class="window-select">
+                <option value="activity" selected>按活跃度</option>
+                <option value="queued">按待传积压</option>
+                <option value="bytes">按累计流量</option>
+                <option value="recent">按最近活跃时间</option>
+                <option value="created">按最新创建</option>
+                <option value="name">按名称</option>
+              </select>
             </label>
           </div>
-
-          <div class="guide-subtabs" role="tablist">
-            <button type="button" class="guide-subtab active" data-guide-p-mode="http">1. HTTP PUT / POST
-              上传（推荐）</button>
-            <button type="button" class="guide-subtab" data-guide-p-mode="register">2. 本机零拷贝注册（亿级批量）</button>
-            <button type="button" class="guide-subtab" data-guide-p-mode="python">3. Python 接入示例（含水位重试）</button>
-            <button type="button" class="guide-subtab" data-guide-p-mode="status">4. 状态查询与错误码规范</button>
+        </div>
+        <div class="proj-toolbar-bottom">
+          <div id="projects-status-chips" class="disk-filter-chips" style="margin-bottom:0">
+            <button type="button" class="disk-chip active" data-proj-filter="all">全部</button>
+            <button type="button" class="disk-chip" data-proj-filter="live">传输中</button>
+            <button type="button" class="disk-chip" data-proj-filter="recent">近期活跃</button>
+            <button type="button" class="disk-chip" data-proj-filter="attention">待分配 / 异常</button>
+            <button type="button" class="disk-chip" data-proj-filter="idle">静止</button>
           </div>
-
-          <div id="guide-p-pane-http" class="api-pane">
-            <div class="api-snippet-grid">
-              <div class="api-snippet-card">
-                <div class="api-snippet-head">
-                  <div>
-                    <span class="badge online">推荐 · 流式大文件</span>
-                    <strong>PUT 原始流直传（支持多级子目录）</strong>
-                  </div>
-                  <button type="button" class="btn sm" data-copy-el="code-p-put">一键复制</button>
-                </div>
-                <div class="muted">路径格式：<code>PUT /local/v1/files/{项目ID}/{相对路径文件名}</code>，流式落盘零内存爆涨。</div>
-                <pre id="code-p-put" class="code-block"></pre>
-              </div>
-              <div class="api-snippet-card">
-                <div class="api-snippet-head">
-                  <div>
-                    <span class="badge accent">强校验</span>
-                    <strong>PUT 带 SHA256 端到端校验</strong>
-                  </div>
-                  <button type="button" class="btn sm" data-copy-el="code-p-put-sha">一键复制</button>
-                </div>
-                <div class="muted">附加 <code>X-Expected-SHA256</code> 头，不匹配直接返回 <code>400</code> 拒收，杜绝源端损坏。</div>
-                <pre id="code-p-put-sha" class="code-block"></pre>
-              </div>
-            </div>
-            <div class="api-snippet-card" style="margin-top:10px">
-              <div class="api-snippet-head">
-                <div>
-                  <span class="badge">兼容表单</span>
-                  <strong>POST Multipart 表单上传（<code>/local/v1/upload</code>）</strong>
-                </div>
-                <button type="button" class="btn sm" data-copy-el="code-p-multipart">一键复制</button>
-              </div>
-              <div class="muted">适合已有 Web/SDK 表单上传逻辑；也支持直接 POST 二进制流并附带 Header <code>X-Project</code> 与
-                <code>X-Filename</code>。
-              </div>
-              <pre id="code-p-multipart" class="code-block"></pre>
-            </div>
-          </div>
-
-          <div id="guide-p-pane-register" class="api-pane hidden">
-            <div class="api-snippet-grid">
-              <div class="api-snippet-card">
-                <div class="api-snippet-head">
-                  <div>
-                    <span class="badge online">零拷贝 · 极速</span>
-                    <strong>单文件本地注册（<code>POST /local/v1/register</code>）</strong>
-                  </div>
-                  <button type="button" class="btn sm" data-copy-el="code-p-reg">一键复制</button>
-                </div>
-                <div class="muted">文件已在分发机磁盘上时，同盘 <code>move</code> 原子改名或 <code>hardlink</code> 硬链接（不删源文件），免 HTTP 重复拷贝。
-                </div>
-                <pre id="code-p-reg" class="code-block"></pre>
-              </div>
-              <div class="api-snippet-card">
-                <div class="api-snippet-head">
-                  <div>
-                    <span class="badge accent">单次最多 256 个</span>
-                    <strong>批量注册入队（<code>POST /local/v1/register-batch</code>）</strong>
-                  </div>
-                  <button type="button" class="btn sm" data-copy-el="code-p-reg-batch">一键复制</button>
-                </div>
-                <div class="muted">亿级小文件 / 采集落盘场景首选，单事务批量写入队列，吞吐提升 10x+。</div>
-                <pre id="code-p-reg-batch" class="code-block"></pre>
-              </div>
-            </div>
-          </div>
-
-          <div id="guide-p-pane-python" class="api-pane hidden">
-            <div class="api-snippet-card">
-              <div class="api-snippet-head">
-                <div>
-                  <span class="badge online">Python 3 标准示例</span>
-                  <strong>流式上传 + 自动处理 507 水位退避重试</strong>
-                </div>
-                <button type="button" class="btn sm" data-copy-el="code-p-python">一键复制</button>
-              </div>
-              <div class="muted">依赖 <code>requests</code>（或换成标准库 <code>urllib</code>）；遇到 <code>503</code>（待选盘）或
-                <code>507</code>（磁盘水位满）自动退避等待，确保业务零丢包。
-              </div>
-              <pre id="code-p-python" class="code-block"></pre>
-            </div>
-          </div>
-
-          <div id="guide-p-pane-status" class="api-pane hidden">
-            <div class="api-snippet-card" style="margin-bottom:10px">
-              <div class="api-snippet-head">
-                <div>
-                  <span class="badge accent">健康与积压探针</span>
-                  <strong>查询项目排队与磁盘水位（<code>GET /local/v1/status</code>）</strong>
-                </div>
-                <button type="button" class="btn sm" data-copy-el="code-p-status">一键复制</button>
-              </div>
-              <pre id="code-p-status" class="code-block"></pre>
-            </div>
-            <div class="api-codes-grid">
-              <div class="api-code-item"><span class="badge online">200 OK</span><span>入队成功，返回
-                  <code>{"file_id","project_id","filename","size","sha256","status":"ready"}</code></span></div>
-              <div class="api-code-item"><span class="badge offline">400</span><span>项目 ID 非法（仅允许
-                  <code>A-Za-z0-9._-</code> 1~64 位）、文件名非法或 SHA256 不一致</span></div>
-              <div class="api-code-item"><span class="badge offline">403</span><span>仅允许本机
-                  <code>localhost / 127.0.0.1</code> 直连（拒绝远程、反代或跨站请求），或该分发节点限制了允许的项目</span></div>
-              <div class="api-code-item"><span
-                  class="badge awaiting">503</span><span>分发节点尚未在控制台勾选激活数据盘，请前往「分发节点」选盘激活</span></div>
-              <div class="api-code-item"><span class="badge alarm">507</span><span>触发强制安全水位（默认 ≥85%，支持节点自定义
-                  1%~99%），上游退避几秒重试即可，绝不写爆磁盘</span></div>
-            </div>
-          </div>
+          <span id="projects-summary-counter" class="muted" style="font-size:12px"></span>
         </div>
       </div>
 
-      <div id="projects-grid" class="card-grid"></div>
+      <div id="projects-grid" class="proj-groups-wrap"></div>
     </section>
 
     <!-- Dispatch (Source/Edge) Nodes Tab -->
@@ -850,6 +736,8 @@
             <input name="single_project_custom" placeholder="输入项目 ID" autocomplete="off" />
           </label>
           <div id="edit-multi-projects-wrap" class="form-stack hidden">
+            <input type="text" id="edit-project-search" class="disk-search-input" data-proj-picker-filter="edit-project-checks"
+              placeholder="搜索项目名称或 ID..." autocomplete="off" />
             <div id="edit-project-checks" class="proj-check-grid"></div>
             <label>已选项目列表 (逗号分隔，按先后顺序生效；可手动补充项目 ID)
               <input name="projects" placeholder="proj-alpha,proj-beta" autocomplete="off" />
@@ -1304,6 +1192,8 @@
           <div class="config-section-title">授权可见项目（默认全部不可见 · 需显式勾选分配）</div>
           <div class="muted">HTTP PUT 新自动创建的项目默认不对任何客户可见；取消全部勾选后该客户将不可见任何项目，仅可管理归属自己的接收节点。</div>
           <div id="account-projects-wrap" class="form-stack">
+            <input type="text" id="account-project-search" class="disk-search-input" data-proj-picker-filter="account-project-checks"
+              placeholder="搜索项目名称或 ID..." autocomplete="off" />
             <div id="account-project-checks" class="proj-check-grid"></div>
             <label>已授权项目 ID (逗号分隔，可手动补充尚未建档的项目 ID)
               <input name="projects" placeholder="选择上方项目自动填入，留空表示暂不分配任何项目" autocomplete="off" />
@@ -1392,6 +1282,184 @@
         <button type="button" class="disk-chip" data-view-state="alert">⚠ 异常/拔出/重插</button>
       </div>
       <div id="node-disks-view-grid" class="disk-scroll-grid"></div>
+    </div>
+  </div>
+
+  <!-- On-Demand Project Detail Modal -->
+  <div id="project-detail-modal" class="overlay hidden">
+    <div class="modal-card wide">
+      <div class="modal-head">
+        <div style="min-width:0">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <h3 id="proj-detail-title" style="margin:0">项目详情</h3>
+            <span id="proj-detail-badges" style="display:inline-flex;gap:5px;flex-wrap:wrap"></span>
+          </div>
+          <div id="proj-detail-sub" class="muted" style="margin-top:4px;font-size:12px"></div>
+        </div>
+        <button class="btn ghost" type="button" data-close-modal="project-detail-modal">关闭</button>
+      </div>
+      <div id="proj-detail-body"></div>
+    </div>
+  </div>
+
+  <!-- Project HTTP Quick Integration Guide Modal (Admin Only) -->
+  <div id="project-guide-modal" class="overlay hidden" data-admin-only="1">
+    <div class="modal-card wide">
+      <div class="modal-head">
+        <div>
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <span class="badge accent">HTTP 快速接入</span>
+            <h3 style="margin:0">业务方推送文件指南（PUT 流式直传 / 表单 / 零拷贝 / Python）</h3>
+          </div>
+          <p class="muted" style="margin:4px 0 0">本机回环免 Token 直传，首次上传自动建档并支持 <code>X-Customer</code> 直接分配客户</p>
+        </div>
+        <button class="btn ghost" type="button" data-close-modal="project-guide-modal">关闭</button>
+      </div>
+      <div id="guide-p-body" class="guide-body" style="margin-top:0;padding-top:0;border-top:none">
+        <div class="concept-box">
+          <strong>接口接入说明：</strong> 业务方在<strong>分发节点本机</strong>直接调用 <code>http://127.0.0.1:&lt;本机上传端口&gt;</code>（默认
+          <code>18081</code>），<strong>仅限本机回环访问、免鉴权直传</strong>（无需配置任何
+          Token）。<strong>新项目无需提前建档</strong>，首次上传自动创建项目隔离目录：携带 <code>X-Customer</code> 请求头可直接自动分配给指定客户（同时支持可选 <code>X-Project-Name</code> 设置备注名），不带则默认仅管理员可见；已存在项目不会覆盖后台已调权限。
+        </div>
+
+        <div class="api-var-bar">
+          <label class="api-var-item">
+            <span>选择/填写项目 ID</span>
+            <div style="display:flex;gap:6px">
+              <select id="guide-p-project-select" class="window-select"></select>
+              <input id="guide-p-project-input" type="text" placeholder="my-project" value="my-project"
+                autocomplete="off" />
+            </div>
+          </label>
+          <label class="api-var-item" style="min-width:210px">
+            <span>首次建档自动分配给客户（可选）</span>
+            <select id="guide-p-customer-select" class="window-select">
+              <option value="">不指定（默认仅管理员可见）</option>
+            </select>
+          </label>
+          <label class="api-var-item" style="max-width:130px">
+            <span>本机上传端口</span>
+            <input id="guide-p-port" type="number" value="18081" min="1" max="65535" />
+          </label>
+        </div>
+
+        <div class="guide-subtabs" role="tablist">
+          <button type="button" class="guide-subtab active" data-guide-p-mode="http">1. HTTP PUT / POST
+            上传（推荐）</button>
+          <button type="button" class="guide-subtab" data-guide-p-mode="register">2. 本机零拷贝注册（亿级批量）</button>
+          <button type="button" class="guide-subtab" data-guide-p-mode="python">3. Python 接入示例（含水位重试）</button>
+          <button type="button" class="guide-subtab" data-guide-p-mode="status">4. 状态查询与错误码规范</button>
+        </div>
+
+        <div id="guide-p-pane-http" class="api-pane">
+          <div class="api-snippet-grid">
+            <div class="api-snippet-card">
+              <div class="api-snippet-head">
+                <div>
+                  <span class="badge online">推荐 · 流式大文件</span>
+                  <strong>PUT 原始流直传（支持多级子目录）</strong>
+                </div>
+                <button type="button" class="btn sm" data-copy-el="code-p-put">一键复制</button>
+              </div>
+              <div class="muted">路径格式：<code>PUT /local/v1/files/{项目ID}/{相对路径文件名}</code>，流式落盘零内存爆涨。</div>
+              <pre id="code-p-put" class="code-block"></pre>
+            </div>
+            <div class="api-snippet-card">
+              <div class="api-snippet-head">
+                <div>
+                  <span class="badge accent">强校验</span>
+                  <strong>PUT 带 SHA256 端到端校验</strong>
+                </div>
+                <button type="button" class="btn sm" data-copy-el="code-p-put-sha">一键复制</button>
+              </div>
+              <div class="muted">附加 <code>X-Expected-SHA256</code> 头，不匹配直接返回 <code>400</code> 拒收，杜绝源端损坏。</div>
+              <pre id="code-p-put-sha" class="code-block"></pre>
+            </div>
+          </div>
+          <div class="api-snippet-card" style="margin-top:10px">
+            <div class="api-snippet-head">
+              <div>
+                <span class="badge">兼容表单</span>
+                <strong>POST Multipart 表单上传（<code>/local/v1/upload</code>）</strong>
+              </div>
+              <button type="button" class="btn sm" data-copy-el="code-p-multipart">一键复制</button>
+            </div>
+            <div class="muted">适合已有 Web/SDK 表单上传逻辑；也支持直接 POST 二进制流并附带 Header <code>X-Project</code> 与
+              <code>X-Filename</code>。
+            </div>
+            <pre id="code-p-multipart" class="code-block"></pre>
+          </div>
+        </div>
+
+        <div id="guide-p-pane-register" class="api-pane hidden">
+          <div class="api-snippet-grid">
+            <div class="api-snippet-card">
+              <div class="api-snippet-head">
+                <div>
+                  <span class="badge online">零拷贝 · 极速</span>
+                  <strong>单文件本地注册（<code>POST /local/v1/register</code>）</strong>
+                </div>
+                <button type="button" class="btn sm" data-copy-el="code-p-reg">一键复制</button>
+              </div>
+              <div class="muted">文件已在分发机磁盘上时，同盘 <code>move</code> 原子改名或 <code>hardlink</code> 硬链接（不删源文件），免 HTTP 重复拷贝。
+              </div>
+              <pre id="code-p-reg" class="code-block"></pre>
+            </div>
+            <div class="api-snippet-card">
+              <div class="api-snippet-head">
+                <div>
+                  <span class="badge accent">单次最多 256 个</span>
+                  <strong>批量注册入队（<code>POST /local/v1/register-batch</code>）</strong>
+                </div>
+                <button type="button" class="btn sm" data-copy-el="code-p-reg-batch">一键复制</button>
+              </div>
+              <div class="muted">亿级小文件 / 采集落盘场景首选，单事务批量写入队列，吞吐提升 10x+。</div>
+              <pre id="code-p-reg-batch" class="code-block"></pre>
+            </div>
+          </div>
+        </div>
+
+        <div id="guide-p-pane-python" class="api-pane hidden">
+          <div class="api-snippet-card">
+            <div class="api-snippet-head">
+              <div>
+                <span class="badge online">Python 3 标准示例</span>
+                <strong>流式上传 + 自动处理 507 水位退避重试</strong>
+              </div>
+              <button type="button" class="btn sm" data-copy-el="code-p-python">一键复制</button>
+            </div>
+            <div class="muted">依赖 <code>requests</code>（或换成标准库 <code>urllib</code>）；遇到 <code>503</code>（待选盘）或
+              <code>507</code>（磁盘水位满）自动退避等待，确保业务零丢包。
+            </div>
+            <pre id="code-p-python" class="code-block"></pre>
+          </div>
+        </div>
+
+        <div id="guide-p-pane-status" class="api-pane hidden">
+          <div class="api-snippet-card" style="margin-bottom:10px">
+            <div class="api-snippet-head">
+              <div>
+                <span class="badge accent">健康与积压探针</span>
+                <strong>查询项目排队与磁盘水位（<code>GET /local/v1/status</code>）</strong>
+              </div>
+              <button type="button" class="btn sm" data-copy-el="code-p-status">一键复制</button>
+            </div>
+            <pre id="code-p-status" class="code-block"></pre>
+          </div>
+          <div class="api-codes-grid">
+            <div class="api-code-item"><span class="badge online">200 OK</span><span>入队成功，返回
+                <code>{"file_id","project_id","filename","size","sha256","status":"ready"}</code></span></div>
+            <div class="api-code-item"><span class="badge offline">400</span><span>项目 ID 非法（仅允许
+                <code>A-Za-z0-9._-</code> 1~64 位）、文件名非法或 SHA256 不一致</span></div>
+            <div class="api-code-item"><span class="badge offline">403</span><span>仅允许本机
+                <code>localhost / 127.0.0.1</code> 直连（拒绝远程、反代或跨站请求），或该分发节点限制了允许的项目</span></div>
+            <div class="api-code-item"><span
+                class="badge awaiting">503</span><span>分发节点尚未在控制台勾选激活数据盘，请前往「分发节点」选盘激活</span></div>
+            <div class="api-code-item"><span class="badge alarm">507</span><span>触发强制安全水位（默认 ≥85%，支持节点自定义
+                1%~99%），上游退避几秒重试即可，绝不写爆磁盘</span></div>
+          </div>
+        </div>
+      </div>
     </div>
   </div>
 

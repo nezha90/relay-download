@@ -26,6 +26,9 @@ type WindowSummary struct {
 	Bytes             int64
 	WindowAvgSpeedBps int64
 	ActiveAvgSpeedBps int64
+	RecentBytes       int64
+	RecentSpeedBps    int64
+	LastActivityAt    *time.Time
 }
 
 type IntervalQuery struct {
@@ -1211,7 +1214,7 @@ func (s *Store) GetWindowEntityStatsScoped(ctx context.Context, now time.Time, h
 	}
 	query := fmt.Sprintf(`
 SELECT bucket_ts, project_id, a_node_id, b_node_id,
-       SUM(files_completed), SUM(files_failed), SUM(bytes_transferred)
+       SUM(files_uploaded), SUM(files_completed), SUM(files_failed), SUM(bytes_transferred)
 FROM stats_intervals
 WHERE %s
 GROUP BY bucket_ts, project_id, a_node_id, b_node_id
@@ -1223,24 +1226,41 @@ GROUP BY bucket_ts, project_id, a_node_id, b_node_id
 	}
 	defer rows.Close()
 
+	// Recent activity covers the last 10 minutes (current + previous 5-minute bucket) so live projects
+	// never drop out across a 5-minute bucket boundary.
+	recentCutoff := ((nowUnix - 2*BaseIntervalSec) / BaseIntervalSec) * BaseIntervalSec
+
 	type accum struct {
 		cmp, fail, bytes int64
+		recentBytes      int64
+		lastSlot         int64
 		activeSlots      map[int64]struct{}
+		recentSlots      map[int64]struct{}
 	}
-	add := func(m map[string]*accum, key string, slot, cmp, fail, bytes int64) {
+	add := func(m map[string]*accum, key string, slot, up, cmp, fail, bytes int64) {
 		if key == "" {
 			return
 		}
 		ac, ok := m[key]
 		if !ok {
-			ac = &accum{activeSlots: make(map[int64]struct{})}
+			ac = &accum{
+				activeSlots: make(map[int64]struct{}),
+				recentSlots: make(map[int64]struct{}),
+			}
 			m[key] = ac
 		}
 		ac.cmp += cmp
 		ac.fail += fail
 		ac.bytes += bytes
+		if (up > 0 || cmp > 0 || fail > 0 || bytes > 0) && slot > ac.lastSlot {
+			ac.lastSlot = slot
+		}
 		if bytes > 0 {
 			ac.activeSlots[slot] = struct{}{}
+			if slot >= recentCutoff {
+				ac.recentBytes += bytes
+				ac.recentSlots[slot] = struct{}{}
+			}
 		}
 	}
 
@@ -1248,14 +1268,14 @@ GROUP BY bucket_ts, project_id, a_node_id, b_node_id
 	bAcc := make(map[string]*accum)
 	pAcc := make(map[string]*accum)
 	for rows.Next() {
-		var slot, cmp, fail, bytes int64
+		var slot, up, cmp, fail, bytes int64
 		var projID, aID, bID string
-		if err := rows.Scan(&slot, &projID, &aID, &bID, &cmp, &fail, &bytes); err != nil {
+		if err := rows.Scan(&slot, &projID, &aID, &bID, &up, &cmp, &fail, &bytes); err != nil {
 			return nil, nil, nil, err
 		}
-		add(pAcc, projID, slot, cmp, fail, bytes)
-		add(aAcc, aID, slot, cmp, fail, bytes)
-		add(bAcc, bID, slot, cmp, fail, bytes)
+		add(pAcc, projID, slot, up, cmp, fail, bytes)
+		add(aAcc, aID, slot, up, cmp, fail, bytes)
+		add(bAcc, bID, slot, up, cmp, fail, bytes)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, nil, nil, err
@@ -1268,14 +1288,30 @@ GROUP BY bucket_ts, project_id, a_node_id, b_node_id
 			for slot := range ac.activeSlots {
 				activeSec += effectiveBucketSec(slot, BaseIntervalSec, nowUnix)
 			}
+			var recentSec int64
+			for slot := range ac.recentSlots {
+				recentSec += effectiveBucketSec(slot, BaseIntervalSec, nowUnix)
+			}
 			ws := WindowSummary{
 				Completed:         ac.cmp,
 				Failed:            ac.fail,
 				Bytes:             ac.bytes,
 				WindowAvgSpeedBps: ac.bytes / windowSec,
+				RecentBytes:       ac.recentBytes,
 			}
 			if activeSec > 0 {
 				ws.ActiveAvgSpeedBps = ac.bytes / activeSec
+			}
+			if recentSec > 0 && ac.recentBytes > 0 {
+				ws.RecentSpeedBps = ac.recentBytes / recentSec
+			}
+			if ac.lastSlot > 0 {
+				ts := ac.lastSlot + BaseIntervalSec
+				if ts > nowUnix {
+					ts = nowUnix
+				}
+				t := time.Unix(ts, 0).UTC()
+				ws.LastActivityAt = &t
 			}
 			out[k] = ws
 		}
@@ -1283,6 +1319,42 @@ GROUP BY bucket_ts, project_id, a_node_id, b_node_id
 	}
 
 	return finalize(aAcc), finalize(bAcc), finalize(pAcc), nil
+}
+
+// GetProjectLastActivity returns the most recent persisted interval bucket timestamp per project
+// across the retained interval history so idle projects outside short windows still report last activity.
+func (s *Store) GetProjectLastActivity(ctx context.Context, now time.Time) (map[string]time.Time, error) {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	nowUnix := now.Unix()
+	rows, err := s.db.QueryContext(ctx, `
+SELECT project_id, MAX(bucket_ts)
+FROM stats_intervals
+WHERE files_uploaded > 0 OR files_completed > 0 OR files_failed > 0 OR bytes_transferred > 0
+GROUP BY project_id
+`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[string]time.Time)
+	for rows.Next() {
+		var pid string
+		var maxSlot int64
+		if err := rows.Scan(&pid, &maxSlot); err != nil {
+			return nil, err
+		}
+		if pid == "" || maxSlot <= 0 {
+			continue
+		}
+		ts := maxSlot + BaseIntervalSec
+		if ts > nowUnix {
+			ts = nowUnix
+		}
+		out[pid] = time.Unix(ts, 0).UTC()
+	}
+	return out, rows.Err()
 }
 
 func (s *Store) TableNames(ctx context.Context) ([]string, error) {

@@ -570,3 +570,121 @@ func TestNodePauseResumeAndAgentAScript(t *testing.T) {
 		t.Fatalf("expected cust-auto-2 to automatically receive 'auto-ev-proj' via events, got %+v", c2AfterEv.Projects)
 	}
 }
+
+func TestOverviewProjectsSortedByActivity(t *testing.T) {
+	dir := t.TempDir()
+	caPath := filepath.Join(dir, "ca.crt")
+	caKeyPath := filepath.Join(dir, "ca.key")
+	if err := pki.InitCA(caPath, caKeyPath, "relay-sort-test-ca", 365); err != nil {
+		t.Fatalf("InitCA: %v", err)
+	}
+	srvCert := filepath.Join(dir, "center.crt")
+	srvKey := filepath.Join(dir, "center.key")
+	if err := pki.IssueCert(caPath, caKeyPath, srvCert, srvKey, "center", []string{"127.0.0.1"}, nil, 365); err != nil {
+		t.Fatalf("IssueCert: %v", err)
+	}
+	srv, err := New(&Config{
+		Listen:       "127.0.0.1:0",
+		TLSCert:      srvCert,
+		TLSKey:       srvKey,
+		CACert:       caPath,
+		PublicURL:    "https://center.test:8440",
+		ReleasesDir:  filepath.Join(dir, "releases"),
+		DBPath:       filepath.Join(dir, "center.db"),
+		JWTSecret:    "jwt-secret-sort-test",
+		CenterSecret: "center-secret-sort-test",
+		AdminToken:   "super-admin-tok",
+	}, nil)
+	if err != nil {
+		t.Fatalf("New center: %v", err)
+	}
+	defer srv.Shutdown(context.Background())
+
+	ctx := context.Background()
+	handler := srv.routes()
+
+	now := time.Now().UTC()
+	// Create 3 projects in chronological order: oldest idle, middle recent, newest live-queued.
+	for _, p := range []protocol.Project{
+		{ID: "proj-old-idle", Name: "Old Idle", CreatedAt: now.Add(-72 * time.Hour)},
+		{ID: "proj-mid-window", Name: "Mid Window", CreatedAt: now.Add(-12 * time.Hour)},
+		{ID: "proj-live-now", Name: "Live Now", CreatedAt: now.Add(-1 * time.Hour)},
+	} {
+		if err := srv.Store().UpsertProject(ctx, p); err != nil {
+			t.Fatalf("upsert project %s: %v", p.ID, err)
+		}
+	}
+	if err := srv.Store().UpsertNode(ctx, protocol.NodeRecord{
+		ID:         "a-sort-1",
+		Name:       "a-sort-1",
+		Role:       protocol.RoleAgentA,
+		PublicAddr: "https://127.0.0.1:8443",
+	}, "tok-sort-a"); err != nil {
+		t.Fatalf("upsert node: %v", err)
+	}
+	// Record historical completed event for proj-mid-window (3 hours ago) and live event for proj-live-now (now).
+	if _, err := srv.Store().RecordSummaryEvents(ctx, []protocol.SummaryEvent{
+		{
+			EventID:   "ev-mid-1",
+			ProjectID: "proj-mid-window",
+			ANodeID:   "a-sort-1",
+			BNodeID:   "b-1",
+			EventType: protocol.EventCompleted,
+			Bytes:     500 << 20,
+			Timestamp: now.Add(-3 * time.Hour),
+		},
+		{
+			EventID:   "ev-live-1",
+			ProjectID: "proj-live-now",
+			ANodeID:   "a-sort-1",
+			BNodeID:   "b-1",
+			EventType: protocol.EventCompleted,
+			Bytes:     100 << 20,
+			Timestamp: now,
+		},
+	}); err != nil {
+		t.Fatalf("record summary events: %v", err)
+	}
+	// Heartbeat with queued files on proj-live-now.
+	hbBody, _ := json.Marshal(protocol.AgentAHeartbeatReq{
+		NodeID:     "a-sort-1",
+		PublicAddr: "https://127.0.0.1:8443",
+		Availability: []protocol.ProjectAvailability{
+			{ProjectID: "proj-live-now", ReadyCount: 5, ReadyBytes: 20 << 20},
+		},
+	})
+	hbReq := httptest.NewRequest(http.MethodPost, "/api/v1/a/heartbeat", bytes.NewReader(hbBody))
+	hbReq.Header.Set(protocol.HeaderNodeID, "a-sort-1")
+	hbReq.Header.Set(protocol.HeaderNodeToken, "tok-sort-a")
+	hbRec := httptest.NewRecorder()
+	handler.ServeHTTP(hbRec, hbReq)
+	if hbRec.Code != http.StatusOK {
+		t.Fatalf("heartbeat failed: %d %s", hbRec.Code, hbRec.Body.String())
+	}
+
+	ovReq := httptest.NewRequest(http.MethodGet, "/api/v1/admin/overview?hours=24", nil)
+	ovReq.Header.Set(protocol.HeaderAdminToken, "super-admin-tok")
+	ovRec := httptest.NewRecorder()
+	handler.ServeHTTP(ovRec, ovReq)
+	if ovRec.Code != http.StatusOK {
+		t.Fatalf("overview failed: %d %s", ovRec.Code, ovRec.Body.String())
+	}
+	var ov protocol.OverviewResp
+	if err := json.Unmarshal(ovRec.Body.Bytes(), &ov); err != nil {
+		t.Fatalf("decode overview: %v", err)
+	}
+	if len(ov.Projects) != 3 {
+		t.Fatalf("expected 3 projects, got %d", len(ov.Projects))
+	}
+	gotOrder := []string{ov.Projects[0].Project.ID, ov.Projects[1].Project.ID, ov.Projects[2].Project.ID}
+	wantOrder := []string{"proj-live-now", "proj-mid-window", "proj-old-idle"}
+	if !slices.Equal(gotOrder, wantOrder) {
+		t.Fatalf("unexpected project activity order: got %v want %v", gotOrder, wantOrder)
+	}
+	if ov.Projects[0].RecentBytes <= 0 || ov.Projects[0].RecentSpeedBps <= 0 || ov.Projects[0].LastActivityAt == nil {
+		t.Fatalf("expected live recent metrics on proj-live-now, got %+v", ov.Projects[0])
+	}
+	if ov.Projects[1].LastActivityAt == nil || ov.Projects[1].RecentBytes != 0 {
+		t.Fatalf("expected window-only activity on proj-mid-window, got %+v", ov.Projects[1])
+	}
+}
