@@ -502,6 +502,8 @@ type ProjectSummary struct {
 	ActiveAvgSpeedBps int64               `json:"active_avg_speed_bps"`
 	RecentBytes       int64               `json:"recent_bytes,omitempty"`
 	RecentSpeedBps    int64               `json:"recent_speed_bps,omitempty"`
+	RecentFailed      int64               `json:"recent_failed,omitempty"`
+	LastFailedAt      *time.Time          `json:"last_failed_at,omitempty"`
 	LastActivityAt    *time.Time          `json:"last_activity_at,omitempty"`
 	QueuedFiles       int                 `json:"queued_files"`
 	QueuedBytes       int64               `json:"queued_bytes"`
@@ -564,6 +566,8 @@ type LiveNodeView struct {
 	WindowHours       int                   `json:"window_hours"`
 	WindowCompleted   int64                 `json:"window_completed"`
 	WindowFailed      int64                 `json:"window_failed"`
+	RecentFailed      int64                 `json:"recent_failed,omitempty"`
+	LastFailedAt      *time.Time            `json:"last_failed_at,omitempty"`
 	WindowBytes       int64                 `json:"window_bytes"`
 	WindowAvgSpeedBps int64                 `json:"window_avg_speed_bps"`
 	ActiveAvgSpeedBps int64                 `json:"active_avg_speed_bps"`
@@ -592,6 +596,8 @@ type OverviewResp struct {
 	WindowCompleted    int64            `json:"window_completed"`
 	WindowBytes        int64            `json:"window_bytes"`
 	WindowFailed       int64            `json:"window_failed"`
+	RecentFailed       int64            `json:"recent_failed,omitempty"`
+	LastFailedAt       *time.Time       `json:"last_failed_at,omitempty"`
 	WindowAvgSpeedBps  int64            `json:"window_avg_speed_bps"`
 	ActiveAvgSpeedBps  int64            `json:"active_avg_speed_bps"`
 	WindowPeakSpeedBps int64            `json:"window_peak_speed_bps"`

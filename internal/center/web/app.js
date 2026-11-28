@@ -460,6 +460,18 @@ async function refreshCurveOnly() {
     });
     if (selectedProjectFilter) qs.set('project', selectedProjectFilter);
     const intervalResp = await api(`/api/v1/admin/stats/intervals?${qs.toString()}`);
+    let curveFail = { level: 'none', count: 0 };
+    if (selectedProjectFilter) {
+      const matched = (cachedOverview?.projects || []).find(p => p.project.id === selectedProjectFilter);
+      if (matched) {
+        const st = getProjectFailState(matched);
+        if (st.status === 'active' || st.status === 'warning') {
+          curveFail = { level: st.status, count: st.count };
+        }
+      }
+    } else if (cachedOverview) {
+      curveFail = summarizeOverviewFailures(cachedOverview);
+    }
     renderSpeedCurve({
       buckets: intervalResp.buckets || [],
       windowHours: intervalResp.window_hours || hours,
@@ -470,6 +482,8 @@ async function refreshCurveOnly() {
       totalBytes: intervalResp.total_bytes || 0,
       totalCompleted: intervalResp.total_completed || 0,
       totalFailed: intervalResp.total_failed || 0,
+      failLevel: curveFail.level,
+      displayFailCount: curveFail.count,
     });
   } catch (e) {
     if (e.message !== 'unauthorized') console.error(e);
@@ -496,6 +510,21 @@ function syncProjectFilterOptions(projects) {
 function renderDashboard(ov) {
   const winHours = ov.window_hours || 24;
   const winLbl = windowLabel(winHours);
+  const ovFail = summarizeOverviewFailures(ov);
+  const failInlineHtml = (level, count) => {
+    if (!count || level === 'none') return '';
+    if (level === 'active') {
+      return ` · <span class="fail-inline-err">异常重试 ${esc(fmtNum(count))}</span>`;
+    }
+    return ` · <span class="fail-inline-warn" title="失败已自动重试完成，2 小时后自动消退">重试已恢复 ${esc(fmtNum(count))}</span>`;
+  };
+  const todayFailHtml = (ov.today_failed || 0) > 0 && ovFail.level !== 'none'
+    ? failInlineHtml(ovFail.level, Math.min(ov.today_failed, ovFail.count))
+    : '';
+  const allTimeFailHtml = ovFail.level === 'active'
+    ? ` · <span class="fail-inline-err">当前异常重试 ${esc(fmtNum(ovFail.count))}</span>`
+    : '';
+
   const kpis = [
     {
       highlight: true,
@@ -507,17 +536,17 @@ function renderDashboard(ov) {
     {
       label: `${winLbl}完成 / 流量`,
       value: `${fmtNum(ov.window_completed)} 文件`,
-      sub: `区间流量 ${fmtBytes(ov.window_bytes)} · 失败 ${fmtNum(ov.window_failed)}`,
+      subHtml: `区间流量 ${esc(fmtBytes(ov.window_bytes))}${failInlineHtml(ovFail.level, ovFail.count)}`,
     },
     {
       label: '今日完成 / 流量 (UTC)',
       value: `${fmtNum(ov.today_completed)} 文件`,
-      sub: `今日流量 ${fmtBytes(ov.today_bytes)} · 失败 ${fmtNum(ov.today_failed)}`,
+      subHtml: `今日流量 ${esc(fmtBytes(ov.today_bytes))}${todayFailHtml}`,
     },
     {
       label: '累计汇总完成',
       value: `${fmtNum(ov.all_time_completed)} 文件`,
-      sub: `累计 ${fmtBytes(ov.all_time_bytes)} · 失败 ${fmtNum(ov.all_time_failed)}`,
+      subHtml: `累计 ${esc(fmtBytes(ov.all_time_bytes))}${allTimeFailHtml}`,
     },
     isCustomer()
       ? {
@@ -538,7 +567,7 @@ function renderDashboard(ov) {
         <span>${esc(k.value)}</span>
         ${k.unit ? `<span class="kpi-unit">${esc(k.unit)}</span>` : ''}
       </div>
-      <div class="kpi-sub">${esc(k.sub)}</div>
+      <div class="kpi-sub">${k.subHtml != null ? k.subHtml : esc(k.sub)}</div>
     </div>
   `).join('');
 
@@ -552,6 +581,8 @@ function renderDashboard(ov) {
     totalBytes: ov.window_bytes || 0,
     totalCompleted: ov.window_completed || 0,
     totalFailed: ov.window_failed || 0,
+    failLevel: ovFail.level,
+    displayFailCount: ovFail.count,
   });
 
   renderTrendChart(ov.daily_trend || []);
@@ -630,7 +661,8 @@ function renderSpeedCurve(data) {
   const {
     buckets, windowHours, bucketMinutes,
     windowAvg, activeAvg, peakSpeed,
-    totalBytes, totalCompleted, totalFailed,
+    totalBytes, totalCompleted,
+    failLevel = 'none', displayFailCount = 0,
   } = data;
 
   const winLbl = windowLabel(windowHours);
@@ -643,6 +675,13 @@ function renderSpeedCurve(data) {
   if (subEl) {
     const gran = bucketMinutes >= 60 ? `${bucketMinutes / 60} 小时` : `${bucketMinutes} 分钟`;
     subEl.textContent = `区间粒度：每 ${gran} 一点 · 仅统计已落盘校验完成字节，非瞬时抖动速率`;
+  }
+
+  let curveFailSuffix = '';
+  if (displayFailCount > 0 && failLevel === 'active') {
+    curveFailSuffix = ` · <span class="fail-inline-err">异常重试 ${esc(fmtNum(displayFailCount))}</span>`;
+  } else if (displayFailCount > 0 && failLevel === 'warning') {
+    curveFailSuffix = ` · <span class="fail-inline-warn">重试已恢复 ${esc(fmtNum(displayFailCount))}</span>`;
   }
 
   document.getElementById('curve-metrics').innerHTML = `
@@ -664,7 +703,7 @@ function renderSpeedCurve(data) {
     <div class="metric-pill">
       <div class="pill-k">区间完成汇总</div>
       <div class="pill-v">${esc(fmtBytes(totalBytes))}</div>
-      <div class="pill-s">${esc(fmtNum(totalCompleted))} 文件 · 失败 ${esc(fmtNum(totalFailed))}</div>
+      <div class="pill-s">${esc(fmtNum(totalCompleted))} 文件${curveFailSuffix}</div>
     </div>
   `;
 
@@ -807,7 +846,7 @@ function renderSpeedCurve(data) {
       <div class="tt-speed">${esc(fmtSpeed(b.avg_speed_bps))} <span class="muted">(${esc(fmtMbps(b.avg_speed_bps))})</span></div>
       <div class="tt-row"><span>区间传输流量</span><strong>${esc(fmtBytes(b.bytes_transferred))}</strong></div>
       <div class="tt-row"><span>区间完成文件</span><strong>${esc(fmtNum(b.files_completed))}</strong></div>
-      <div class="tt-row"><span>区间失败次数</span><strong>${esc(fmtNum(b.files_failed))}</strong></div>
+      ${(b.files_failed || 0) > 0 ? `<div class="tt-row"><span>区间重试次数</span><strong class="fail-inline-warn">${esc(fmtNum(b.files_failed))}</strong></div>` : ''}
     `;
     tooltipEl.classList.remove('hidden');
 
@@ -1087,11 +1126,100 @@ function getProjectAssignedAccounts(projectId) {
   return (cachedAccounts || []).filter(a => Array.isArray(a.projects) && a.projects.includes(projectId));
 }
 
+const RESOLVED_WARN_TTL_MS = 2 * 60 * 60 * 1000; // 已恢复的重试警告 2 小时后自动消退
+const DISMISSED_WARN_STORAGE_KEY = 'relay_dismissed_fail_warns_v1';
+
+function loadDismissedFailWarns() {
+  try {
+    return JSON.parse(localStorage.getItem(DISMISSED_WARN_STORAGE_KEY) || '{}') || {};
+  } catch {
+    return {};
+  }
+}
+
+function isFailWarnDismissed(key, lastFailedAt) {
+  if (!key || !lastFailedAt) return false;
+  return loadDismissedFailWarns()[key] === lastFailedAt;
+}
+
+function dismissFailWarn(key, lastFailedAt) {
+  if (!key || !lastFailedAt) return;
+  const map = loadDismissedFailWarns();
+  map[key] = lastFailedAt;
+  try { localStorage.setItem(DISMISSED_WARN_STORAGE_KEY, JSON.stringify(map)); } catch {}
+}
+
+function failAgeMs(lastFailedAt) {
+  if (!lastFailedAt) return Infinity;
+  const ts = new Date(lastFailedAt).getTime();
+  if (Number.isNaN(ts)) return Infinity;
+  return Math.max(0, Date.now() - ts);
+}
+
+// Classifies a project's failure status so resolved retries downgrade to a transient amber warning
+// and never stay permanently pinned as red errors or stuck in the "待分配 / 异常" filter.
+function getProjectFailState(ps) {
+  const winFail = ps?.window_failed || 0;
+  const recentFail = ps?.recent_failed || 0;
+  const totalFail = ps?.total_failed || 0;
+  if (winFail === 0 && recentFail === 0 && totalFail === 0) {
+    return { status: 'none', count: 0, windowCount: 0, totalCount: 0, lastFailedAt: null, resolved: true };
+  }
+  const queued = ps?.queued_files || 0;
+  const uploaded = ps?.total_uploaded || 0;
+  const completed = ps?.total_completed || 0;
+  const allDelivered = queued === 0 && (uploaded === 0 || completed >= uploaded);
+  const age = failAgeMs(ps?.last_failed_at);
+  const withinWarnTTL = age <= RESOLVED_WARN_TTL_MS;
+
+  if ((winFail > 0 || recentFail > 0) && (queued > 0 || (!allDelivered && withinWarnTTL))) {
+    return {
+      status: 'active',
+      count: recentFail > 0 ? recentFail : winFail,
+      windowCount: winFail,
+      totalCount: totalFail,
+      lastFailedAt: ps?.last_failed_at || null,
+      resolved: false,
+    };
+  }
+  if (winFail > 0 && withinWarnTTL && !isFailWarnDismissed(`proj:${ps?.project?.id || ''}`, ps?.last_failed_at)) {
+    return {
+      status: 'warning',
+      count: winFail,
+      windowCount: winFail,
+      totalCount: totalFail,
+      lastFailedAt: ps?.last_failed_at || null,
+      resolved: true,
+    };
+  }
+  return {
+    status: 'resolved',
+    count: winFail || totalFail,
+    windowCount: winFail,
+    totalCount: totalFail,
+    lastFailedAt: ps?.last_failed_at || null,
+    resolved: true,
+  };
+}
+
+function summarizeOverviewFailures(ov) {
+  let activeCount = 0;
+  let warnCount = 0;
+  for (const ps of (ov?.projects || [])) {
+    const st = getProjectFailState(ps);
+    if (st.status === 'active') activeCount += st.count;
+    else if (st.status === 'warning') warnCount += st.count;
+  }
+  if (activeCount > 0) return { level: 'active', count: activeCount };
+  if (warnCount > 0) return { level: 'warning', count: warnCount };
+  return { level: 'none', count: 0 };
+}
+
 function projectNeedsAttention(ps, cust) {
-  const hasFail = (ps.window_failed || 0) > 0 || (ps.total_failed || 0) > 0;
+  const hasActiveFail = getProjectFailState(ps).status === 'active';
   const hasDiskAlarm = !cust && (ps.a_node_availability || []).some(a => a.disk_alarm);
   const unassigned = !cust && getProjectAssignedAccounts(ps.project.id).length === 0;
-  return hasFail || hasDiskAlarm || unassigned;
+  return hasActiveFail || hasDiskAlarm || unassigned;
 }
 
 function sortProjectSummaries(list, sortBy) {
@@ -1150,7 +1278,7 @@ function renderProjectCompactRow(ps, winHours, cust) {
   const tier = getProjectActivityTier(ps);
   const assignedAccs = getProjectAssignedAccounts(p.id);
   const hasDiskAlarm = !cust && (ps.a_node_availability || []).some(a => a.disk_alarm);
-  const hasFail = (ps.window_failed || 0) > 0 || (ps.total_failed || 0) > 0;
+  const failState = getProjectFailState(ps);
 
   const dotCls = tier === 3 ? 'live' : (tier === 2 ? 'recent' : 'idle');
   const dotTitle = tier === 3 ? '传输中 / 实时活跃' : (tier === 2 ? `${windowLabel(winHours)}内有传输` : '静止 / 历史项目');
@@ -1165,8 +1293,12 @@ function renderProjectCompactRow(ps, winHours, cust) {
   if (hasDiskAlarm) {
     miniPills.push('<span class="badge alarm proj-mini-pill">盘水位告警</span>');
   }
-  if (hasFail) {
-    miniPills.push(`<span class="badge offline proj-mini-pill">失败 ${fmtNum(ps.total_failed || ps.window_failed)}</span>`);
+  if (failState.status === 'active') {
+    const tip = failState.lastFailedAt ? `最近异常 ${fmtRelativeTime(failState.lastFailedAt)}，仍有未完成文件待重试` : '当前仍有未完成文件发生重试失败';
+    miniPills.push(`<span class="badge offline proj-mini-pill" title="${esc(tip)}">异常重试 ${fmtNum(failState.count)}</span>`);
+  } else if (failState.status === 'warning') {
+    const tip = `已全部自动重试恢复（最近 ${fmtRelativeTime(failState.lastFailedAt)}）· 2 小时后自动消退，点击可立即忽略`;
+    miniPills.push(`<button type="button" class="badge alarm proj-mini-pill proj-warn-dismiss" data-dismiss-warn="proj:${esc(p.id)}" data-warn-ts="${esc(failState.lastFailedAt || '')}" title="${esc(tip)}">重试已恢复 ${fmtNum(failState.count)} ×</button>`);
   }
 
   // Customer column (admin only)
@@ -1573,6 +1705,16 @@ function renderProjectDetailModal(projectId, winHours) {
     </div>
   `;
 
+  const detailFailState = getProjectFailState(ps);
+  const detailWinFailHtml = (ps.window_failed || 0) > 0
+    ? (detailFailState.status === 'active'
+        ? `<div class="muted"><span class="fail-inline-err">窗口异常重试 ${esc(fmtNum(ps.window_failed))}（处理中）</span></div>`
+        : `<div class="muted"><span class="fail-inline-warn">窗口重试 ${esc(fmtNum(ps.window_failed))}（已全部恢复）</span></div>`)
+    : '<div class="muted">窗口无失败重试</div>';
+  const detailTotalFailTxt = (ps.total_failed || 0) > 0
+    ? `累计上传 ${fmtNum(ps.total_uploaded)} · 历史重试 ${fmtNum(ps.total_failed)}${detailFailState.resolved ? '（已恢复）' : ''}`
+    : `累计上传 ${fmtNum(ps.total_uploaded)} · 无失败`;
+
   bodyEl.innerHTML = `
     ${quickBarHtml}
     <div class="proj-stats-grid" style="margin-bottom:14px">
@@ -1589,12 +1731,12 @@ function renderProjectDetailModal(projectId, winHours) {
       <div class="proj-stat-box">
         <div class="k">${esc(winLbl)}完成汇总</div>
         <div class="v">${esc(fmtNum(ps.window_completed))} 文件 · ${esc(fmtBytes(ps.window_bytes))}</div>
-        <div class="muted">窗口失败 ${esc(fmtNum(ps.window_failed))}</div>
+        ${detailWinFailHtml}
       </div>
       <div class="proj-stat-box">
         <div class="k">累计完成总量</div>
         <div class="v">${esc(fmtNum(ps.total_completed))} 文件 · ${esc(fmtBytes(ps.total_bytes))}</div>
-        <div class="muted">累计上传 ${esc(fmtNum(ps.total_uploaded))} · 累计失败 ${esc(fmtNum(ps.total_failed))}</div>
+        <div class="muted">${esc(detailTotalFailTxt)}</div>
       </div>
     </div>
 
@@ -2131,7 +2273,16 @@ function renderNodes(nodes, winHours) {
         <td>${renderReceiverDisks(n)}</td>
         <td>
           <div>${fmtNum(n.window_completed)} 文件</div>
-          <div class="muted">${fmtBytes(n.window_bytes)} · 失败 ${fmtNum(n.window_failed)}</div>
+          <div class="muted">${fmtBytes(n.window_bytes)}${(() => {
+            const ovFail = summarizeOverviewFailures(cachedOverview);
+            if ((n.recent_failed || 0) > 0 && ovFail.level === 'active') {
+              return ` · <span class="fail-inline-err">异常重试 ${fmtNum(n.recent_failed)}</span>`;
+            }
+            if ((n.window_failed || 0) > 0 && failAgeMs(n.last_failed_at) <= RESOLVED_WARN_TTL_MS && !isFailWarnDismissed(`node:${n.id}`, n.last_failed_at)) {
+              return ` · <span class="fail-inline-warn" title="失败已自动重试完成，2 小时后自动消退">重试已恢复 ${fmtNum(n.window_failed)}</span>`;
+            }
+            return '';
+          })()}</div>
         </td>
         <td>
           <div class="mono">${fmtSpeed(n.window_avg_speed_bps)} <span class="muted">(${fmtMbps(n.window_avg_speed_bps)})</span></div>
@@ -3397,6 +3548,16 @@ function setupEvents() {
         case 'edit-account': openAccountModal(id); break;
         case 'rotate-account': rotateAccountToken(id); break;
         case 'delete-account': deleteAccount(id); break;
+      }
+      return;
+    }
+    const dismissWarnBtn = e.target.closest('button[data-dismiss-warn]');
+    if (dismissWarnBtn) {
+      e.stopPropagation();
+      dismissFailWarn(dismissWarnBtn.dataset.dismissWarn, dismissWarnBtn.dataset.warnTs);
+      if (cachedOverview) {
+        renderDashboard(cachedOverview);
+        renderProjects(cachedOverview);
       }
       return;
     }

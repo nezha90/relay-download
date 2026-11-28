@@ -553,3 +553,49 @@ func TestClusterQuotaFairShareAndActiveReceiversSync(t *testing.T) {
 		t.Fatalf("unexpected Agent A HRW routing response: active=%+v affinity=%+v", aResp.ActiveReceivers, aResp.ProjectAffinity)
 	}
 }
+
+func TestWindowEntityStatsTracksRecentFailedAndLastFailedAt(t *testing.T) {
+	st, err := OpenStore(filepath.Join(t.TempDir(), "center.db"))
+	if err != nil {
+		t.Fatalf("OpenStore: %v", err)
+	}
+	defer st.Close()
+
+	now := time.Now().UTC().Truncate(time.Minute)
+	oldFailAt := now.Add(-3 * time.Hour)
+	recentFailAt := now.Add(-2 * time.Minute)
+
+	events := []protocol.SummaryEvent{
+		{EventID: "f-old-1", ProjectID: "proj-old", ANodeID: "a-1", BNodeID: "b-1", EventType: protocol.EventFailed, Bytes: 100, Timestamp: oldFailAt},
+		{EventID: "c-old-1", ProjectID: "proj-old", ANodeID: "a-1", BNodeID: "b-1", EventType: protocol.EventCompleted, Bytes: 100, Timestamp: oldFailAt.Add(time.Minute)},
+		{EventID: "f-rec-1", ProjectID: "proj-rec", ANodeID: "a-2", BNodeID: "b-1", EventType: protocol.EventFailed, Bytes: 200, Timestamp: recentFailAt},
+	}
+	if _, err := st.RecordSummaryEvents(context.Background(), events); err != nil {
+		t.Fatalf("RecordSummaryEvents: %v", err)
+	}
+
+	aStats, bStats, pStats, err := st.GetWindowEntityStats(context.Background(), now, 24)
+	if err != nil {
+		t.Fatalf("GetWindowEntityStats: %v", err)
+	}
+
+	oldP := pStats["proj-old"]
+	if oldP.Failed != 1 || oldP.RecentFailed != 0 || oldP.LastFailedAt == nil {
+		t.Fatalf("proj-old expected failed=1 recent_failed=0 last_failed_at!=nil, got %+v", oldP)
+	}
+	if now.Sub(*oldP.LastFailedAt) < 2*time.Hour {
+		t.Fatalf("proj-old last_failed_at should be >2h ago, got %v (now=%v)", oldP.LastFailedAt, now)
+	}
+
+	recP := pStats["proj-rec"]
+	if recP.Failed != 1 || recP.RecentFailed != 1 || recP.LastFailedAt == nil {
+		t.Fatalf("proj-rec expected failed=1 recent_failed=1 last_failed_at!=nil, got %+v", recP)
+	}
+	if now.Sub(*recP.LastFailedAt) > 10*time.Minute {
+		t.Fatalf("proj-rec last_failed_at should be within 10m, got %v (now=%v)", recP.LastFailedAt, now)
+	}
+
+	if aStats["a-1"].RecentFailed != 0 || aStats["a-2"].RecentFailed != 1 || bStats["b-1"].Failed != 2 || bStats["b-1"].RecentFailed != 1 {
+		t.Fatalf("unexpected node failure stats: a=%+v b=%+v", aStats, bStats)
+	}
+}

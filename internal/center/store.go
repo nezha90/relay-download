@@ -28,6 +28,8 @@ type WindowSummary struct {
 	ActiveAvgSpeedBps int64
 	RecentBytes       int64
 	RecentSpeedBps    int64
+	RecentFailed      int64
+	LastFailedAt      *time.Time
 	LastActivityAt    *time.Time
 }
 
@@ -1233,7 +1235,9 @@ GROUP BY bucket_ts, project_id, a_node_id, b_node_id
 	type accum struct {
 		cmp, fail, bytes int64
 		recentBytes      int64
+		recentFail       int64
 		lastSlot         int64
+		lastFailSlot     int64
 		activeSlots      map[int64]struct{}
 		recentSlots      map[int64]struct{}
 	}
@@ -1254,6 +1258,14 @@ GROUP BY bucket_ts, project_id, a_node_id, b_node_id
 		ac.bytes += bytes
 		if (up > 0 || cmp > 0 || fail > 0 || bytes > 0) && slot > ac.lastSlot {
 			ac.lastSlot = slot
+		}
+		if fail > 0 {
+			if slot > ac.lastFailSlot {
+				ac.lastFailSlot = slot
+			}
+			if slot >= recentCutoff {
+				ac.recentFail += fail
+			}
 		}
 		if bytes > 0 {
 			ac.activeSlots[slot] = struct{}{}
@@ -1298,12 +1310,21 @@ GROUP BY bucket_ts, project_id, a_node_id, b_node_id
 				Bytes:             ac.bytes,
 				WindowAvgSpeedBps: ac.bytes / windowSec,
 				RecentBytes:       ac.recentBytes,
+				RecentFailed:      ac.recentFail,
 			}
 			if activeSec > 0 {
 				ws.ActiveAvgSpeedBps = ac.bytes / activeSec
 			}
 			if recentSec > 0 && ac.recentBytes > 0 {
 				ws.RecentSpeedBps = ac.recentBytes / recentSec
+			}
+			if ac.lastFailSlot > 0 {
+				ts := ac.lastFailSlot + BaseIntervalSec
+				if ts > nowUnix {
+					ts = nowUnix
+				}
+				t := time.Unix(ts, 0).UTC()
+				ws.LastFailedAt = &t
 			}
 			if ac.lastSlot > 0 {
 				ts := ac.lastSlot + BaseIntervalSec

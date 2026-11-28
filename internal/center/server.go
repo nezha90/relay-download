@@ -1028,6 +1028,16 @@ func (s *Server) handleAdminOverview(w http.ResponseWriter, r *http.Request) {
 			cp := lt
 			lastAct = &cp
 		}
+		var lastFail *time.Time
+		if pw.LastFailedAt != nil {
+			cp := *pw.LastFailedAt
+			lastFail = &cp
+			if overview.LastFailedAt == nil || cp.After(*overview.LastFailedAt) {
+				ovCP := cp
+				overview.LastFailedAt = &ovCP
+			}
+		}
+		overview.RecentFailed += pw.RecentFailed
 		ps := protocol.ProjectSummary{
 			Project:           p,
 			TotalUploaded:     t.TotalUploaded,
@@ -1041,6 +1051,8 @@ func (s *Server) handleAdminOverview(w http.ResponseWriter, r *http.Request) {
 			ActiveAvgSpeedBps: pw.ActiveAvgSpeedBps,
 			RecentBytes:       pw.RecentBytes,
 			RecentSpeedBps:    pw.RecentSpeedBps,
+			RecentFailed:      pw.RecentFailed,
+			LastFailedAt:      lastFail,
 			LastActivityAt:    lastAct,
 			ANodeAvailability: make([]protocol.ANodeAvailSummary, 0),
 		}
@@ -1299,6 +1311,8 @@ func (s *Server) handleAdminListNodes(w http.ResponseWriter, r *http.Request) {
 			if ws, ok := aWinStats[n.ID]; ok {
 				v.WindowCompleted = ws.Completed
 				v.WindowFailed = ws.Failed
+				v.RecentFailed = ws.RecentFailed
+				v.LastFailedAt = ws.LastFailedAt
 				v.WindowBytes = ws.Bytes
 				v.WindowAvgSpeedBps = ws.WindowAvgSpeedBps
 				v.ActiveAvgSpeedBps = ws.ActiveAvgSpeedBps
@@ -1334,6 +1348,8 @@ func (s *Server) handleAdminListNodes(w http.ResponseWriter, r *http.Request) {
 			if ws, ok := bWinStats[n.ID]; ok {
 				v.WindowCompleted = ws.Completed
 				v.WindowFailed = ws.Failed
+				v.RecentFailed = ws.RecentFailed
+				v.LastFailedAt = ws.LastFailedAt
 				v.WindowBytes = ws.Bytes
 				v.WindowAvgSpeedBps = ws.WindowAvgSpeedBps
 				v.ActiveAvgSpeedBps = ws.ActiveAvgSpeedBps

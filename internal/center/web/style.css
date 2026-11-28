@@ -1893,6 +1893,23 @@ input[type="checkbox"], input[type="radio"] {
   font-size: 10.5px;
   padding: 1px 6px;
 }
+.proj-warn-dismiss {
+  cursor: pointer;
+  border-style: dashed;
+  font-family: inherit;
+  transition: opacity 0.15s ease, filter 0.15s ease;
+}
+.proj-warn-dismiss:hover {
+  filter: brightness(1.12);
+}
+.fail-inline-err {
+  color: var(--red-soft);
+  font-weight: 600;
+}
+.fail-inline-warn {
+  color: var(--amber-soft);
+  font-weight: 500;
+}
 .proj-id-line {
   display: flex;
   align-items: center;
