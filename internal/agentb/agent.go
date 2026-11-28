@@ -133,7 +133,7 @@ func New(cfg *Config, logger *slog.Logger) (*Agent, error) {
 
 	diskHealth := transfer.NewDiskHealthTracker()
 	for _, sd := range cfg.StorageDirs {
-		if err := diskHealth.SafeMkdirAll(sd, sd, true); err != nil {
+		if err := diskHealth.SafeMkdirAll(sd, filepath.Join(sd, ".relay_tmp"), true); err != nil {
 			probe := diskHealth.ProbeRoot(sd, true, cfg.MaxDiskUsagePct, cfg.MinFreeDiskBytes, 0)
 			if probe.Detached {
 				logger.Warn("storage dir detached at startup, skipping mkdir to protect root filesystem", "dir", sd, "reason", probe.StatusReason)
@@ -145,13 +145,23 @@ func New(cfg *Config, logger *slog.Logger) (*Agent, error) {
 	for _, proj := range cfg.ProjectIDs() {
 		for _, dir := range cfg.DestDirsFor(proj) {
 			root := transfer.MatchRootForPath(dir, cfg.DiskRoots())
-			if err := diskHealth.SafeMkdirAll(root, filepath.Join(dir, ".relay_tmp"), true); err != nil {
+			if err := diskHealth.SafeMkdirAll(root, filepath.Join(root, ".relay_tmp"), true); err != nil {
 				probe := diskHealth.ProbeRoot(root, true, cfg.MaxDiskUsagePct, cfg.MinFreeDiskBytes, 0)
 				if probe.Detached {
 					logger.Warn("dest dir detached at startup, skipping mkdir", "project", proj, "dir", dir, "reason", probe.StatusReason)
 					continue
 				}
-				return nil, fmt.Errorf("init dest dir for project %s (%s): %w", proj, dir, err)
+				return nil, fmt.Errorf("init staging dir for project %s (%s): %w", proj, root, err)
+			}
+			if filepath.Clean(dir) != filepath.Clean(root) {
+				if err := diskHealth.SafeMkdirAll(root, dir, true); err != nil {
+					probe := diskHealth.ProbeRoot(root, true, cfg.MaxDiskUsagePct, cfg.MinFreeDiskBytes, 0)
+					if probe.Detached {
+						logger.Warn("dest dir detached at startup, skipping mkdir", "project", proj, "dir", dir, "reason", probe.StatusReason)
+						continue
+					}
+					return nil, fmt.Errorf("init dest dir for project %s (%s): %w", proj, dir, err)
+				}
 			}
 		}
 	}
@@ -745,6 +755,25 @@ func (a *Agent) diskRootForDestDir(dir string) string {
 	return transfer.MatchRootForPath(dir, a.diskRoots())
 }
 
+// stagingDirFor returns the temporary staging directory on the same filesystem as destDir.
+// In storage-pool mode (destDir sits under a storage root, e.g. /mnt/sda/relay-delivery/<project_id>),
+// staging uses <storage_root>/.relay_tmp/<project_id>/ so that:
+//   - external removal or moving of <storage_root>/<project_id> mid-download cannot unlink in-flight .part files;
+//   - temporary files remain cleanly isolated and inspectable per project;
+//   - staging stays on the exact same mount as destDir so os.Rename remains O(1) atomic.
+// In legacy static project-mapping mode (no storage_dirs; diskRoot == destDir), staging stays <destDir>/.relay_tmp.
+func (a *Agent) stagingDirFor(destDir, projectID string) string {
+	root := a.diskRootForDestDir(destDir)
+	if root == "" || root == "." {
+		root = destDir
+	}
+	base := filepath.Join(root, ".relay_tmp")
+	if filepath.Clean(root) != filepath.Clean(destDir) && SafeProjectSubdir(projectID) {
+		return filepath.Join(base, strings.TrimSpace(projectID))
+	}
+	return base
+}
+
 func (a *Agent) evictReadyDirsForRoot(root string) {
 	cleanRoot := filepath.Clean(strings.TrimSpace(root))
 	if cleanRoot == "" || cleanRoot == "." {
@@ -810,20 +839,21 @@ func (a *Agent) enabledDestDirsFor(projectID string) []string {
 	return out
 }
 
-func (a *Agent) ensureDestDirReady(dir string) error {
+func (a *Agent) ensureDestDirReady(dir, projectID string) error {
 	root := a.diskRootForDestDir(dir)
+	stagingDir := a.stagingDirFor(dir, projectID)
 	if a.diskHealth.IsBlocked(root) {
-		a.readyDirs.Delete(dir)
+		a.readyDirs.Delete(stagingDir)
 		return fmt.Errorf("storage root %s is disabled or detached", root)
 	}
-	if _, ok := a.readyDirs.Load(dir); ok {
+	if _, ok := a.readyDirs.Load(stagingDir); ok {
 		return nil
 	}
-	if err := a.diskHealth.SafeMkdirAll(root, filepath.Join(dir, ".relay_tmp"), true); err != nil {
-		a.readyDirs.Delete(dir)
+	if err := a.diskHealth.SafeMkdirAll(root, stagingDir, true); err != nil {
+		a.readyDirs.Delete(stagingDir)
 		return err
 	}
-	a.readyDirs.Store(dir, struct{}{})
+	a.readyDirs.Store(stagingDir, struct{}{})
 	return nil
 }
 
@@ -1767,8 +1797,8 @@ func (a *Agent) scanProjectWithLimit(ctx context.Context, projectID string, maxS
 					skippedSlots++
 					continue
 				}
-				_ = a.ensureDestDirReady(destDir)
-				partPath := filepath.Join(destDir, ".relay_tmp", cr.FileID+".part")
+				_ = a.ensureDestDirReady(destDir, projectID)
+				partPath := filepath.Join(a.stagingDirFor(destDir, projectID), cr.FileID+".part")
 				dls = append(dls, ActiveDownload{
 					FileID:         cr.FileID,
 					ProjectID:      projectID,
@@ -2185,7 +2215,9 @@ func (a *Agent) runDownload(ctx context.Context, dl ActiveDownload) {
 		_ = os.Remove(dl.PartPath)
 		a.commitMu.Unlock()
 	} else {
-		if err := a.diskHealth.SafeMkdirAll(diskRoot, filepath.Dir(targetPath), !a.isDiskRootDisabled(diskRoot)); err != nil {
+		targetDir := filepath.Dir(targetPath)
+		allowCreate := !a.isDiskRootDisabled(diskRoot)
+		if err := a.diskHealth.SafeMkdirAll(diskRoot, targetDir, allowCreate); err != nil {
 			a.commitMu.Unlock()
 			a.handleLocalDiskErr(diskRoot, err)
 			a.logger.Error("mkdir target parent failed", "err", err)
@@ -2197,10 +2229,21 @@ func (a *Agent) runDownload(ctx context.Context, dl ActiveDownload) {
 		if err := os.Chmod(dl.PartPath, 0o644); err != nil {
 			a.logger.Warn("chmod target part file failed", "path", dl.PartPath, "err", err)
 		}
-		if err := os.Rename(dl.PartPath, targetPath); err != nil {
+		renameErr := os.Rename(dl.PartPath, targetPath)
+		if renameErr != nil && errors.Is(renameErr, os.ErrNotExist) {
+			// Guard against the tiny race where an external consumer removes/moves the project
+			// directory between SafeMkdirAll and os.Rename: if our staged .part file is still
+			// intact, recreate targetDir once and retry the atomic rename.
+			if _, statErr := os.Stat(dl.PartPath); statErr == nil {
+				if mkErr := a.diskHealth.SafeMkdirAll(diskRoot, targetDir, allowCreate); mkErr == nil {
+					renameErr = os.Rename(dl.PartPath, targetPath)
+				}
+			}
+		}
+		if renameErr != nil {
 			a.commitMu.Unlock()
-			a.handleLocalDiskErr(diskRoot, err)
-			a.logger.Error("atomic rename failed", "src", dl.PartPath, "dst", targetPath, "err", err)
+			a.handleLocalDiskErr(diskRoot, renameErr)
+			a.logger.Error("atomic rename failed", "src", dl.PartPath, "dst", targetPath, "err", renameErr)
 			_ = os.Remove(dl.PartPath)
 			_ = a.store.DeleteActive(dl.FileID)
 			_ = a.sendNack(ctx, dl, "rename failed")
@@ -3145,7 +3188,15 @@ func (a *Agent) flushPendingAcks(ctx context.Context) {
 			syncWG.Add(1)
 			go func(d string) {
 				defer syncWG.Done()
-				if err := transfer.SyncFS(d); err != nil {
+				err := transfer.SyncFS(d)
+				if err != nil && errors.Is(err, os.ErrNotExist) {
+					// Project dir may have been moved/removed right after commit; flush the
+					// underlying storage root on the same mount so the filesystem is still synced.
+					if root := a.diskRootForDestDir(d); root != "" && filepath.Clean(root) != filepath.Clean(d) {
+						err = transfer.SyncFS(root)
+					}
+				}
+				if err != nil {
 					a.handleLocalDiskErr(a.diskRootForDestDir(d), err)
 					a.logger.Warn("syncfs dest dir failed, deferring ACK", "dir", d, "err", err)
 					failMu.Lock()
